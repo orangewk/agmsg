@@ -1,86 +1,66 @@
-# Team operations — reference
+# Team operations
 
-The [README](../README.md) covers the slash-command flow most users need. This page is the reference for the underlying shell scripts and the less common team operations: leaving, renaming, joining the same team from a second project, and clearing a project's registrations.
+The [README](../README.md) covers the slash-command flow most users need. This page collects the rest: identity model, joining the same team from a second project, multi-name workspaces, and clearing or resetting registrations.
 
-All scripts live under `~/.agents/skills/agmsg/scripts/` (or `<cmd>` if you installed under a different command name).
+You don't need to call shell scripts to do any of this. Talk to your agent or use the slash-command forms below.
 
 ## How identity works
 
 Agents join teams by **identity**: `(agent name, team)`. Projects are stored as registration metadata, so the same agent can re-join from multiple projects without creating duplicate identities.
 
-You can re-join the same team with the same agent name from a second project, and agmsg will keep one identity and add a registration record for the new project. This is what makes "same agent on two laptops / two repos" work without forking your inbox.
+This is what makes "same agent on two laptops / two repos" work without forking your inbox. Messages addressed to `alice` reach whichever live session is registered as `alice`, regardless of which project that session is in.
 
-## Joining without the slash command
+## Joining a team
 
-The slash command (`/agmsg` on Claude Code, `$agmsg` on Codex / Gemini CLI / Antigravity) does this for you and is the recommended path. For automation, CI, or scripts, you can call `join.sh` directly:
+In your project:
 
-```bash
-~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> <agent_type> <project_path>
-# example
-~/.agents/skills/agmsg/scripts/join.sh myteam alice claude-code /path/to/project
+```
+/agmsg
 ```
 
-To register the same identity from a second project:
+On first use it prompts for a team name (joins existing or creates new) and an agent name. That's the whole onboarding.
 
-```bash
-~/.agents/skills/agmsg/scripts/join.sh myteam alice claude-code /path/to/project-a
-~/.agents/skills/agmsg/scripts/join.sh myteam alice claude-code /path/to/project-b
-```
+## Joining the same team from a second project
 
-Both projects now route messages addressed to `alice` to whichever session is live, without creating a second `alice` identity.
+Open the second project in your agent and run `/agmsg`. When it asks for the agent name, give the same name you used before. agmsg recognizes the existing identity and registers the new project against it — your inbox stays unified.
 
 ## Multiple agent names on one project
 
-You can register more than one name in the same project (e.g. `cc` and `reviewer`). The slash command detects this and asks which one to use for the session:
+You can register more than one name in the same project (e.g. `cc` and `reviewer`). Run `/agmsg` and answer with each name in turn. After the second join, `/agmsg` detects multiple identities on this project and asks which one to use for the current session.
 
-```bash
-~/.agents/skills/agmsg/scripts/join.sh myteam cc claude-code /path/to/project
-~/.agents/skills/agmsg/scripts/join.sh myteam reviewer claude-code /path/to/project
+For the case where one workspace plays multiple *roles* (e.g. a `tech-lead` identity and a `biz-analyst` identity sharing the same checkout), use `actas` instead:
+
+```
+/agmsg actas tech-lead
+/agmsg actas biz-analyst
+/agmsg drop biz-analyst
 ```
 
-For the case where you want one workspace to play multiple *roles* (e.g. a `tech-lead` identity and a `biz-analyst` identity sharing the same checkout), use `actas` / `drop` instead — see [docs/actas.md](actas.md).
-
-## Leaving a team
-
-```bash
-~/.agents/skills/agmsg/scripts/leave.sh <team> <agent_name>
-```
-
-Removes the agent's identity from the team entirely. All registrations across all projects for that `(team, agent)` pair are removed. Messages already in the DB are kept (history is preserved).
-
-## Renaming a team
-
-```bash
-~/.agents/skills/agmsg/scripts/rename-team.sh <oldteam> <newteam>
-```
-
-Moves the team directory, updates `config.json`, and migrates messages so history is preserved under the new name.
-
-**Effect on existing members:** all agents in the team keep their registrations and message history — only the team name changes. Any session that has already cached the team name (e.g. a running `/agmsg` Claude Code session) will continue to use the old name until it re-resolves identity. After a rename, each member should re-run `whoami` from their project to pick up the new name:
-
-```bash
-~/.agents/skills/agmsg/scripts/whoami.sh "$(pwd)" claude-code
-```
+`actas` is the right tool when the roles are mutually exclusive across sessions — see [docs/actas.md](actas.md).
 
 ## Clearing a project's registrations
 
-If you want to clear the current project's registrations without leaving the team identity entirely (e.g. you're moving the project, or you want a clean rejoin):
-
-```bash
-~/.agents/skills/agmsg/scripts/reset.sh <project_path> <agent_type>
-# example
-~/.agents/skills/agmsg/scripts/reset.sh /path/to/project-b claude-code
+```
+/agmsg reset
 ```
 
-To remove a single role's registration on this project (leaving other roles untouched):
+Removes the current project's registrations without leaving the team identity entirely. Useful before moving the project or starting a clean rejoin. Other projects' registrations of the same identity are untouched.
 
-```bash
-~/.agents/skills/agmsg/scripts/reset.sh <project_path> <agent_type> <agent_name>
+To remove a single role:
+
+```
+/agmsg drop <name>
 ```
 
-This is what `/agmsg drop <name>` calls under the hood.
+## Leaving a team entirely
+
+There's no slash-command shortcut for "leave team X across all projects". Ask your agent to leave — it knows the script (`leave.sh <team> <agent>`) and will run it for you. All registrations across all projects for that `(team, agent)` pair are removed; messages already in the DB stay.
+
+## Renaming a team
+
+Same idea: ask your agent to rename the team. It will move the team directory, update the config, and migrate the messages. Existing members keep their registrations and history under the new name. Any already-running session keeps the old cached name until it re-resolves identity — running `/agmsg` again is enough to pick up the new name.
 
 ## See also
 
-- [docs/actas.md](actas.md) — multi-role mechanics (`actas` / `drop`), exclusivity locks, Codex caveat.
-- [README — Shell (any agent)](../README.md#shell-any-agent) — the script quick-reference for sending, inbox, history, delivery mode.
+- [docs/actas.md](actas.md) — multi-role mechanics, exclusivity locks, Codex caveat.
+- [README — Shell (any agent)](../README.md#shell-any-agent) — script quick-reference for automation, CI, sandboxes.
