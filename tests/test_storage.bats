@@ -81,3 +81,40 @@ teardown() {
   default_count=$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" "SELECT COUNT(*) FROM messages;")
   [ "$default_count" -eq 0 ]
 }
+
+@test "storage: agmsg_sqlite sets a busy timeout without polluting output" {
+  # .timeout (not PRAGMA) so the timeout value is never echoed into results.
+  source "$SCRIPTS/lib/storage.sh"
+  run agmsg_sqlite ":memory:" "SELECT 'only-this';"
+  [ "$status" -eq 0 ]
+  [ "$output" = "only-this" ]
+}
+
+@test "send: concurrent fan-out to N recipients all land (no SQLITE_BUSY)" {
+  # Without a busy_timeout, concurrent writers fail with SQLITE_BUSY(5) and the
+  # sends silently drop. With the wrapper they wait and all land. See #114.
+  local x
+  for x in 1 2 3 4 5 6 7 8 9 10; do
+    ( bash "$SCRIPTS/send.sh" team leader "tgt$x" "job $x" >/dev/null 2>&1 ) &
+  done
+  wait
+  local n
+  n=$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "SELECT COUNT(*) FROM messages WHERE from_agent='leader';")
+  [ "$n" -eq 10 ]
+}
+
+@test "send: concurrent fan-out to a FRESH (uninitialized) store all lands" {
+  # No init-db first — every send races to initialize an override store that
+  # doesn't exist yet. Without idempotent init + INSERT retry, the losers abort
+  # on "already exists" / "no such table" and drop. See #114.
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/freshstore"
+  local x
+  for x in 1 2 3 4 5 6 7 8 9 10; do
+    ( bash "$SCRIPTS/send.sh" team leader "tgt$x" "job $x" >/dev/null 2>&1 ) &
+  done
+  wait
+  local n
+  n=$(sqlite3 "$AGMSG_STORAGE_PATH/messages.db" "SELECT COUNT(*) FROM messages;")
+  [ "$n" -eq 10 ]
+}
