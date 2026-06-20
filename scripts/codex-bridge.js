@@ -27,8 +27,12 @@ Options:
   --max-wakes <n>         Stop after n wakeups, useful for tests.
   --stale-wake-limit <n>  Stop after n repeated unchanged wakeups (default: 1).
   --app-server <url>      Connect through an existing app-server endpoint.
-                          Currently supports unix://PATH over WebSocket.
-  --thread <id|current>   Resume an existing app-server thread. "current" uses CODEX_THREAD_ID.
+                          Supports unix://PATH or ws://host:port over WebSocket.
+  --thread <id|current|loaded>
+                          Resume an existing app-server thread. "current" uses
+                          CODEX_THREAD_ID; "loaded" discovers the live TUI thread
+                          via thread/loaded/list (codex 0.141+, see #170).
+  --loaded-timeout <ms>   Max wait for a loaded thread to appear (default: 30000).
   --inline-inbox          Read inbox in the bridge and include message text in the turn input.
   --resolve-only          Print resolved team/name and exit.
   --help                  Show this help.
@@ -80,6 +84,8 @@ function parseArgs(argv) {
       opts.appServer = argv[++i];
     } else if (arg === "--thread") {
       opts.threadId = argv[++i];
+    } else if (arg === "--loaded-timeout") {
+      opts.loadedTimeout = Number(argv[++i]);
     } else if (arg === "--inline-inbox") {
       opts.inlineInbox = true;
     } else {
@@ -247,9 +253,15 @@ class AppServerClient {
   }
 }
 
-class UnixWebSocketAppServerClient {
-  constructor(socketPath) {
-    this.socketPath = socketPath;
+// WebSocket app-server client. The handshake and framing are transport-agnostic;
+// only the connection target differs: a unix socket path ({ path }) for
+// `--app-server unix://…`, or a TCP host/port ({ host, port }) for
+// `--app-server ws://host:port` (codex 0.141+ accepts only ws:// for `--remote`,
+// see #170).
+class WebSocketAppServerClient {
+  constructor(connectOptions, label) {
+    this.connectOptions = connectOptions;
+    this.label = label || "app-server";
     this.nextId = 1;
     this.pending = new Map();
     this.handlers = new Map();
@@ -269,7 +281,7 @@ class UnixWebSocketAppServerClient {
         .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
         .digest("base64");
 
-      this.socket = net.createConnection(this.socketPath);
+      this.socket = net.createConnection(this.connectOptions);
       this.socket.on("connect", () => {
         this.socket.write(
           [
@@ -290,7 +302,7 @@ class UnixWebSocketAppServerClient {
         reject(error);
       });
       this.socket.on("close", () => {
-        this.rejectAll(new Error("app-server socket closed"));
+        this.rejectAll(new Error(`app-server connection closed (${this.label})`));
       });
     });
   }
@@ -566,7 +578,34 @@ class CodexBridge {
     this.client.notify("initialized");
   }
 
+  async resolveLoadedThread() {
+    // codex 0.141+ does not export CODEX_THREAD_ID to hooks and writes no rollout
+    // for --remote sessions, so the thread id cannot be resolved out-of-band.
+    // Ask the app-server which thread the live TUI has loaded instead. See #170.
+    const deadline = Date.now() + (this.opts.loadedTimeout || 30000);
+    for (;;) {
+      const response = await this.client.request("thread/loaded/list", {});
+      const ids = response && Array.isArray(response.data) ? response.data : [];
+      if (ids.length > 0) {
+        if (ids.length > 1) {
+          console.error(
+            `codex-bridge: ${ids.length} threads loaded; attaching to the first (${ids[0]})`,
+          );
+        }
+        return ids[0];
+      }
+      if (Date.now() >= deadline) {
+        die("no loaded codex thread found via thread/loaded/list");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+
   async ensureThread() {
+    if (this.threadId === "loaded") {
+      this.threadId = await this.resolveLoadedThread();
+      console.error(`codex-bridge: discovered loaded thread ${this.threadId}`);
+    }
     if (this.threadId) {
       const response = await this.client.request("thread/resume", {
         threadId: this.threadId,
@@ -896,10 +935,10 @@ function appServerCommand(opts = {}) {
     if (opts.appServer === "stdio://" || opts.appServer === "stdio") {
       return ["codex", "app-server", "--listen", "stdio://"];
     }
-    if (opts.appServer.startsWith("unix://")) {
-      die("--app-server unix:// is handled by the direct WebSocket client");
+    if (opts.appServer.startsWith("unix://") || opts.appServer.startsWith("ws://")) {
+      die("--app-server unix://PATH or ws://host:port is handled by the direct WebSocket client");
     }
-    die("--app-server currently supports only unix://PATH");
+    die("--app-server supports only unix://PATH or ws://host:port");
   }
   if (process.env.AGMSG_CODEX_APP_SERVER_CMD) {
     return ["/bin/sh", "-lc", process.env.AGMSG_CODEX_APP_SERVER_CMD];
@@ -907,12 +946,28 @@ function appServerCommand(opts = {}) {
   return ["codex", "app-server", "--listen", "stdio://"];
 }
 
+function parseWsTarget(url) {
+  // ws://host:port → { host, port }. wss:// would need TLS, which the plain
+  // net socket below does not do; the agmsg app-server is loopback ws only.
+  const match = /^ws:\/\/([^/:]+):(\d+)\/?$/.exec(url);
+  if (!match) die(`--app-server ${url} must be ws://host:port`);
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    die(`--app-server ${url} has an invalid port`);
+  }
+  return { host: match[1], port };
+}
+
 function createAppServerClient(opts) {
   if (opts.appServer && opts.appServer.startsWith("unix://")) {
     const rawSocketPath = opts.appServer.slice("unix://".length);
     if (!rawSocketPath) die("--app-server unix:// requires a socket path");
     const socketPath = path.isAbsolute(rawSocketPath) ? rawSocketPath : path.resolve(process.cwd(), rawSocketPath);
-    return new UnixWebSocketAppServerClient(socketPath);
+    return new WebSocketAppServerClient({ path: socketPath }, `unix://${socketPath}`);
+  }
+  if (opts.appServer && opts.appServer.startsWith("ws://")) {
+    const target = parseWsTarget(opts.appServer);
+    return new WebSocketAppServerClient(target, opts.appServer);
   }
   return new AppServerClient(appServerCommand(opts), opts.project);
 }

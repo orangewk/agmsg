@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs outside Codex's tool sandbox, waiting for SessionStart to publish the
-# current thread id. The hook only writes a request file; this launcher owns the
-# app-server socket connection and starts codex-bridge.js from the unsandboxed
-# codex-monitor.sh wrapper process.
+# Runs outside Codex's tool sandbox and owns the app-server connection: it starts
+# codex-bridge.js for this project's single codex identity.
+#
+# On codex 0.141+ the SessionStart hook cannot resolve the thread id
+# (CODEX_THREAD_ID is not exported and no rollout is written for --remote
+# sessions), so the bridge discovers the live TUI thread itself via
+# thread/loaded/list (`--thread loaded`). If an older codex DID write a request
+# file with a real thread id, that id is used instead. See #170, #41.
 
 TYPE="${1:?Usage: codex-bridge-launcher.sh <type> <project_path> <app_server> <parent_pid>}"
 PROJECT="${2:?Missing project_path}"
@@ -16,42 +20,69 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
 PROJECT_HASH="$(printf '%s' "$PROJECT" | shasum | awk '{print $1}')"
 REQUEST_FILE="$RUN_DIR/codex-bridge-request.$PROJECT_HASH"
+TAB="$(printf '\t')"
 
 mkdir -p "$RUN_DIR"
 
-last_request=""
+resolve_identity() {  # prints "team<TAB>name" lines for the project's codex roles
+  "$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null \
+    | awk -v t="$TAB" 'NF >= 2 { print $1 t $2 }' \
+    | sort -u
+}
+
+# actas may register the role a moment after launch, so retry while the parent
+# (codex-monitor.sh) is alive. Proceed only when exactly one identity resolves.
+team="" name=""
 while kill -0 "$PARENT_PID" 2>/dev/null; do
-  if [ -f "$REQUEST_FILE" ]; then
-    request="$(cat "$REQUEST_FILE" 2>/dev/null || true)"
-    if [ -n "$request" ] && [ "$request" != "$last_request" ]; then
-      last_request="$request"
-      IFS="$(printf '\t')" read -r req_type team name thread_id req_app_server <<EOF
-$request
+  ids="$(resolve_identity || true)"
+  count="$(printf '%s\n' "$ids" | grep -c . || true)"
+  if [ "$count" = "1" ]; then
+    IFS="$TAB" read -r team name <<EOF
+$ids
 EOF
-      [ -n "${req_type:-}" ] || req_type="$TYPE"
-      [ -n "${req_app_server:-}" ] || req_app_server="$APP_SERVER"
-      if [ -n "${team:-}" ] && [ -n "${name:-}" ] && [ -n "${thread_id:-}" ]; then
-        pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
-        if [ -f "$pidfile" ]; then
-          bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
-          if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
-            sleep 0.2
-            continue
-          fi
-        fi
-        log="$RUN_DIR/codex-bridge.$team.$name.log"
-        bridge_cmd="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/codex-bridge.js}"
-        nohup "$bridge_cmd" \
-          --project "$PROJECT" \
-          --type "$req_type" \
-          --team "$team" \
-          --name "$name" \
-          --thread "$thread_id" \
-          --app-server "$req_app_server" \
-          --inline-inbox \
-          >>"$log" 2>&1 &
-      fi
+    [ -n "$team" ] && [ -n "$name" ] && break
+    team="" name=""
+  fi
+  sleep 0.3
+done
+[ -n "$team" ] && [ -n "$name" ] || exit 0
+
+pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
+log="$RUN_DIR/codex-bridge.$team.$name.log"
+bridge_cmd="${AGMSG_CODEX_BRIDGE_CMD:-$SCRIPT_DIR/codex-bridge.js}"
+
+while kill -0 "$PARENT_PID" 2>/dev/null; do
+  if [ -f "$pidfile" ]; then
+    bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
+      sleep 0.3
+      continue
     fi
   fi
-  sleep 0.2
+
+  # Thread source: a request file (older-codex hook) wins; otherwise discover the
+  # live TUI thread via thread/loaded/list.
+  thread_id="loaded"
+  req_app_server="$APP_SERVER"
+  if [ -f "$REQUEST_FILE" ]; then
+    request="$(cat "$REQUEST_FILE" 2>/dev/null || true)"
+    if [ -n "$request" ]; then
+      IFS="$TAB" read -r _rtype _rteam _rname _rthread _rapp <<EOF
+$request
+EOF
+      [ -n "${_rthread:-}" ] && thread_id="$_rthread"
+      [ -n "${_rapp:-}" ] && req_app_server="$_rapp"
+    fi
+  fi
+
+  nohup "$bridge_cmd" \
+    --project "$PROJECT" \
+    --type "$TYPE" \
+    --team "$team" \
+    --name "$name" \
+    --thread "$thread_id" \
+    --app-server "$req_app_server" \
+    --inline-inbox \
+    >>"$log" 2>&1 &
+  sleep 1
 done
