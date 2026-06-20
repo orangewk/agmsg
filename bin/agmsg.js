@@ -29,9 +29,23 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const SETUP_URL = 'https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh';
+const RAW_BASE = 'https://raw.githubusercontent.com/fujibee/agmsg';
 const REPO_URL = 'https://github.com/fujibee/agmsg';
 const HOMEPAGE = 'https://agmsg.cc';
+
+// Install the repo ref that matches THIS bootstrapper's version, so
+// `npx agmsg@X` installs X — not whatever happens to be on main. We fetch
+// setup.sh from the matching tag AND pass AGMSG_REF so setup.sh clones the
+// same tag. Falls back to main only when the version can't be read (e.g. a
+// dev checkout with no published tag). See #172.
+//
+// Bootstrappers published before this fix (<= 1.0.5) hardcoded main and
+// cannot be retrofitted — `npx agmsg@1.0.5` will still pull main. Pinning
+// holds from the first release that ships this file (1.0.6) onward.
+function installRef() {
+  const v = readVersion();
+  return v && v !== '?' ? 'v' + v : 'main';
+}
 
 function readVersion() {
   try {
@@ -75,21 +89,27 @@ function runInstaller(passthroughArgs) {
   // bootstrapper plus a still-vulnerable install.sh would also work; doing it
   // correctly here is defense-in-depth and lets future interactive prompts
   // in setup.sh keep working for real-tty users.
+  const ref = installRef();
+  const setupUrl = RAW_BASE + '/' + ref + '/setup.sh';
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agmsg-bootstrap-'));
   const setupPath = path.join(tmpDir, 'setup.sh');
 
   try {
-    const fetch = spawnSync('curl', ['-fsSL', '-o', setupPath, SETUP_URL], { stdio: 'inherit' });
+    const fetch = spawnSync('curl', ['-fsSL', '-o', setupPath, setupUrl], { stdio: 'inherit' });
     if (fetch.error) {
       console.error('agmsg: failed to launch curl:', fetch.error.message);
       process.exit(1);
     }
     if (fetch.status !== 0) {
-      console.error('agmsg: curl exited ' + fetch.status + ' fetching ' + SETUP_URL);
+      console.error('agmsg: curl exited ' + fetch.status + ' fetching ' + setupUrl);
       process.exit(fetch.status || 1);
     }
 
-    const result = spawnSync('bash', [setupPath, ...passthroughArgs], { stdio: 'inherit' });
+    // Pin the clone inside setup.sh to the same ref we fetched it from.
+    const result = spawnSync('bash', [setupPath, ...passthroughArgs], {
+      stdio: 'inherit',
+      env: Object.assign({}, process.env, { AGMSG_REF: ref })
+    });
     if (result.error) {
       console.error('agmsg: failed to launch bash:', result.error.message);
       process.exit(1);
