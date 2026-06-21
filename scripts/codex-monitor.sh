@@ -84,9 +84,14 @@ port_alive() {  # $1 = port; succeeds if something is accepting on 127.0.0.1:$1
 }
 
 PORT=""
-if [ -f "$PORT_FILE" ]; then
+if [ -f "$PORT_FILE" ] && [ -f "$SERVER_PID" ]; then
   existing_port="$(cat "$PORT_FILE" 2>/dev/null || true)"
-  if [ -n "$existing_port" ] && port_alive "$existing_port"; then
+  existing_pid="$(cat "$SERVER_PID" 2>/dev/null || true)"
+  # Reuse only when OUR recorded app-server is still alive AND its port answers,
+  # so a foreign process that grabbed the same port after ours died is not
+  # mistaken for the bridge app-server.
+  if [ -n "$existing_port" ] && [ -n "$existing_pid" ] \
+    && kill -0 "$existing_pid" 2>/dev/null && port_alive "$existing_port"; then
     PORT="$existing_port"
   fi
 fi

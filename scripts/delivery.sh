@@ -37,6 +37,8 @@ RUN_DIR="$SKILL_DIR/run"
 . "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/instance-id.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/node.sh"
 
 resolve_hooks_file() {
   local type="$1"
@@ -534,11 +536,13 @@ do_set() {
         # Presence only: the bridge uses old/stable APIs (the sole modern feature
         # is one optional-chaining call, Node 14+), and any Node new enough to run
         # Codex itself runs the bridge — so a version gate would be noise.
-        # AGMSG_CODEX_NODE overrides the binary the check looks for (also testable).
-        codex_node="${AGMSG_CODEX_NODE:-node}"
-        if ! command -v "$codex_node" >/dev/null 2>&1; then
-          echo "WARNING: Node.js ('$codex_node') was not found on PATH. The Codex bridge needs Node —"
-          echo "  monitor delivery will NOT start until Node is installed."
+        # Resolve via the same path the runtime uses (lib/node.sh) so this warning
+        # matches what the launcher will actually do — including a version-manager
+        # Node off PATH. AGMSG_NODE / AGMSG_CODEX_NODE override the binary.
+        codex_node="$(agmsg_resolve_node)"
+        if ! command -v "$codex_node" >/dev/null 2>&1 && [ ! -x "$codex_node" ]; then
+          echo "WARNING: Node.js ('$codex_node') was not found. The Codex bridge needs Node —"
+          echo "  monitor delivery will NOT start until Node is installed (or set AGMSG_NODE)."
         fi
         # The bridge launches from the Codex SessionStart hook, which fires on the
         # FIRST turn of a new session (not the moment Codex opens) — and an

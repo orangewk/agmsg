@@ -12,12 +12,20 @@
 # relying on PATH today (the caller still fails the same way, with the existing
 # delivery.sh preflight warning). See #170.
 agmsg_resolve_node() {
-  if command -v node >/dev/null 2>&1; then
-    command -v node
+  # An explicit override is authoritative — return it verbatim, even if it does
+  # not exist, so the caller's preflight surfaces a misconfigured value rather
+  # than silently falling back. AGMSG_NODE is the canonical name; AGMSG_CODEX_NODE
+  # is kept for back-compat with the delivery.sh preflight.
+  if [ -n "${AGMSG_NODE:-}" ]; then
+    printf '%s\n' "$AGMSG_NODE"
     return 0
   fi
-  if [ -n "${AGMSG_NODE:-}" ] && [ -x "${AGMSG_NODE}" ]; then
-    printf '%s\n' "$AGMSG_NODE"
+  if [ -n "${AGMSG_CODEX_NODE:-}" ]; then
+    printf '%s\n' "$AGMSG_CODEX_NODE"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    command -v node
     return 0
   fi
 
