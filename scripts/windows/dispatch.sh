@@ -205,6 +205,14 @@ case "$COMMAND" in
     fi
     ;;
 
+  plugin)
+    if [ "$#" -eq 0 ]; then
+      run_script plugin.sh list
+    else
+      run_script plugin.sh "$@"
+    fi
+    ;;
+
   mode)
     case "$#" in
       0)

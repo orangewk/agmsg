@@ -10,11 +10,11 @@
 # A small per-key reader is used, so a third-party add-on's manifest cannot
 # execute code. Multi-value keys are space-separated.
 #
-# Search order:
-#   1. in-tree built-ins:  <skill-root>/scripts/drivers/types
-#   2. external add-ons:   ${AGMSG_HOME:-$HOME/.config/agmsg}/types
-# Built-in names are reserved; if the same name appears in both, the in-tree one
-# wins (listed first).
+# Discovery + trust are delegated to driver-registry.sh (this is the "types"
+# axis). Search bases are <root>/scripts/drivers (built-in), <root>/plugins, and
+# $AGMSG_PLUGIN_DIRS. External drivers must be opted into (`agmsg plugin trust`);
+# untrusted drop-ins are ignored. Later bases override earlier ones among
+# eligible candidates, so an opted-in plugin can shadow a built-in.
 #
 # Safe under `set -u`: every env read is guarded.
 
@@ -25,43 +25,64 @@
 # queried later.
 _AGMSG_REGISTRY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
-# Echo the type search directories, one per line (in-tree first).
-_agmsg_type_search_dirs() {
-  local root="${AGMSG_TYPES_ROOT:-}"
-  if [ -z "$root" ]; then
-    # this lib lives at <root>/scripts/lib/type-registry.sh -> up two = <root>
-    root="$(cd "$_AGMSG_REGISTRY_LIB_DIR/../.." 2>/dev/null && pwd)"
-  fi
-  [ -n "$root" ] && printf '%s\n' "$root/scripts/drivers/types"
-  # ${HOME:-} keeps this safe under `set -u` with an empty environment.
-  local ext="${AGMSG_HOME:-${HOME:-}/.config/agmsg}/types"
-  [ -n "$root" ] && [ "$ext" = "$root/types" ] || printf '%s\n' "$ext"
+# Axis-generic bases + trust policy.
+# shellcheck disable=SC1091
+. "$_AGMSG_REGISTRY_LIB_DIR/driver-registry.sh"
+
+# Warn (once per process, on stderr) about any untrusted external 'types' driver
+# that is present. An unexpected drop-in is a potential attack, so it is ignored
+# until opted into; this tells the user it exists and how to trust it.
+_agmsg_type_warn_untrusted() {
+  [ -n "${_AGMSG_TYPE_WARNED:-}" ] && return 0
+  _AGMSG_TYPE_WARNED=1
+  local kind base dir name
+  while IFS=$'\t' read -r kind base; do
+    [ "$kind" = external ] && [ -d "$base/types" ] || continue
+    for dir in "$base"/types/*/; do
+      [ -f "${dir}type.conf" ] || continue
+      name="$(basename "$dir")"
+      agmsg_driver_is_trusted types "$name" "${dir%/}" && continue
+      printf "agmsg: external plugin 'types/%s' found at %s but not trusted (ignored).\n       Opt in if you put it there intentionally: agmsg plugin trust types/%s\n" \
+        "$name" "${dir%/}" "$name" >&2
+    done
+  done <<EOF
+$(agmsg_driver_bases)
+EOF
 }
 
-# Echo the directory holding <name>/type.conf, or return 1.
+# Echo the directory holding <name>/type.conf, or return 1. Later bases override
+# earlier ones among ELIGIBLE candidates: built-ins are always eligible; external
+# drivers only once opted into. Untrusted external candidates are skipped.
 agmsg_type_dir() {
-  local want="$1" d
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    [ -f "$d/$want/type.conf" ] && { printf '%s\n' "$d/$want"; return 0; }
+  local want="$1" kind base dir chosen=""
+  while IFS=$'\t' read -r kind base; do
+    dir="$base/types/$want"
+    [ -f "$dir/type.conf" ] || continue
+    if [ "$kind" = builtin ] || agmsg_driver_is_trusted types "$want" "$dir"; then
+      chosen="$dir"
+    fi
   done <<EOF
-$(_agmsg_type_search_dirs)
+$(agmsg_driver_bases)
 EOF
+  [ -n "$chosen" ] && { printf '%s\n' "$chosen"; return 0; }
   return 1
 }
 
-# List all known type names (deduped, sorted).
+# List all known (eligible) type names, with duplicates the caller dedups via
+# `sort -u`. Surfaces untrusted-external warnings as a side effect (once/process).
 agmsg_known_types() {
-  local d sub name
-  while IFS= read -r d; do
-    [ -n "$d" ] && [ -d "$d" ] || continue
-    for sub in "$d"/*/; do
-      [ -f "${sub}type.conf" ] || continue
-      name="$(basename "$sub")"
+  _agmsg_type_warn_untrusted
+  local kind base dir name
+  while IFS=$'\t' read -r kind base; do
+    [ -d "$base/types" ] || continue
+    for dir in "$base"/types/*/; do
+      [ -f "${dir}type.conf" ] || continue
+      name="$(basename "$dir")"
+      [ "$kind" = builtin ] || agmsg_driver_is_trusted types "$name" "${dir%/}" || continue
       printf '%s\n' "$name"
     done
   done <<EOF
-$(_agmsg_type_search_dirs)
+$(agmsg_driver_bases)
 EOF
 }
 

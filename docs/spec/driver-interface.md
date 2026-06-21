@@ -13,7 +13,9 @@ These conventions apply to every driver on every axis.
 
 ### 1.1 Driver location
 
-Bundled drivers live at `scripts/drivers/<axis>/<name>.sh`. Their metadata is implicit and tied to the agmsg core version.
+Bundled drivers live at `scripts/drivers/<axis>/<name>`. File-based axes use a single `<name>.sh`; the agent-type ("types") axis uses a directory `scripts/drivers/types/<name>/` holding a `type.conf` manifest plus the type's runtime. Their metadata is implicit and tied to the agmsg core version.
+
+External (non-bundled) drivers are discovered from `<install_dir>/plugins/<axis>/<name>` and from `$AGMSG_PLUGIN_DIRS`, and must be opted into — see [ADR 0002](../adr/0002-driver-discovery-and-plugin-opt-in.md).
 
 ### 1.2 Calling convention
 
@@ -149,7 +151,7 @@ Active driver per axis is recorded in `~/.agents/agmsg/config.json`:
 
 ## 5. Out of scope (deferred)
 
-- **Plugin loader** — `~/.agents/agmsg/plugins/<axis>/<name>/` discovery, `plugin.json` parsing, `min_core_version` gating, and the `incompatible_core` status code. Deferred until a concrete third-party driver is wanted; in the meantime, all drivers ship bundled.
+- **Plugin loader** — external-driver discovery (`<install_dir>/plugins/`, `$AGMSG_PLUGIN_DIRS`) and the opt-in trust model are now defined by [ADR 0002](../adr/0002-driver-discovery-and-plugin-opt-in.md). Still deferred from that loader: `plugin.json` metadata parsing, `min_core_version` gating, and the `incompatible_core` status code.
 - **Plugin signing or sandboxing** — orthogonal to the loader; would be addressed when the loader lands.
 - **Per-project active driver override** — v1 is machine-wide; future enhancement.
 - **Subcommand + JSONL-pipe driver protocol** (language-independent drivers) — deferred until a non-bash driver is actually wanted.

@@ -68,25 +68,31 @@ node <type-dir>/<spawn>.mjs --name <name> --team <team> --project <path> --initi
 All type-specific configuration (which binary, which model, which transport, env
 vars) is the launcher's **own default / environment** — agmsg core never names any
 add-on. This is what lets a node-launcher type ship entirely outside the agmsg tree
-(under `${AGMSG_HOME:-$HOME/.config/agmsg}/types`) with no built-in edits.
+as an external plugin (under `<install_dir>/plugins/types/<name>/` or a dir on
+`$AGMSG_PLUGIN_DIRS`) with no built-in edits. External types must be opted into
+with `agmsg plugin trust types/<name>` — see
+[ADR 0002](adr/0002-driver-discovery-and-plugin-opt-in.md).
 
 ## Adding a type
 
-1. Create `types/<name>/type.conf` with at least `name`, `template`, and
-   `hooks_file` (add `detect`/`detect_proc` for auto-detection, and `cli` +
-   `spawnable=yes` if `spawn.sh` should launch it).
-2. Add the command template `templates/cmd.<name>.md`.
-3. If the type needs a delivery hook format that doesn't exist yet, add an
-   `apply_settings_<name>` path in `delivery.sh`. Reusing an existing format needs
-   no code.
+1. Create `scripts/drivers/types/<name>/type.conf` with at least `name`,
+   `template`, and `hooks_file` (add `detect`/`detect_proc` for auto-detection,
+   `cli` + `spawnable=yes` if `spawn.sh` should launch it, and `delivery_modes` to
+   restrict the modes the type accepts).
+2. Add the command template beside the manifest as `template.md` (the path the
+   `template=` key names, relative to the type dir).
+3. If the type needs a delivery behavior that doesn't exist yet, add a
+   `_delivery.sh` plug in the type dir overriding `agmsg_delivery_apply` /
+   `on_enable` / `on_disable` / `status`. Reusing an existing format (default JSON
+   hooks, or `rulefile_apply`) needs no code.
 
 That's it — `whoami.sh`, `join.sh`, and `spawn.sh` pick the type up from the
 registry with no further edits.
 
 ## Worked example
 
-The six built-in manifests under `types/` are the reference. For instance
-`types/codex/type.conf`:
+The six built-in manifests under `scripts/drivers/types/` are the reference. For
+instance `scripts/drivers/types/codex/type.conf`:
 
 ```
 name=codex
