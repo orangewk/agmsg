@@ -78,7 +78,7 @@ _agmsg_escape_flag() {
 
 agmsg_sqlite() {
   # shellcheck disable=SC2046  # intentional split: "-escape off" → two args, or none
-  sqlite3 $(_agmsg_escape_flag) -cmd ".timeout ${AGMSG_BUSY_TIMEOUT:-5000}" "$@"
+  sqlite3 $(_agmsg_escape_flag) -cmd ".timeout ${AGMSG_BUSY_TIMEOUT:-5000}" "$@" | tr -d '\r'
 }
 
 # In-memory sqlite for JSON parsing / scalar lookups whose stdout is captured in

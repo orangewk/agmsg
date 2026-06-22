@@ -121,11 +121,16 @@ if [ -f "$WATERMARK_FILE" ]; then
   case "$WATERMARK" in ''|*[!0-9]*) WATERMARK="" ;; esac
 fi
 if [ -z "$WATERMARK" ]; then
-  WATERMARK="$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages;" 2>/dev/null || echo 0)"
+  # Seed from the latest *read* message for this agent so that current unread
+  # messages are still delivered on the first check (unlike watch.sh which seeds
+  # at MAX(id) since monitor mode only cares about post-attach messages).
+  WATERMARK="$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages WHERE to_agent='$AGENT' AND read_at IS NOT NULL;" 2>/dev/null || echo 0)"
   case "$WATERMARK" in ''|*[!0-9]*) WATERMARK=0 ;; esac
   persist_check_watermark
 else
-  DB_MAX="$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages;" 2>/dev/null || echo 0)"
+  # Safety valve: if the DB was recreated (id space shrank), clamp the
+  # watermark down so we don't skip the entire new store.
+  DB_MAX="$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages WHERE to_agent='$AGENT';" 2>/dev/null || echo 0)"
   case "$DB_MAX" in ''|*[!0-9]*) DB_MAX=0 ;; esac
   if [ "$DB_MAX" -lt "$WATERMARK" ]; then
     WATERMARK="$DB_MAX"
