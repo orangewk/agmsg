@@ -250,7 +250,7 @@ if [ "$UPDATE_ONLY" = true ]; then
   # shared SKILL.md; their dedicated copies are dropped separately below.)
   TPL_TYPE="codex"
   case "$AGENT_TYPE" in
-    gemini|antigravity|opencode|hermes) TPL_TYPE="$AGENT_TYPE" ;;
+    gemini|antigravity|opencode|hermes|cursor) TPL_TYPE="$AGENT_TYPE" ;;
   esac
   sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
   # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/)
@@ -340,7 +340,7 @@ mkdir -p "$SKILL_DIR"/{scripts,types,db,agents}
 # codex template by default; gemini/antigravity/opencode get their own.
 TPL_TYPE="codex"
 case "$AGENT_TYPE" in
-  gemini|antigravity|opencode|hermes) TPL_TYPE="$AGENT_TYPE" ;;
+  gemini|antigravity|opencode|hermes|cursor) TPL_TYPE="$AGENT_TYPE" ;;
 esac
 sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
 # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/) ship

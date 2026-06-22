@@ -489,6 +489,15 @@ PY
   ! grep -q "whoami.sh \"\$(pwd)\" antigravity" "$SK/SKILL.md"
 }
 
+@test "install: --agent-type cursor makes shared SKILL.md Cursor-typed (#131)" {
+  # Regression guard: the TPL_TYPE case must list cursor, or --agent-type cursor
+  # silently falls through to the codex template and the install ships a
+  # codex-typed SKILL.md (delivery/join then run as codex, not cursor).
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type cursor
+  grep -q "whoami.sh \"\$(pwd)\" cursor" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+}
+
 @test "install --update: refreshes the Hermes skill if it was previously installed" {
   mkdir -p "$FAKE_HOME/.hermes"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
