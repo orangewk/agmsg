@@ -98,17 +98,20 @@ ids) and `at` (ISO-8601 UTC). `storage_send` prints the new message's `id` on a
 single line. The `watch_*` pair is defined in §2.2.
 
 **stdout framing.** The **control ops** — `storage_check`, `storage_init`,
-`storage_mark_read_batch`, `storage_describe`, `storage_compact` — **must** use
-the §1.4 convention: a status name (`ok` / `missing_deps` / `runtime_error` / …)
-on the last stdout line, with the matching exit code. The **record-returning
-ops** — `storage_send`, `storage_list_unread`, `storage_history`,
-`storage_watch_tip`, `storage_watch_after` — write **data only** to stdout (JSONL
-records, or a bare id / cursor token; one record per line) and signal outcome
-with the **exit code** alone: `0` on success, non-zero with a message on
-**stderr** on failure. They never emit a §1.4 status name to stdout, so a status
-word can never be misread as a record. The trailing `cursor` record of
-`storage_watch_after` is part of that data stream (a designated final line), not
-a status.
+`storage_mark_read_batch`, `storage_compact` — **must** use the §1.4 convention:
+a status name (`ok` / `missing_deps` / `runtime_error` / …) on the last stdout
+line, with the matching exit code. The **record-returning ops** —
+`storage_send`, `storage_list_unread`, `storage_history`, `storage_watch_tip`,
+`storage_watch_after` — write **data only** to stdout (JSONL records, or a bare
+id / cursor token; one record per line) and signal outcome with the **exit code**
+alone: `0` on success, non-zero with a message on **stderr** on failure. They
+never emit a §1.4 status name to stdout, so a status word can never be misread as
+a record. The trailing `cursor` record of `storage_watch_after` is part of that
+data stream (a designated final line), not a status.
+
+`storage_describe` is a **metadata op**, not a control op: it always exits 0 and
+writes only its `key=value` registry metadata to stdout — never a §1.4 status
+name, which a metadata consumer would otherwise misread.
 
 ### 2.2 Delivery cursor (watch / replay)
 

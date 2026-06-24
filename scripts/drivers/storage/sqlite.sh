@@ -24,9 +24,11 @@ _sqlite_lit() { printf '%s' "$1" | sed "s/'/''/g"; }
 
 # Run a record-returning query: strip CR but PRESERVE the sqlite exit status
 # (pipefail), so a backend failure surfaces as a non-zero return instead of
-# being swallowed by tr's exit 0 (§2.1 stdout framing / co1 review).
+# being swallowed by tr's exit 0. The backend's error text goes to stderr (a
+# separate fd — it never pollutes the JSONL on stdout) so failures are
+# debuggable, per §2.1 framing (#203 (1) / co1 review).
 _sqlite_data() {
-  ( set -o pipefail; agmsg_sqlite "$(_sqlite_db)" "$1" 2>/dev/null | tr -d '\r' )
+  ( set -o pipefail; agmsg_sqlite "$(_sqlite_db)" "$1" | tr -d '\r' )
 }
 
 # UUIDv7: 48-bit ms timestamp + version/variant + random. python3 preferred;
@@ -137,12 +139,13 @@ storage_list_unread() {
   shift 2
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
+  storage_init >/dev/null
   local tl al; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
   _sqlite_data "
     SELECT j FROM (
       SELECT json_object('type','message_sent','id',e.id,'team',e.team,
                'from',e.from_agent,'to',e.to_agent,'body',e.body,'at',e.at) AS j,
-             1 AS src, e.seq AS ord
+             e.at AS ts, 1 AS src, e.seq AS ord
       FROM events e
       WHERE e.type='message_sent' AND e.team='$tl' AND e.to_agent='$al'
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
@@ -150,13 +153,13 @@ storage_list_unread() {
       UNION ALL
       SELECT json_object('type','message_sent','id',CAST(m.id AS TEXT),'team',m.team,
                'from',m.from_agent,'to',m.to_agent,'body',m.body,'at',m.created_at) AS j,
-             0 AS src, m.id AS ord
+             m.created_at AS ts, 0 AS src, m.id AS ord
       FROM messages m
       WHERE m.team='$tl' AND m.to_agent='$al' AND m.read_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
                         AND r.team=m.team AND r.agent='$al' AND r.msg_id=CAST(m.id AS TEXT))
     )
-    ORDER BY src, ord ${limit:+LIMIT $limit};
+    ORDER BY ts, src, ord ${limit:+LIMIT $limit};
   "
 }
 
@@ -212,21 +215,22 @@ storage_history() {
   shift 2
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
+  storage_init >/dev/null
   local tl al; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
   _sqlite_data "
     SELECT j FROM (
       SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
-               'to',to_agent,'body',body,'at',at) AS j, 1 AS src, seq AS ord
+               'to',to_agent,'body',body,'at',at) AS j, at AS ts, 1 AS src, seq AS ord
       FROM events
       WHERE type='message_sent' AND team='$tl' AND (to_agent='$al' OR from_agent='$al')
       UNION ALL
       SELECT json_object('type','message_sent','id',CAST(id AS TEXT),'team',team,
                'from',from_agent,'to',to_agent,'body',body,'at',created_at) AS j,
-             0 AS src, id AS ord
+             created_at AS ts, 0 AS src, id AS ord
       FROM messages
       WHERE team='$tl' AND (to_agent='$al' OR from_agent='$al')
     )
-    ORDER BY src, ord ${limit:+LIMIT $limit};
+    ORDER BY ts, src, ord ${limit:+LIMIT $limit};
   "
 }
 
