@@ -181,10 +181,15 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 }
 
 @test "contract: a data op fails non-zero on a broken store (no silent success)" {
-  # pipefail must surface the backend error instead of tr swallowing it.
-  local db; db="$(agmsg_db_path)"
-  rm -f "$db"-wal "$db"-shm
-  printf 'not a sqlite database' > "$db"
+  # A backend error must surface as a non-zero exit, never a silent empty result.
+  # Corruption is store-specific, so break whichever store the active driver reads.
+  if [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ]; then
+    printf 'not json at all {{{\n' > "$(dirname "$(agmsg_db_path)")/events.jsonl"
+  else
+    local db; db="$(agmsg_db_path)"
+    rm -f "$db"-wal "$db"-shm
+    printf 'not a sqlite database' > "$db"
+  fi
   run storage_list_unread agsuite bob
   [ "$status" -ne 0 ]
 }
@@ -252,6 +257,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 # --- sqlite-specific: compaction physically shrinks the log -----------------
 
 @test "contract(sqlite): compact coalesces tail duplicates AND high-water keeps the tip/cursor safe" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (direct events-table injection / high-water)"
   # This is the test that actually EXERCISES cursor-safety: mark_read_batch is
   # write-idempotent, so the driver-agnostic cursor tests above never create the
   # tail-duplicate rows whose deletion would regress a naive MAX(seq) tip. Here we
@@ -292,6 +298,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 }
 
 @test "contract(sqlite): forward-compat — export/list/history ignore an unknown event type" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (direct events-table injection)"
   local db; db="$(agmsg_db_path)"
   storage_send agsuite alice bob "known"
   # a v2-style event a v1 reader has never seen — must be skipped, not leaked.
@@ -321,6 +328,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 # legacy table). Existing installs must keep their inbox + history at cutover.
 
 @test "contract(sqlite): legacy messages rows surface in unread and history" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (legacy messages table)"
   local db; db="$(agmsg_db_path)"
   agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body,read_at)
     VALUES ('agsuite','alice','bob','legacy-unread',NULL),
@@ -334,6 +342,7 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 }
 
 @test "contract(sqlite): marking a legacy id read hides it without mutating the row" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific (legacy messages table)"
   local db; db="$(agmsg_db_path)"
   agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body)
     VALUES ('agsuite','alice','bob','legacy-x');"
