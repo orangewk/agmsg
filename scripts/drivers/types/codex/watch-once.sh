@@ -57,7 +57,6 @@ source "$SCRIPT_DIR/../../../lib/resolve-project.sh"
 source "$SCRIPT_DIR/../../../lib/subscription.sh"
 
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
-DB="$(agmsg_db_path)"
 
 PAIRS="$(agmsg_subscription_pairs "$PROJECT_PATH" "$AGENT_TYPE" "" "$ACTIVE_NAME")" || exit 1
 if [ -n "$TEAM_FILTER" ]; then
@@ -72,13 +71,15 @@ fi
 deadline=$(( $(date +%s) + TIMEOUT ))
 
 while true; do
-  if [ -f "$DB" ]; then
+  if storage_store_exists; then
     # Unread across the subscription via the storage facade (§2.1, events ∪ legacy)
-    # — one storage_list_unread per pair, summed. max_id is an OPAQUE token: the
-    # greatest unread id across pairs, used by codex-bridge only for equality
-    # (stale-wake detection), never ordered. It is no longer an integer.
+    # — one storage_list_unread per pair, summed. max_id is an OPAQUE equality-only
+    # token for codex-bridge stale-wake detection (never ordered): a cksum DIGEST of
+    # the whole unread SET, so it changes whenever the set changes. A "greatest id"
+    # frontier could miss a set change under a backend whose ids aren't
+    # recency-ordered (jsonl); a set digest is robust on every backend.
     count=0
-    max_id=""
+    all_ids=""
     while IFS=$'\t' read -r _team _agent; do
       [ -n "$_team" ] && [ -n "$_agent" ] || continue
       u="$(storage_list_unread "$_team" "$_agent" 2>/dev/null || true)"
@@ -89,10 +90,13 @@ while true; do
       " 2>/dev/null || true)"
       [ -n "$ids" ] || continue
       count=$(( count + $(printf '%s\n' "$ids" | grep -c .) ))
-      pairmax="$(printf '%s\n' "$ids" | LC_ALL=C sort | tail -1)"
-      if [ -z "$max_id" ] || [ "$pairmax" \> "$max_id" ]; then max_id="$pairmax"; fi
+      all_ids="$all_ids$ids"$'\n'
     done <<< "$PAIRS"
     if [ "$count" -gt 0 ]; then
+      # cksum = POSIX (no shasum dep). Field 1 is whitespace-free for the bridge's
+      # `max_id=(\S+)` parse. The bridge only compares it within one session, so the
+      # checksum needn't be stable across platforms — only deterministic per run.
+      max_id="$(printf '%s' "$all_ids" | sed '/^$/d' | LC_ALL=C sort | cksum | cut -d' ' -f1)"
       printf 'status=pending count=%s max_id=%s\n' "$count" "$max_id"
       exit 0
     fi
