@@ -93,10 +93,21 @@ storage_import <file>
 storage_compact                # internal; see §2.7
 ```
 
-Record-returning functions write one JSON object per line (JSONL) to stdout and
-follow §1.4 for status. Every record carries `id` (UUIDv7 for new writes, an
-opaque string for legacy ids) and `at` (ISO-8601 UTC). `storage_send` prints the
-new message's `id` on a single line. The `watch_*` pair is defined in §2.2.
+Every record carries `id` (UUIDv7 for new writes, an opaque string for legacy
+ids) and `at` (ISO-8601 UTC). `storage_send` prints the new message's `id` on a
+single line. The `watch_*` pair is defined in §2.2.
+
+**stdout framing.** The §1.4 convention (a status name on the last stdout line)
+applies only to the **control ops** — `storage_check`, `storage_init`,
+`storage_mark_read_batch`, `storage_describe`, `storage_compact`. The
+**record-returning ops** — `storage_send`, `storage_list_unread`,
+`storage_history`, `storage_watch_tip`, `storage_watch_after` — write **data
+only** to stdout (JSONL records, or a bare id / cursor token; one record per
+line) and signal outcome with the **exit code** alone: `0` on success, non-zero
+with a message on **stderr** on failure. They never emit a §1.4 status name to
+stdout, so a status word can never be misread as a record. The trailing `cursor`
+record of `storage_watch_after` is part of that data stream (a designated final
+line), not a status.
 
 ### 2.2 Delivery cursor (watch / replay)
 
@@ -109,6 +120,14 @@ compares, or orders cursors.** This is what lets one contract serve sqlite
 integer ids, UUIDv7, Redis stream ids, and JSONL byte offsets — the
 `id > watermark` integer assumption is removed from core entirely.
 
+The cursor is opaque to core but constrained for transport: it must be a
+**single-line, whitespace-free, printable token** that survives being written to
+a run-dir file and passed back as one `argv` argument to the sourced driver.
+Native positions that already satisfy this (a sqlite integer `seq`, a Redis
+stream id) are used as-is; a driver whose native position carries unsafe
+characters (e.g. a JSONL byte offset bundled with metadata) must encode it
+(base64url or similar) into a single safe token.
+
 - `storage_watch_tip <pairs...>` — print the cursor for "now" (the current tip of
   the global order) as a single bare line. A fresh watcher starts here, so it
   delivers only messages that arrive *after* it attached (no history replay; the
@@ -116,10 +135,14 @@ integer ids, UUIDv7, Redis stream ids, and JSONL byte offsets — the
 - `storage_watch_after <cursor> <pairs...>` — print, as JSONL and in delivery
   order, every `message_sent` after `<cursor>` addressed to one of the
   subscription pairs; then print a final cursor record
-  `{"type":"cursor","cursor":"<opaque>"}` as the last line (always emitted, even
-  when there are zero new messages, so core can advance). Poll-once: it returns
-  what is currently available and exits — core loops on its own interval; a
-  streaming backend may implement it as one non-blocking drain.
+  `{"type":"cursor","cursor":"<opaque>"}` as the last line. That trailing cursor
+  is the **global tip the driver can safely resume from at call time** (the same
+  notion as `storage_watch_tip`) — *not* the cursor of the last matching message.
+  It is always emitted, and advances even when zero subscription messages fell in
+  the range, so a watcher behind heavy off-subscription traffic does not re-scan
+  the same span on every poll. Poll-once: it returns what is currently available
+  and exits — core loops on its own interval; a streaming backend may implement
+  it as one non-blocking drain.
 
 Each `<pair>` is `<team>:<agent>`. Team and agent names cannot contain `:` (the
 name rules enforce this); a driver may additionally reject a pair it cannot split
