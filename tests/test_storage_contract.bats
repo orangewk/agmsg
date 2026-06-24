@@ -118,3 +118,65 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
     [ "$(sqlite3 :memory: "SELECT json_valid('$(printf '%s' "$line" | sed "s/'/''/g")')")" = "1" ]
   done <<< "$output"
 }
+
+@test "contract: list_unread / history records carry a type field" {
+  storage_send agsuite alice bob "t1"
+  run storage_list_unread agsuite bob
+  [[ "$output" == *'"type":"message_sent"'* ]]
+  run storage_history agsuite bob
+  [[ "$output" == *'"type":"message_sent"'* ]]
+}
+
+@test "contract: the delivery cursor is a single whitespace-free token" {
+  local tip; tip=$(storage_watch_tip agsuite:bob)
+  [ -n "$tip" ]
+  [ "$(printf '%s' "$tip" | wc -l | tr -d ' ')" = "0" ]   # one line, no trailing newline
+  [[ "$tip" != *" "* ]]
+  [[ "$tip" != *$'\t'* ]]
+}
+
+@test "contract: watch_after's trailing cursor record is the final line" {
+  local tip; tip=$(storage_watch_tip agsuite:bob)
+  storage_send agsuite alice bob "w1"
+  local out; out=$(storage_watch_after "$tip" agsuite:bob)
+  [[ "$(printf '%s\n' "$out" | tail -1)" == *'"type":"cursor"'* ]]
+}
+
+@test "contract: a data op fails non-zero on a broken store (no silent success)" {
+  # pipefail must surface the backend error instead of tr swallowing it.
+  local db; db="$(agmsg_db_path)"
+  rm -f "$db"-wal "$db"-shm
+  printf 'not a sqlite database' > "$db"
+  run storage_list_unread agsuite bob
+  [ "$status" -ne 0 ]
+}
+
+# --- sqlite-specific: legacy messages-table compatibility (§2.4) ------------
+# These assert the sqlite driver's read-only UNION of the pre-event-log store;
+# they are intentionally NOT driver-agnostic (a fresh jsonl/redis store has no
+# legacy table). Existing installs must keep their inbox + history at cutover.
+
+@test "contract(sqlite): legacy messages rows surface in unread and history" {
+  local db; db="$(agmsg_db_path)"
+  agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body,read_at)
+    VALUES ('agsuite','alice','bob','legacy-unread',NULL),
+           ('agsuite','alice','bob','legacy-read','2026-01-01T00:00:00Z');"
+  run storage_list_unread agsuite bob
+  [[ "$output" == *legacy-unread* ]]
+  [[ "$output" != *legacy-read* ]]
+  run storage_history agsuite bob
+  [[ "$output" == *legacy-unread* ]]
+  [[ "$output" == *legacy-read* ]]
+}
+
+@test "contract(sqlite): marking a legacy id read hides it without mutating the row" {
+  local db; db="$(agmsg_db_path)"
+  agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body)
+    VALUES ('agsuite','alice','bob','legacy-x');"
+  local lid; lid=$(agmsg_sqlite "$db" "SELECT id FROM messages WHERE body='legacy-x';" | tr -d '\r')
+  storage_mark_read_batch agsuite bob "$lid"
+  run storage_list_unread agsuite bob
+  [[ "$output" != *legacy-x* ]]
+  # the legacy row is never mutated (read_at stays NULL) — no destructive migration.
+  [ -z "$(agmsg_sqlite "$db" "SELECT read_at FROM messages WHERE body='legacy-x';" | tr -d '\r')" ]
+}
