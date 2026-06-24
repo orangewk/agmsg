@@ -106,3 +106,66 @@ agmsg_sql_readfile_path() {
   fi
   printf '%s' "$path" | sed "s/'/''/g"
 }
+
+# ── Storage driver facade (storage axis) ─────────────────────────────────────
+# The helpers above resolve the legacy sqlite path and run raw SQL; call sites
+# keep using them until #206 migrates them onto the contract below. The facade
+# resolves the *active* storage driver, sources it, and makes the storage_*
+# contract (docs/spec/driver-interface.md §2 / ADR 0003) available. Driver
+# discovery + trust reuse the axis-generic registry (ADR 0002, driver-registry.sh).
+
+# Path to the machine-wide driver config (spec §4). Overridable for tests.
+_agmsg_storage_config_path() {
+  printf '%s\n' "${AGMSG_CONFIG:-$HOME/.agents/agmsg/config.json}"
+}
+
+# Active storage driver name: env override > config "storage" key > built-in.
+agmsg_storage_driver() {
+  if [ -n "${AGMSG_STORAGE_DRIVER:-}" ]; then
+    printf '%s\n' "$AGMSG_STORAGE_DRIVER"
+    return 0
+  fi
+  local cfg name
+  cfg="$(_agmsg_storage_config_path)"
+  if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+    name="$(sqlite3 :memory: \
+      "SELECT COALESCE(json_extract(readfile('$(agmsg_sql_readfile_path "$cfg")'), '\$.storage'), '')" \
+      2>/dev/null | tr -d '\r')"
+    if [ -n "$name" ] && [ "$name" != "null" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  fi
+  printf 'sqlite\n'
+}
+
+# Locate and source the active storage driver's storage_* functions. Idempotent.
+# Resolution reuses the registry search bases (in-tree builtins always trusted;
+# external plugin dirs gated by the opt-in trustfile, ADR 0002).
+_AGMSG_STORAGE_LOADED=""
+agmsg_storage_load() {
+  [ -n "$_AGMSG_STORAGE_LOADED" ] && return 0
+  # Pull in the axis-generic registry once (its functions may not be sourced yet).
+  if ! command -v agmsg_driver_bases >/dev/null 2>&1; then
+    local _lib
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    # shellcheck disable=SC1091
+    [ -n "$_lib" ] && . "$_lib/driver-registry.sh"
+  fi
+  local name file kind base
+  name="$(agmsg_storage_driver)"
+  while IFS="$(printf '\t')" read -r kind base; do
+    [ -n "$base" ] || continue
+    file="$base/storage/$name.sh"
+    [ -f "$file" ] || continue
+    if [ "$kind" = external ] && ! agmsg_driver_is_trusted storage "$name" "$file"; then
+      continue
+    fi
+    # shellcheck disable=SC1090
+    . "$file"
+    _AGMSG_STORAGE_LOADED="$name"
+    return 0
+  done < <(agmsg_driver_bases)
+  printf 'agmsg: no trusted storage driver "%s" found\n' "$name" >&2
+  return 1
+}
