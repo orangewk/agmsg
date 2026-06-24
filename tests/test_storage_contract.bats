@@ -198,6 +198,19 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   fi
   run storage_list_unread agsuite bob
   [ "$status" -ne 0 ]
+  run storage_watch_tip agsuite:bob   # the tip read must also fail, not report 0
+  [ "$status" -ne 0 ]
+}
+
+@test "contract(jsonl): mark_read_batch fails non-zero when the lock is unavailable" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (mkdir write lock)"
+  local id; id=$(storage_send agsuite alice bob "x")
+  # Hold the write lock so the mark can't acquire it; cap retries so it fails fast.
+  mkdir "$(dirname "$(agmsg_db_path)")/events.jsonl.lock"
+  AGMSG_JSONL_LOCK_TRIES=2 run storage_mark_read_batch agsuite bob "$id"
+  rmdir "$(dirname "$(agmsg_db_path)")/events.jsonl.lock" 2>/dev/null || true
+  [ "$status" -ne 0 ]                  # control op surfaces the failure
+  [[ "$output" != *ok* ]]             # never a false "ok"
 }
 
 # --- compaction contract (§2.7) --------------------------------------------

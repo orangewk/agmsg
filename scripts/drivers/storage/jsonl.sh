@@ -60,10 +60,10 @@ PY
 # Serialize all log mutations (append / mark / compact / import) behind a portable
 # mkdir lock; record-returning reads take a single file read as their snapshot.
 _jsonl_with_lock() {
-  local lock i=0 rc=0
+  local lock i=0 rc=0 max="${AGMSG_JSONL_LOCK_TRIES:-1000}"
   lock="$(_jsonl_log).lock"
   until mkdir "$lock" 2>/dev/null; do
-    i=$((i + 1)); [ "$i" -ge 1000 ] && return 1
+    i=$((i + 1)); [ "$i" -ge "$max" ] && return 1
     sleep 0.01
   done
   "$@" || rc=$?
@@ -155,15 +155,22 @@ storage_list_unread() {
 # it as "Y-M-D H:M:S", losing the canonical ISO-8601 "...T...Z" the jq path keeps.
 _jsonl_unread_duckdb() {
   local team="$1" agent="$2" log="$3"
+  # SQL-escape every value spliced into the query (team/agent are not apostrophe-
+  # free per validate.sh, and the path may contain one) so a legal team/agent that
+  # the jq path handles can't break — or silently misbehave on — the duckdb path.
+  local tl al lg
+  tl="$(printf '%s' "$team"  | sed "s/'/''/g")"
+  al="$(printf '%s' "$agent" | sed "s/'/''/g")"
+  lg="$(printf '%s' "$log"   | sed "s/'/''/g")"
   local cols="columns={type:'VARCHAR', id:'VARCHAR', team:'VARCHAR', \"from\":'VARCHAR', \"to\":'VARCHAR', body:'VARCHAR', at:'VARCHAR', msg_id:'VARCHAR', agent:'VARCHAR'}, format='newline_delimited'"
   duckdb -noheader -list -newline $'\n' <<SQL 2>/dev/null
 SELECT to_json(struct_pack(type := 'message_sent', id := s.id, team := s.team,
          "from" := s."from", "to" := s."to", body := s.body, at := s.at))
-FROM (SELECT * FROM read_json('$log', $cols) WHERE type='message_sent'
-        AND team='$team' AND "to"='$agent') s
+FROM (SELECT * FROM read_json('$lg', $cols) WHERE type='message_sent'
+        AND team='$tl' AND "to"='$al') s
 WHERE s.id NOT IN (
-  SELECT msg_id FROM read_json('$log', $cols)
-  WHERE type='message_read' AND team='$team' AND agent='$agent')
+  SELECT msg_id FROM read_json('$lg', $cols)
+  WHERE type='message_read' AND team='$tl' AND agent='$al')
 ORDER BY s.at, s.id;
 SQL
 }
@@ -171,7 +178,10 @@ SQL
 storage_mark_read_batch() {
   local team="$1" agent="$2"; shift 2
   _jsonl_init_file
-  _jsonl_with_lock _jsonl_mark "$team" "$agent" "$@"
+  # Propagate a lock-acquire / write failure as a §1.4 control-op error — never
+  # swallow it as ok, or inbox/check-inbox would treat unread as read with no
+  # message_read written (re-delivery loop / stale wake on the read hot path).
+  _jsonl_with_lock _jsonl_mark "$team" "$agent" "$@" || { echo runtime_error; return 13; }
   echo ok
 }
 _jsonl_mark() {
@@ -195,7 +205,10 @@ _jsonl_mark() {
 
 storage_watch_tip() {
   _jsonl_init_file
-  jq -s '[.[] | select(.type=="message_sent")] | length' "$(_jsonl_log)" 2>/dev/null || echo 0
+  # An empty log makes jq return 0 with exit 0; a CORRUPT log makes jq fail, and
+  # that must surface as a non-zero exit (data-op framing §2.1) — no `|| echo 0`
+  # fallback that would mask a broken store as a fresh tip of 0.
+  jq -s '[.[] | select(.type=="message_sent")] | length' "$(_jsonl_log)"
 }
 
 storage_watch_after() {
