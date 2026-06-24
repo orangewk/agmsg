@@ -221,8 +221,13 @@ storage_watch_after() {
 # With <agent>, only rows where that agent is sender or recipient; omit it (empty)
 # for the whole team (§2.1 G3 — an additive widening, existing callers unchanged).
 storage_history() {
-  local team="$1" agent="$2" limit=""
-  shift 2
+  local team="$1"; shift
+  local agent="" limit=""
+  # <agent> is optional: consume a leading NON-flag argument as the agent (an
+  # empty string is allowed and also means team-wide). A leading --flag means no
+  # agent was given. This is what makes `storage_history <team> --limit N` and
+  # `storage_history <team>` parse correctly per the §2.1 contract (co1 review).
+  if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then agent="$1"; shift; fi
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
   storage_init >/dev/null

@@ -123,6 +123,16 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [ "$l2" -lt "$l3" ]            # chronological order, not reverse
 }
 
+@test "contract: history <team> --limit (no agent) treats --limit as a flag, not the agent" {
+  storage_send agsuite alice bob "p1"
+  storage_send agsuite carol dave "p2"
+  run storage_history agsuite --limit 1     # --limit must NOT be consumed as <agent>
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]   # exactly one record (team-wide)
+  [[ "$output" == *'"type":"message_sent"'* ]]         # pure JSONL, not a parse error
+  [ "$(sqlite3 :memory: "SELECT json_valid('$(printf '%s' "$output" | sed "s/'/''/g")')")" = "1" ]
+}
+
 @test "contract: export then import round-trips the event log" {
   local id; id=$(storage_send agsuite alice bob "keep")
   storage_mark_read_batch agsuite bob "$id"

@@ -99,7 +99,11 @@ single line. The `watch_*` pair is defined in §2.2.
 
 `storage_history`'s `<agent>` is optional: given, it returns only messages where
 that agent is the sender or the recipient; omitted (or empty), it returns the
-whole team's messages. Both forms are JSONL `message_sent` records in time order.
+whole team's messages. Both forms are JSONL `message_sent` records. `--limit N`
+selects the **most recent N** of the matching set; the output is always in
+**time order, oldest→newest** (so a limited query returns the tail of the history,
+still chronological — never newest-first). A driver must honour both this
+selection (recency) and this ordering so the result is identical across backends.
 Read-state is deliberately **not** carried on a history record — it is
 recipient-scoped (§2.3), so a consumer that wants a read/unread marker derives it
 by cross-referencing `storage_list_unread` for the relevant recipient rather than
