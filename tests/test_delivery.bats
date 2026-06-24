@@ -761,11 +761,12 @@ JSON
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 &
   local pid=$!
-  # High-water-mark = MAX(id) at startup, so prior messages aren't replayed.
-  # Insert NEW messages and wait for several poll iterations.
+  # The watcher seeds its cursor from the storage tip at startup, so prior
+  # messages aren't replayed. Send NEW messages through the facade (storage_send
+  # writes the event log the watcher now streams) and wait for several polls.
   sleep 1
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'new-for-alice');"
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'new-for-bob');"
+  bash "$SCRIPTS/send.sh" myteam system alice "new-for-alice" >/dev/null
+  bash "$SCRIPTS/send.sh" myteam system bob "new-for-bob" >/dev/null
   sleep 3
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
@@ -863,10 +864,10 @@ JSON
   # Join `bob` to the same (project, type) after the watcher is running.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$TEST_PROJECT"
 
-  # Insert messages for both. alice should arrive (alice was in the original
-  # subscription set); bob should NOT arrive (joined after launch).
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'for-alice-static');"
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'bob',   'for-bob-static');"
+  # Send messages for both via the facade. alice should arrive (alice was in the
+  # original subscription set); bob should NOT arrive (joined after launch).
+  bash "$SCRIPTS/send.sh" myteam sys alice "for-alice-static" >/dev/null
+  bash "$SCRIPTS/send.sh" myteam sys bob   "for-bob-static" >/dev/null
 
   sleep 3
   kill -TERM "$pid" 2>/dev/null

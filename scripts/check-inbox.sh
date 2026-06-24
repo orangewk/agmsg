@@ -143,20 +143,25 @@ for team in "${TEAM_LIST[@]}"; do
     RESULT=$(agmsg_sqlite ':memory:' "
       SELECT json_extract(value,'\$.from') || char(31) ||
              replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
-             json_extract(value,'\$.at')
+             json_extract(value,'\$.at') || char(31) ||
+             json_extract(value,'\$.id')
       FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
     ")
     COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    while IFS=$'\x1f' read -r from body ts; do
-      [ -n "$ts$from$body" ] || continue
+    IDS=()
+    while IFS=$'\x1f' read -r from body ts id; do
+      [ -n "$id" ] || continue
       OUTPUT+="  [$ts] $from: $body"$'\n'
+      IDS+=("$id")
     done <<< "$RESULT"
     OUTPUT+=$'\n'
-    # Mark read — transitional legacy UPDATE (not storage_mark_read_batch yet);
-    # flips to events at step 3 alongside watch-once, which still reads legacy
-    # read_at. See the matching note in inbox.sh.
-    agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team' AND to_agent='$AGENT' AND read_at IS NULL;" 2>/dev/null || true
+    # Mark read via the facade (§2.1 storage_mark_read_batch): recipient-scoped,
+    # idempotent; a legacy id records a message_read event without mutating the
+    # legacy row (§2.4).
+    if [ "${#IDS[@]}" -gt 0 ]; then
+      storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
+    fi
   fi
 done
 

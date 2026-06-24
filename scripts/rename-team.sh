@@ -52,8 +52,14 @@ if [ -f "$NEW_CONFIG" ]; then
 fi
 
 # --- Update messages in DB ---
+# Rewrite the team name in BOTH stores: the event log (where storage_send now
+# writes) and the legacy messages table (pre-event-log installs). Without the
+# events update a rename would orphan every message sent after the storage flip.
 if [ -f "$DB" ]; then
   agmsg_sqlite "$DB" "UPDATE messages SET team='$NEW_TEAM' WHERE team='$OLD_TEAM';"
+  # events may not exist yet on an install that has not sent since the storage
+  # flip — best-effort, never abort the rename over a missing optional table.
+  agmsg_sqlite "$DB" "UPDATE events SET team='$NEW_TEAM' WHERE team='$OLD_TEAM';" 2>/dev/null || true
 fi
 
 echo "Renamed team $OLD_TEAM → $NEW_TEAM"

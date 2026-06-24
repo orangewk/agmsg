@@ -48,6 +48,16 @@ _max_message_id() {
     agmsg_sqlite "$(agmsg_db_path)" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
 }
 
+# The delivery watermark is now an opaque storage cursor (the event-log
+# high-water), not a legacy messages id. This mirrors what storage_watch_tip
+# issues, so tests can assert the watcher's persisted watermark against it.
+_storage_tip() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_sqlite "$(agmsg_db_path)" \
+      "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0);" )
+}
+
 _wait_for_file() {
   local file="$1" i
   for i in $(seq 1 100); do
@@ -158,7 +168,7 @@ _wait_for_file_contains() {
 
   bash "$SCRIPTS/send.sh" team bob alice "M1-delivered" >/dev/null
   _wait_for_file_contains "$out" "M1-delivered"
-  local first_id="$(_max_message_id)"
+  local first_id="$(_storage_tip)"
 
   # Owning session dies (reap it so kill -0 reports gone, not a zombie), then a
   # newer row arrives. The liveness guard runs before the DB poll, so the watcher
@@ -166,7 +176,7 @@ _wait_for_file_contains() {
   kill "$sesspid" 2>/dev/null || true
   wait "$sesspid" 2>/dev/null || true
   bash "$SCRIPTS/send.sh" team bob alice "M2-undelivered" >/dev/null
-  local second_id="$(_max_message_id)"
+  local second_id="$(_storage_tip)"
 
   _wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
   run kill -0 "$w"; [ "$status" -ne 0 ]

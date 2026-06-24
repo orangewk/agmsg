@@ -122,13 +122,21 @@ storage_init() {
 storage_send() {
   local team="$1" from="$2" to="$3" body="$4"
   local id at db; id="$(_sqlite_uuid7)"; at="$(_sqlite_now)"; db="$(_sqlite_db)"
-  storage_init >/dev/null
-  agmsg_sqlite "$db" "
+  local insert="
     INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
     VALUES ('message_sent','$(_sqlite_lit "$id")','$(_sqlite_lit "$team")',
             '$(_sqlite_lit "$from")','$(_sqlite_lit "$to")','$(_sqlite_lit "$body")',
             '$(_sqlite_lit "$at")');
-  " >/dev/null 2>&1 || return 1
+  "
+  # Try the INSERT first and only fall back to storage_init on failure (the #114
+  # pattern). Running storage_init — which issues PRAGMA journal_mode=WAL and the
+  # CREATE TABLE/INDEX statements — on EVERY send serializes badly under a
+  # concurrent first-write fan-out and lost rows past the busy_timeout. The common
+  # path is now a single INSERT; only a missing table pays the init + retry.
+  if ! agmsg_sqlite "$db" "$insert" >/dev/null 2>&1; then
+    storage_init >/dev/null
+    agmsg_sqlite "$db" "$insert" >/dev/null 2>&1 || return 1
+  fi
   printf '%s\n' "$id"
 }
 
@@ -203,7 +211,13 @@ storage_watch_after() {
   local cursor="$1"; shift
   case "$cursor" in ''|*[!0-9]*) cursor=0 ;; esac
   local pairs; pairs="$(_sqlite_pair_in "$@")"
+  # The message scan and the trailing-cursor (high-water) read MUST observe the
+  # same snapshot, or a row inserted between the two statements would advance the
+  # cursor past a message the scan never returned — a silent skip. A deferred read
+  # transaction pins one WAL snapshot across both SELECTs, so the emitted cursor
+  # never runs ahead of what the scan saw (§2.2 "never skip").
   _sqlite_data "
+    BEGIN;
     SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
                        'to',to_agent,'body',body,'at',at)
     FROM events
@@ -212,6 +226,7 @@ storage_watch_after() {
     ORDER BY seq ASC;
     SELECT json_object('type','cursor','cursor',
                        CAST(MAX($cursor, $(_sqlite_highwater)) AS TEXT));
+    COMMIT;
   "
 }
 

@@ -48,6 +48,7 @@ case "$INTERVAL" in ''|*[!0-9]*) echo "watch-once: --interval must be a whole nu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 source "$SCRIPT_DIR/../../../lib/storage.sh"
+agmsg_storage_load
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../../../lib/actas-lock.sh"
 # shellcheck disable=SC1091
@@ -68,20 +69,29 @@ if [ -z "$PAIRS" ]; then
   exit 1
 fi
 
-WHERE_PAIRS="$(agmsg_subscription_where "$PAIRS")"
 deadline=$(( $(date +%s) + TIMEOUT ))
 
 while true; do
   if [ -f "$DB" ]; then
-    row="$(agmsg_sqlite -separator $'\t' "$DB" "
-      SELECT COUNT(*), COALESCE(MAX(id), 0)
-      FROM messages
-      WHERE read_at IS NULL AND ($WHERE_PAIRS);
-    " 2>/dev/null || true)"
-    count="${row%%$'\t'*}"
-    max_id="${row#*$'\t'}"
-    case "$count" in ''|*[!0-9]*) count=0 ;; esac
-    case "$max_id" in ''|*[!0-9]*) max_id=0 ;; esac
+    # Unread across the subscription via the storage facade (§2.1, events ∪ legacy)
+    # — one storage_list_unread per pair, summed. max_id is an OPAQUE token: the
+    # greatest unread id across pairs, used by codex-bridge only for equality
+    # (stale-wake detection), never ordered. It is no longer an integer.
+    count=0
+    max_id=""
+    while IFS=$'\t' read -r _team _agent; do
+      [ -n "$_team" ] && [ -n "$_agent" ] || continue
+      u="$(storage_list_unread "$_team" "$_agent" 2>/dev/null || true)"
+      [ -n "$u" ] || continue
+      uarr="[$(printf '%s' "$u" | paste -sd, -)]"
+      ids="$(agmsg_sqlite ':memory:' "
+        SELECT json_extract(value,'\$.id') FROM json_each('$(printf '%s' "$uarr" | sed "s/'/''/g")');
+      " 2>/dev/null || true)"
+      [ -n "$ids" ] || continue
+      count=$(( count + $(printf '%s\n' "$ids" | grep -c .) ))
+      pairmax="$(printf '%s\n' "$ids" | LC_ALL=C sort | tail -1)"
+      if [ -z "$max_id" ] || [ "$pairmax" \> "$max_id" ]; then max_id="$pairmax"; fi
+    done <<< "$PAIRS"
     if [ "$count" -gt 0 ]; then
       printf 'status=pending count=%s max_id=%s\n' "$count" "$max_id"
       exit 0

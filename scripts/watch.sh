@@ -38,6 +38,7 @@ ACTIVE_NAME="${4:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+agmsg_storage_load
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
@@ -199,18 +200,13 @@ if [ -z "$PAIRS" ]; then
   exit 0
 fi
 
-# Build the SQL WHERE clause. Each pair contributes:
-#   (team='<team>' AND to_agent='<agent>')
-# joined by OR. Single quotes inside team/agent names are doubled for SQL.
-sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
-
-WHERE_PAIRS=""
+# SUB_PAIRS holds the subscription as <team>:<agent> tokens — the argument form
+# the storage facade's watch ops take (§2.2). Live delivery goes entirely through
+# storage_watch_tip / storage_watch_after now, so no SQL WHERE clause is built here.
+SUB_PAIRS=()
 while IFS=$'\t' read -r team agent; do
   [ -z "$team" ] && continue
-  t_esc=$(sql_escape "$team")
-  a_esc=$(sql_escape "$agent")
-  pair="(team='$t_esc' AND to_agent='$a_esc')"
-  WHERE_PAIRS="${WHERE_PAIRS:+$WHERE_PAIRS OR }$pair"
+  SUB_PAIRS+=("$team:$agent")
 done <<< "$PAIRS"
 
 # Determine the starting watermark.
@@ -228,20 +224,22 @@ done <<< "$PAIRS"
 # A *fresh* session (no persisted watermark) still starts from the current
 # MAX(id) — live push, no replay of history (the no-arg inbox check covers
 # historical unread, not this stream).
+# The watermark is now an OPAQUE delivery cursor (§2.2), not an integer id — the
+# active storage driver issues and interprets it; this script only persists the
+# latest token and passes it back unchanged.
 WATERMARK_FILE="$RUN_DIR/watch.$SESSION_ID.watermark"
 persist_watermark() { printf '%s\n' "$LAST" > "$WATERMARK_FILE" 2>/dev/null || true; }
 
 LAST=""
 if [ -f "$WATERMARK_FILE" ]; then
-  LAST="$(cat "$WATERMARK_FILE" 2>/dev/null || true)"
-  case "$LAST" in ''|*[!0-9]*) LAST="" ;; esac
+  # Opaque token: a single whitespace-free line. No integer validation — just
+  # strip stray surrounding whitespace.
+  LAST="$(tr -d '[:space:]' < "$WATERMARK_FILE" 2>/dev/null || true)"
 fi
 if [ -z "$LAST" ]; then
-  LAST=0
-  if [ -f "$DB" ]; then
-    LAST="$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages WHERE $WHERE_PAIRS;" 2>/dev/null || echo 0)"
-  fi
-  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  # A fresh watcher starts from the current tip (live push, no history replay).
+  LAST="$(storage_watch_tip "${SUB_PAIRS[@]}" 2>/dev/null || true)"
+  case "$LAST" in '') LAST=0 ;; esac
   persist_watermark
 fi
 
@@ -277,16 +275,36 @@ while true; do
     exit 0
   fi
   if [ -f "$DB" ]; then
-    ROWS="$(agmsg_sqlite -separator $'\x1f' "$DB" "
-      SELECT id, created_at, team, from_agent, to_agent,
-             replace(replace(body, char(13), ''), char(10), '\\n')
-      FROM messages
-      WHERE id > $LAST AND ($WHERE_PAIRS)
-      ORDER BY id;
-    " 2>/dev/null || true)"
+    # Pull messages after the cursor via the storage facade (§2.2). The output is
+    # JSONL: zero or more message_sent records in delivery order, then a trailing
+    # {"type":"cursor","cursor":"<token>"} as the LAST line — the position to
+    # resume from. Parse every record in one pass with sqlite's JSON funcs (the
+    # repo idiom; no jq). Newlines/tabs in the body are escaped to keep one line.
+    OUT="$(storage_watch_after "$LAST" "${SUB_PAIRS[@]}" 2>/dev/null || true)"
+    if [ -n "$OUT" ]; then
+      _arr="[$(printf '%s' "$OUT" | paste -sd, -)]"
+      ROWS="$(agmsg_sqlite ':memory:' "
+        SELECT COALESCE(json_extract(value,'\$.type'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.id'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.at'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.team'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.from'),'') || char(31) ||
+               COALESCE(json_extract(value,'\$.to'),'') || char(31) ||
+               replace(replace(replace(COALESCE(json_extract(value,'\$.body'),''), char(13), ''), char(10), '\\n'), char(9), '\t') || char(31) ||
+               COALESCE(json_extract(value,'\$.cursor'),'')
+        FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+      " 2>/dev/null || true)"
 
-    if [ -n "$ROWS" ]; then
-      while IFS=$'\x1f' read -r id ts team from to body; do
+      while IFS=$'\x1f' read -r kind id ts team from to body cursor; do
+        [ -z "$kind" ] && continue
+        if [ "$kind" = "cursor" ]; then
+          # Trailing cursor = the resume point. Advance + persist only after the
+          # batch's messages were delivered above; a crash mid-batch re-delivers
+          # from the old cursor (at-least-once, never skip — §2.2).
+          LAST="$cursor"; persist_watermark
+          continue
+        fi
+        [ "$kind" = "message_sent" ] || continue
         [ -z "$id" ] && continue
         # Control message: a leader's `despawn` sends `ctrl:despawn` to this
         # role. Tear ourselves down rather than printing it — drop the role
@@ -294,14 +312,14 @@ while true; do
         # which also ends the agent CLI sharing it. Deterministic teardown, no
         # dependence on the agent LLM noticing the message. See #109.
         if [ "$body" = "ctrl:despawn" ]; then
-          LAST="$id"; persist_watermark
           # Only an EXCLUSIVE watcher dedicated to exactly this role tears
           # itself down. A broad-subscription watcher (e.g. a leader whose
           # default watcher subscribes to every project role, including the
           # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
           # own pane, so killing it would take down the leader's session. The
           # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
-          # own pane; that's the one meant to respond. See #109.
+          # own pane; that's the one meant to respond. The trailing cursor still
+          # advances the watermark past this control message at the batch end. See #109.
           if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
             continue
           fi
@@ -317,8 +335,6 @@ while true; do
           cleanup
           exit 0
         fi
-        LAST="$id"
-        persist_watermark
       done <<< "$ROWS"
     fi
   fi

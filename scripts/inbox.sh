@@ -37,28 +37,31 @@ if [ -z "$UNREAD_JSONL" ]; then
   exit 0
 fi
 
-# JSONL -> JSON array -> "from \x1f body \x1f at" rows (newlines/tabs in the body
-# escaped so each message stays one display line).
+# JSONL -> JSON array -> "from \x1f body \x1f at \x1f id" rows (newlines/tabs in
+# the body escaped so each message stays one display line).
 _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
 ROWS=$(agmsg_sqlite ':memory:' "
   SELECT json_extract(value,'\$.from') || char(31) ||
          replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
-         json_extract(value,'\$.at')
+         json_extract(value,'\$.at') || char(31) ||
+         json_extract(value,'\$.id')
   FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
 ")
 
 COUNT=$(printf '%s\n' "$ROWS" | wc -l | tr -d ' ')
 echo "$COUNT new message(s):"
 echo ""
-while IFS=$'\x1f' read -r from body ts; do
-  [ -n "$ts$from$body" ] || continue
+IDS=()
+while IFS=$'\x1f' read -r from body ts id; do
+  [ -n "$id" ] || continue
   echo "  [$ts] $from: $body"
+  IDS+=("$id")
 done <<< "$ROWS"
 echo ""
 
-# Mark read — transitional legacy UPDATE, NOT storage_mark_read_batch yet. The
-# read-state writers (inbox/check-inbox) and the legacy-read_at readers that have
-# not migrated (watch-once, whose codex-bridge consumes an integer max_id cursor)
-# must flip together at step 3 (send → events + watch → facade). Marking via
-# events now would be invisible to those readers and split read-state. Non-fatal.
-agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM' AND to_agent='$AGENT' AND read_at IS NULL;" 2>/dev/null || true
+# Mark read via the storage facade (§2.1 storage_mark_read_batch): recipient-scoped
+# and idempotent. For a legacy id it records a message_read event without mutating
+# the legacy row (§2.4). Non-fatal — may fail in sandboxed environments.
+if [ "${#IDS[@]}" -gt 0 ]; then
+  storage_mark_read_batch "$TEAM" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
+fi

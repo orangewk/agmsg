@@ -10,21 +10,18 @@ BODY="${4:?Missing message body}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+agmsg_storage_load
 DB="$(agmsg_db_path)"
 
+# Keep the full-schema bootstrap (registry + storage tables) for a first-ever
+# command; the message write itself goes through the storage facade below.
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
-INSERT="INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('$TEAM', '$FROM', '$TO', '$(echo "$BODY" | sed "s/'/''/g")');"
-
-# Retry once after ensuring the schema. Under a concurrent first-write fan-out
-# (leader → N members against a fresh/override store), one process can see the
-# DB file exist before the winning initializer has finished creating the table,
-# so its INSERT would hit "no such table". init-db.sh is idempotent + uses the
-# busy_timeout, so re-running it waits for the schema, then the INSERT lands.
-# See #114.
-if ! agmsg_sqlite "$DB" "$INSERT" 2>/dev/null; then
-  bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
-  agmsg_sqlite "$DB" "$INSERT"
-fi
+# Write through the storage axis (§2.1 storage_send) — the active driver now owns
+# the message log (an append-only message_sent event), not a direct INSERT.
+# storage_send re-inits its schema idempotently before writing, which subsumes the
+# #114 concurrent first-write race the old path retried around (a process seeing
+# the DB file before the table exists just creates it). The new id is not surfaced.
+storage_send "$TEAM" "$FROM" "$TO" "$BODY" >/dev/null
 
 echo "Sent to $TO in team $TEAM"
