@@ -67,63 +67,120 @@ Directives are advisory: the host agent decides whether to surface them to the u
 
 ## 2. Storage driver
 
+The storage axis is **messages only**: the durable message log and its read /
+replay state. The team registry (`teams/<team>/config.json`) and run-state
+(pidfiles, the per-session delivery cursor, actas locks, ready sentinels) are
+**not** part of this contract — they stay file-based and form a separate axis
+(see [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)). A storage driver
+must implement the *entire* contract below: "this driver does only messages,
+that one also does teams" is disallowed, because a partial implementation breaks
+the swap-ability the axis exists for.
+
 ### 2.1 Required functions
 
 ```
 storage_check
 storage_describe
 storage_init
-storage_insert_message <team> <from> <to> <body>
-storage_unread <team> <agent> [--limit N]
-storage_mark_read <id>
-storage_mark_read_batch <id> [<id> ...]
+storage_send <team> <from> <to> <body>
+storage_list_unread <team> <agent> [--limit N]
+storage_mark_read_batch <team> <agent> <id> [<id> ...]
+storage_watch_tip <team:agent> [<team:agent> ...]
+storage_watch_after <cursor> <team:agent> [<team:agent> ...]
 storage_history <team> <agent> [--limit N]
-storage_teams
-storage_team_members <team>
 storage_export <file>
 storage_import <file>
+storage_compact                # internal; see §2.7
 ```
 
-All functions write structured output (JSONL) to stdout when returning records and follow §1.4 for status. Records always include `id` (UUIDv7 for new writes, opaque string for legacy IDs) and `at` (ISO-8601 UTC).
+Record-returning functions write one JSON object per line (JSONL) to stdout and
+follow §1.4 for status. Every record carries `id` (UUIDv7 for new writes, an
+opaque string for legacy ids) and `at` (ISO-8601 UTC). `storage_send` prints the
+new message's `id` on a single line. The `watch_*` pair is defined in §2.2.
 
-### 2.2 Event log schema
+### 2.2 Delivery cursor (watch / replay)
 
-Bundled drivers represent state as an append-only event log. Each event is one record with a `type` discriminator:
+Live delivery (`watch.sh`, `check-inbox.sh`) resumes from a checkpoint instead of
+re-reading the whole log. That checkpoint is an **opaque, driver-issued cursor**
+— a position in the driver's global message order. Core treats it as an opaque
+string: it persists the latest cursor (per session — the successor to the old
+`watch.<sid>.watermark` file) and passes it back unchanged. **Core never parses,
+compares, or orders cursors.** This is what lets one contract serve sqlite
+integer ids, UUIDv7, Redis stream ids, and JSONL byte offsets — the
+`id > watermark` integer assumption is removed from core entirely.
+
+- `storage_watch_tip <pairs...>` — print the cursor for "now" (the current tip of
+  the global order) as a single bare line. A fresh watcher starts here, so it
+  delivers only messages that arrive *after* it attached (no history replay; the
+  no-arg inbox check covers the backlog).
+- `storage_watch_after <cursor> <pairs...>` — print, as JSONL and in delivery
+  order, every `message_sent` after `<cursor>` addressed to one of the
+  subscription pairs; then print a final cursor record
+  `{"type":"cursor","cursor":"<opaque>"}` as the last line (always emitted, even
+  when there are zero new messages, so core can advance). Poll-once: it returns
+  what is currently available and exits — core loops on its own interval; a
+  streaming backend may implement it as one non-blocking drain.
+
+Each `<pair>` is `<team>:<agent>`. Team and agent names cannot contain `:` (the
+name rules enforce this); a driver may additionally reject a pair it cannot split
+unambiguously.
+
+### 2.3 Event log schema
+
+The bundled drivers represent state as an append-only event log. Each event is
+one record with a `type` discriminator — and only these two types live in the
+storage axis (team membership does not; see the §2 intro):
 
 ```jsonl
 {"type":"message_sent","id":"0192...","team":"agsuite","from":"aggie-cc","to":"aggie-co","body":"...","at":"2026-05-30T19:00:00Z"}
-{"type":"message_read","id":"0192...","msg_id":"0192...","agent":"aggie-co","at":"2026-05-30T19:05:00Z"}
-{"type":"team_joined","id":"0192...","team":"agsuite","agent":"alice","agent_type":"claude-code","project":"/path","at":"..."}
-{"type":"team_left","id":"0192...","team":"agsuite","agent":"alice","at":"..."}
+{"type":"message_read","id":"0192...","msg_id":"0192...","team":"agsuite","agent":"aggie-co","at":"2026-05-30T19:05:00Z"}
 ```
 
-Drivers project these events to answer queries. `storage_unread` returns `message_sent` events whose `id` has no corresponding `message_read` for the requesting agent.
+`storage_list_unread <team> <agent>` returns the `message_sent` events addressed
+to `<agent>` in `<team>` that have no matching `message_read` for that same
+`(team, agent)`. Read-marking is **recipient-scoped**: a `message_read` names the
+`(team, agent)` that read the message, so marking one recipient's copy never
+affects another's, and re-marking an already-read id is **idempotent** (a no-op,
+or a duplicate event the projection collapses).
 
-### 2.3 Legacy compatibility (sqlite only)
+### 2.4 Legacy compatibility (sqlite only)
 
-The bundled sqlite driver reads two sources for `storage_unread` and `storage_history`:
+The bundled sqlite driver reads two sources for `storage_list_unread` and
+`storage_history`:
 
-1. The legacy `messages` table (rows where `read=0`) for installations that predate the event log refactor
-2. The new event log tables for everything written after the refactor
+1. the legacy `messages` table (rows where `read_at IS NULL`) for installs that
+   predate the event log, and
+2. the event-log tables for everything written after.
 
-Writes only target the event log. There is no automated migration; legacy rows stay where they are and remain queryable indefinitely.
+Writes target the event log. There is no automated migration; legacy rows stay
+queryable indefinitely. Legacy integer ids are passed through as decimal strings
+(opaque, per §2.5).
 
-### 2.4 Identifiers
+### 2.5 Identifiers
 
-All IDs generated by drivers must be **UUIDv7** strings. The interface treats IDs as opaque, so drivers reading legacy data (integer autoincrement IDs in sqlite) may pass them through as decimal strings.
+IDs that drivers generate for new writes are **UUIDv7** strings. The interface
+treats every id as opaque, so a driver reading legacy data (sqlite autoincrement
+ints) passes them through as decimal strings. UUIDv7 is generated inside the
+driver (`python -c "..."`, a `uuidgen` that supports v7, or a shell
+implementation); drivers must not depend on a counter file. The delivery cursor
+(§2.2) is a **separate** opaque token from message ids — a driver may build it
+from ids, byte offsets, or stream positions.
 
-UUIDv7 is generated within the driver (e.g. via `python -c "..."`, `uuidgen` on platforms that support v7, or a shell implementation). Drivers must not depend on a counter file.
+### 2.6 Concurrency
 
-### 2.5 Concurrency
+Drivers own the concurrency model of their backing store:
 
-Drivers are responsible for the concurrency model of their backing store:
+- the sqlite driver relies on SQLite's WAL mode;
+- a `jsonl` / `duckdb` driver uses a lockfile around mark-read sequences and
+  around `compact` / `export` / `import`; single appends may rely on POSIX append
+  atomicity for writes ≤ `PIPE_BUF` bytes.
 
-- The sqlite driver relies on SQLite's WAL mode.
-- The `jsonl-duckdb` driver must use a lockfile around mark-read sequences and around `convert`/`export`/`import`. Single-message appends may rely on POSIX append atomicity for writes ≤ `PIPE_BUF` bytes.
+### 2.7 Compaction
 
-### 2.6 Compaction
-
-The event log grows unbounded. Drivers must implement an internal `storage_compact` function that collapses redundant events (e.g. coalescing `message_read` markers, dropping events for deleted teams). v1 exposes this only as an internal command; a user-facing CLI may follow.
+The event log grows unbounded. Drivers implement an internal `storage_compact`
+that collapses redundant events (coalescing repeated `message_read` markers for
+the same `(msg_id, team, agent)`). v1 exposes this only internally; a user-facing
+CLI may follow.
 
 ## 3. CLI mapping
 
