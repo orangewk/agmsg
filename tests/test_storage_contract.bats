@@ -95,6 +95,34 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [[ "$output" == *h2* ]]
 }
 
+@test "contract: history without an agent returns the whole team (§2.1 G3)" {
+  storage_send agsuite alice bob "tw1"
+  storage_send agsuite carol dave "tw2"   # involves neither alice nor bob
+  run storage_history agsuite              # omitted agent = whole team
+  [ "$status" -eq 0 ]
+  [[ "$output" == *tw1* ]]
+  [[ "$output" == *tw2* ]]
+  # the agent-scoped form still filters (additive, existing behaviour intact)
+  run storage_history agsuite carol
+  [[ "$output" == *tw2* ]]
+  [[ "$output" != *tw1* ]]
+}
+
+@test "contract: history --limit returns the most recent N in chronological order" {
+  storage_send agsuite alice bob "old1"
+  storage_send agsuite alice bob "old2"
+  storage_send agsuite alice bob "new3"
+  run storage_history agsuite bob --limit 2
+  [ "$status" -eq 0 ]
+  [[ "$output" == *old2* ]]      # the two most recent
+  [[ "$output" == *new3* ]]
+  [[ "$output" != *old1* ]]      # the oldest dropped
+  local l2 l3
+  l2=$(printf '%s\n' "$output" | grep -n old2 | head -1 | cut -d: -f1)
+  l3=$(printf '%s\n' "$output" | grep -n new3 | head -1 | cut -d: -f1)
+  [ "$l2" -lt "$l3" ]            # chronological order, not reverse
+}
+
 @test "contract: export then import round-trips the event log" {
   local id; id=$(storage_send agsuite alice bob "keep")
   storage_mark_read_batch agsuite bob "$id"

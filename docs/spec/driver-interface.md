@@ -87,7 +87,7 @@ storage_list_unread <team> <agent> [--limit N]
 storage_mark_read_batch <team> <agent> <id> [<id> ...]
 storage_watch_tip <team:agent> [<team:agent> ...]
 storage_watch_after <cursor> <team:agent> [<team:agent> ...]
-storage_history <team> <agent> [--limit N]
+storage_history <team> [agent] [--limit N]
 storage_export <file>
 storage_import <file>
 storage_compact                # internal; see §2.7
@@ -96,6 +96,14 @@ storage_compact                # internal; see §2.7
 Every record carries `id` (UUIDv7 for new writes, an opaque string for legacy
 ids) and `at` (ISO-8601 UTC). `storage_send` prints the new message's `id` on a
 single line. The `watch_*` pair is defined in §2.2.
+
+`storage_history`'s `<agent>` is optional: given, it returns only messages where
+that agent is the sender or the recipient; omitted (or empty), it returns the
+whole team's messages. Both forms are JSONL `message_sent` records in time order.
+Read-state is deliberately **not** carried on a history record — it is
+recipient-scoped (§2.3), so a consumer that wants a read/unread marker derives it
+by cross-referencing `storage_list_unread` for the relevant recipient rather than
+from the history record itself.
 
 **stdout framing.** The **control ops** — `storage_check`, `storage_init`,
 `storage_mark_read_batch`, `storage_compact` — **must** use the §1.4 convention:

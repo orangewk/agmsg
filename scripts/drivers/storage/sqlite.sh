@@ -217,28 +217,41 @@ storage_watch_after() {
 
 # --- contract: history -----------------------------------------------------
 
-# storage_history <team> <agent> [--limit N]  — events ∪ legacy, agent involved.
+# storage_history <team> [agent] [--limit N]  — events ∪ legacy in time order.
+# With <agent>, only rows where that agent is sender or recipient; omit it (empty)
+# for the whole team (§2.1 G3 — an additive widening, existing callers unchanged).
 storage_history() {
   local team="$1" agent="$2" limit=""
   shift 2
   while [ $# -gt 0 ]; do case "$1" in --limit) limit="$2"; shift 2 ;; *) shift ;; esac; done
   case "$limit" in ''|*[!0-9]*) limit="" ;; esac
   storage_init >/dev/null
-  local tl al; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  local tl al afilter; tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  if [ -n "$agent" ]; then
+    afilter="AND (to_agent='$al' OR from_agent='$al')"
+  else
+    afilter=""
+  fi
+  # --limit returns the most RECENT N (inner DESC + LIMIT), re-sorted to
+  # chronological order for output — the intuitive "recent history" semantics,
+  # not the oldest N.
   _sqlite_data "
     SELECT j FROM (
-      SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
-               'to',to_agent,'body',body,'at',at) AS j, at AS ts, 1 AS src, seq AS ord
-      FROM events
-      WHERE type='message_sent' AND team='$tl' AND (to_agent='$al' OR from_agent='$al')
-      UNION ALL
-      SELECT json_object('type','message_sent','id',CAST(id AS TEXT),'team',team,
-               'from',from_agent,'to',to_agent,'body',body,'at',created_at) AS j,
-             created_at AS ts, 0 AS src, id AS ord
-      FROM messages
-      WHERE team='$tl' AND (to_agent='$al' OR from_agent='$al')
+      SELECT j, ts, src, ord FROM (
+        SELECT json_object('type','message_sent','id',id,'team',team,'from',from_agent,
+                 'to',to_agent,'body',body,'at',at) AS j, at AS ts, 1 AS src, seq AS ord
+        FROM events
+        WHERE type='message_sent' AND team='$tl' $afilter
+        UNION ALL
+        SELECT json_object('type','message_sent','id',CAST(id AS TEXT),'team',team,
+                 'from',from_agent,'to',to_agent,'body',body,'at',created_at) AS j,
+               created_at AS ts, 0 AS src, id AS ord
+        FROM messages
+        WHERE team='$tl' $afilter
+      )
+      ORDER BY ts DESC, src DESC, ord DESC ${limit:+LIMIT $limit}
     )
-    ORDER BY ts, src, ord ${limit:+LIMIT $limit};
+    ORDER BY ts ASC, src ASC, ord ASC;
   "
 }
 

@@ -112,6 +112,7 @@ mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
 # Check for unread messages and mark as read
+agmsg_storage_load
 DB="$(agmsg_db_path)"
 if [ ! -f "$DB" ]; then exit 0; fi
 
@@ -134,19 +135,27 @@ for team in "${TEAM_LIST[@]}"; do
     other:*) continue ;;
   esac
 
-  RESULT=$(agmsg_sqlite "$DB" "
-    SELECT from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-    FROM messages WHERE team='$team' AND to_agent='$AGENT' AND read_at IS NULL
-    ORDER BY created_at ASC;
-  ")
-  if [ -n "$RESULT" ]; then
-    COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
+  # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
+  # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
+  UNREAD_JSONL=$(storage_list_unread "$team" "$AGENT")
+  if [ -n "$UNREAD_JSONL" ]; then
+    _arr="[$(printf '%s' "$UNREAD_JSONL" | paste -sd, -)]"
+    RESULT=$(agmsg_sqlite ':memory:' "
+      SELECT json_extract(value,'\$.from') || char(31) ||
+             replace(replace(json_extract(value,'\$.body'), char(10), '\n'), char(9), '\t') || char(31) ||
+             json_extract(value,'\$.at')
+      FROM json_each('$(printf '%s' "$_arr" | sed "s/'/''/g")');
+    ")
+    COUNT=$(printf '%s\n' "$RESULT" | wc -l | tr -d ' ')
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
     while IFS=$'\x1f' read -r from body ts; do
+      [ -n "$ts$from$body" ] || continue
       OUTPUT+="  [$ts] $from: $body"$'\n'
     done <<< "$RESULT"
     OUTPUT+=$'\n'
-    # Mark as read
+    # Mark read — transitional legacy UPDATE (not storage_mark_read_batch yet);
+    # flips to events at step 3 alongside watch-once, which still reads legacy
+    # read_at. See the matching note in inbox.sh.
     agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team' AND to_agent='$AGENT' AND read_at IS NULL;" 2>/dev/null || true
   fi
 done
