@@ -124,6 +124,56 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: bats --print-output-on-failure tests/
 
+  # Continuously verify that the storage contract is backend-portable: run the
+  # SAME driver-agnostic contract suite against the jsonl driver (the sqlite run
+  # is covered by the `bats` job above). This catches silent rot in jsonl as the
+  # contract evolves. Not a required check yet (promote once stable). duckdb is an
+  # opt-in accelerator, absent on the runner, so the jq path is exercised here.
+  storage-jsonl:
+    name: storage contract (jsonl, ${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      # Both userlands — the jsonl driver shells out to jq/sed/sort/cksum/paste,
+      # whose behaviour differs between GNU (Linux) and BSD (macOS).
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docs-only change — skipping
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "Diff is documentation-only; skipping the jsonl storage contract."
+
+      - name: Ensure jq + sqlite3 (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.docs_only != 'true'
+        run: |
+          jq --version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y jq; }
+          sqlite3 --version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y sqlite3; }
+
+      - name: Install bats
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          npm config set prefix "$HOME/.npm-global"
+          npm install -g bats
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          jq --version
+          sqlite3 --version
+          bats --version
+
+      - name: Run the storage contract against the jsonl driver
+        if: needs.changes.outputs.docs_only != 'true'
+        env:
+          AGMSG_STORAGE_DRIVER: jsonl
+        run: bats --print-output-on-failure tests/test_storage_contract.bats
+
   # Windows coverage for the native helpers shipped in #103 (Git Bash runner,
   # sqlite3 compatibility shim, cygpath normalization). The POSIX-assuming suite
   # is not fully green on Windows yet, so this is staged
