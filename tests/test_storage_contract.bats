@@ -213,6 +213,15 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [[ "$output" != *ok* ]]             # never a false "ok"
 }
 
+@test "contract(jsonl): mark_read_batch fails non-zero on a corrupt log" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (corrupt JSONL)"
+  storage_send agsuite alice bob "x" >/dev/null
+  printf 'not json {{{\n' > "$(dirname "$(agmsg_db_path)")/events.jsonl"
+  run storage_mark_read_batch agsuite bob someid
+  [ "$status" -ne 0 ]                  # the existing-reads scan failure aborts the mark
+  [[ "$output" != *ok* ]]
+}
+
 # --- compaction contract (§2.7) --------------------------------------------
 # These pin storage_compact's behavioural guarantees through the facade, so they
 # hold for every driver: idempotent, state-preserving, cursor-safe, monotonic tip.

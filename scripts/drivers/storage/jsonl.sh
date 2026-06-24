@@ -187,9 +187,12 @@ storage_mark_read_batch() {
 _jsonl_mark() {
   local team="$1" agent="$2"; shift 2
   local log id at line existing; log="$(_jsonl_log)"
+  # A failed scan of existing reads (e.g. a corrupt log) must abort the mark, not
+  # silently treat every id as new and append — that would be the same swallowed
+  # failure. The caller turns this non-zero into runtime_error.
   existing="$(jq -r --arg team "$team" --arg agent "$agent" \
     'select(.type=="message_read" and .team==$team and .agent==$agent) | .msg_id' \
-    "$log" 2>/dev/null)"
+    "$log")" || return 1
   for id in "$@"; do
     printf '%s\n' "$existing" | grep -Fxq "$id" && continue
     at="$(_jsonl_now)"
