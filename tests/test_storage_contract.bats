@@ -213,26 +213,68 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
 
 # --- sqlite-specific: compaction physically shrinks the log -----------------
 
-@test "contract(sqlite): compact coalesces duplicate read markers and shrinks the log" {
+@test "contract(sqlite): compact coalesces tail duplicates AND high-water keeps the tip/cursor safe" {
+  # This is the test that actually EXERCISES cursor-safety: mark_read_batch is
+  # write-idempotent, so the driver-agnostic cursor tests above never create the
+  # tail-duplicate rows whose deletion would regress a naive MAX(seq) tip. Here we
+  # inject those duplicates directly (the highest seqs in the log), then compact —
+  # the case that distinguishes the AUTOINCREMENT high-water from MAX(seq).
   local db; db="$(agmsg_db_path)"
-  local id; id=$(storage_send agsuite alice bob "s1")
-  # mark_read_batch is write-idempotent (a NOT EXISTS guard), so duplicate
-  # message_read rows only arise from a racing writer or a merged import. Inject
-  # them directly — that race/import residue is exactly what compact cleans up.
+  storage_send agsuite alice bob "s1"
+  # cursor taken before a later send — must still deliver that later message.
+  local cur0; cur0=$(storage_watch_tip agsuite:bob)
+  storage_send agsuite alice bob "s2-late"
+  local id; id=$(storage_send agsuite alice bob "s3")
+  # duplicate read markers as the TAIL rows (highest seq): compact deletes these,
+  # dropping MAX(seq) but NOT the high-water.
   agmsg_sqlite "$db" "INSERT INTO events (type,id,team,agent,msg_id,at) VALUES
     ('message_read','r1','agsuite','bob','$id','2026-01-01T00:00:01Z'),
     ('message_read','r2','agsuite','bob','$id','2026-01-01T00:00:02Z'),
     ('message_read','r3','agsuite','bob','$id','2026-01-01T00:00:03Z');"
-  local reads_before total_before
+  local reads_before total_before tip_before
   reads_before=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';" | tr -d '\r')
   total_before=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events;" | tr -d '\r')
+  tip_before=$(storage_watch_tip agsuite:bob)
   [ "$reads_before" -eq 3 ]
+
   storage_compact
-  local reads_after total_after
+
+  local reads_after total_after tip_after
   reads_after=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';" | tr -d '\r')
   total_after=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events;" | tr -d '\r')
+  tip_after=$(storage_watch_tip agsuite:bob)
   [ "$reads_after" -eq 1 ]                 # coalesced to one
-  [ "$total_after" -lt "$total_before" ]   # strictly shrank (2 dupes removed)
+  [ "$total_after" -lt "$total_before" ]   # strictly shrank (2 tail dupes removed)
+  # high-water: the tip did NOT regress even though the tail rows (= old MAX seq)
+  # were deleted. A MAX(seq) implementation would fail here.
+  [ "$tip_after" -ge "$tip_before" ]
+  # and the cursor issued before s2-late still delivers it — no message_sent lost.
+  run storage_watch_after "$cur0" agsuite:bob
+  [[ "$output" == *"s2-late"* ]]
+}
+
+@test "contract(sqlite): forward-compat — export/list/history ignore an unknown event type" {
+  local db; db="$(agmsg_db_path)"
+  storage_send agsuite alice bob "known"
+  # a v2-style event a v1 reader has never seen — must be skipped, not leaked.
+  agmsg_sqlite "$db" "INSERT INTO events (type,id,team,from_agent,to_agent,body,at)
+    VALUES ('message_reaction','x1','agsuite','bob','alice','👍','2026-02-02T00:00:00Z');"
+  # export stays clean JSONL: no blank line, no unknown type, every line valid JSON.
+  local f="$TEST_SKILL_DIR/fc.jsonl"
+  storage_export "$f"
+  [ "$(grep -c '^$' "$f")" -eq 0 ]          # no blank line leaked by the unknown type
+  ! grep -q 'message_reaction' "$f"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(sqlite3 :memory: "SELECT json_valid('$(printf '%s' "$line" | sed "s/'/''/g")')")" = "1" ]
+  done < "$f"
+  # the known message is still visible; the unknown event perturbs nothing.
+  run storage_list_unread agsuite bob
+  [[ "$output" == *known* ]]
+  [[ "$output" != *message_reaction* ]]
+  run storage_history agsuite bob
+  [[ "$output" == *known* ]]
+  [[ "$output" != *message_reaction* ]]
 }
 
 # --- sqlite-specific: legacy messages-table compatibility (§2.4) ------------

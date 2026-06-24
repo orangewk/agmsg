@@ -247,6 +247,9 @@ storage_history() {
 storage_export() {
   local file="$1"
   storage_init >/dev/null
+  # Forward-compat (§2.3): only the v1 event types are projected. A WHERE filter
+  # (not just a CASE) keeps unknown-type rows out entirely, so they never surface
+  # as a NULL → blank line on stdout, matching list_unread/history/watch_after.
   _sqlite_data "
     SELECT CASE type
       WHEN 'message_sent' THEN json_object('type','message_sent','id',id,'team',team,
@@ -254,7 +257,9 @@ storage_export() {
       WHEN 'message_read' THEN json_object('type','message_read','id',id,'team',team,
              'agent',agent,'msg_id',msg_id,'at',at)
     END
-    FROM events ORDER BY seq ASC;
+    FROM events
+    WHERE type IN ('message_sent','message_read')
+    ORDER BY seq ASC;
   " > "$file"
 }
 
