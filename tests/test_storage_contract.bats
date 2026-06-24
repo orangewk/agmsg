@@ -27,6 +27,12 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [[ "$output" == *ok* ]]
 }
 
+@test "contract: storage_store_exists is true once the store is initialized" {
+  # setup() ran storage_init, so the active driver's store is present.
+  run storage_store_exists
+  [ "$status" -eq 0 ]
+}
+
 @test "contract: send returns an id and list_unread shows the message" {
   local id; id=$(storage_send agsuite alice bob "hi")
   [ -n "$id" ]

@@ -82,6 +82,7 @@ the swap-ability the axis exists for.
 storage_check
 storage_describe
 storage_init
+storage_store_exists
 storage_send <team> <from> <to> <body>
 storage_list_unread <team> <agent> [--limit N]
 storage_mark_read_batch <team> <agent> <id> [<id> ...]
@@ -96,6 +97,13 @@ storage_compact                # internal; see §2.7
 Every record carries `id` (UUIDv7 for new writes, an opaque string for legacy
 ids) and `at` (ISO-8601 UTC). `storage_send` prints the new message's `id` on a
 single line. The `watch_*` pair is defined in §2.2.
+
+`storage_store_exists` answers — by exit code, 0 if a store is already present and
+non-trivially initialized, non-zero otherwise — **without creating one**. A read
+call-site (inbox / history) uses it to say "no messages yet" in a project that has
+never used agmsg, rather than lazily materializing an empty store on a mere read.
+It is the driver, not a fixed `messages.db` file check, that knows where its store
+lives (sqlite's db file, jsonl's `events.jsonl`, a Redis key, …).
 
 `storage_history`'s `<agent>` is optional: given, it returns only messages where
 that agent is the sender or the recipient; omitted (or empty), it returns the

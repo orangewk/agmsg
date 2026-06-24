@@ -15,11 +15,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
-DB="$(agmsg_db_path)"
 
 # Preserve the read-only "not initialized yet" behaviour: an inbox check must not
-# create the store, so guard on the file before touching the facade.
-if [ ! -f "$DB" ]; then
+# create the store. Ask the active driver whether one exists (driver-level, so it
+# works for jsonl's events.jsonl as well as sqlite's messages.db).
+if ! storage_store_exists; then
   if [ "$QUIET" = true ]; then exit 0; fi
   echo "No messages (DB not initialized)"
   exit 0

@@ -83,6 +83,10 @@ storage_describe() {
   printf 'db=%s\n' "$(_sqlite_db)"
 }
 
+# Does a store already exist? (does NOT create one — lets a read call-site answer
+# "no messages yet" without lazily initializing a store in a storeless project.)
+storage_store_exists() { [ -f "$(_sqlite_db)" ]; }
+
 storage_init() {
   local db; db="$(_sqlite_db)"
   mkdir -p "$(dirname "$db")" 2>/dev/null || true

@@ -107,6 +107,10 @@ storage_init() {
   echo ok
 }
 
+# Does a store already exist? (does NOT create one.) The log is the store, so a
+# read call-site can answer "no messages yet" without lazily creating events.jsonl.
+storage_store_exists() { [ -f "$(_jsonl_log)" ]; }
+
 # --- contract: messages -----------------------------------------------------
 
 storage_send() {

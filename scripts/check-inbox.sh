@@ -111,10 +111,10 @@ fi
 mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
-# Check for unread messages and mark as read
+# Check for unread messages and mark as read. Ask the active driver whether a
+# store exists (driver-level, works for jsonl too) — don't create one on a poll.
 agmsg_storage_load
-DB="$(agmsg_db_path)"
-if [ ! -f "$DB" ]; then exit 0; fi
+if ! storage_store_exists; then exit 0; fi
 
 OUTPUT=""
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
