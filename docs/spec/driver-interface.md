@@ -170,6 +170,17 @@ to `<agent>` in `<team>` that have no matching `message_read` for that same
 affects another's, and re-marking an already-read id is **idempotent** (a no-op,
 or a duplicate event the projection collapses).
 
+**Schema version.** This is **event-log schema v1**. The two event types above
+and their fields are the v1 contract. Forward compatibility is a hard rule, not a
+courtesy: a projection **must ignore event `type`s it does not recognize and
+object fields it does not recognize**. That is the only "version marker" v1 needs
+— a later revision may add new optional fields or new event types without a
+breaking bump, and a v1 reader stays correct (it skips what it cannot interpret
+rather than failing). `export` emits the raw event stream in `seq` order; a v1
+`import` accepts the record types it knows and is free to drop ones it does not.
+A change that removes or repurposes an existing field is the only thing that
+requires a new major schema version.
+
 ### 2.4 Legacy compatibility (sqlite only)
 
 The bundled sqlite driver reads two sources for `storage_list_unread` and
@@ -204,10 +215,42 @@ Drivers own the concurrency model of their backing store:
 
 ### 2.7 Compaction
 
-The event log grows unbounded. Drivers implement an internal `storage_compact`
-that collapses redundant events (coalescing repeated `message_read` markers for
-the same `(msg_id, team, agent)`). v1 exposes this only internally; a user-facing
-CLI may follow.
+The event log grows unbounded (append-only), so every record-replaying driver —
+and especially a `jsonl` driver that re-reads the whole file per query — needs a
+way to bound it. Drivers implement an internal `storage_compact` that collapses
+redundant events. v1 exposes this only internally; a user-facing CLI may follow.
+
+`storage_compact` is the load-bearing primitive that keeps a log-based backend in
+its fast band, so its behaviour is **contractual**, not best-effort. A conforming
+`storage_compact` must satisfy all of:
+
+1. **Idempotent** — `compact` then `compact` again leaves the store identical to a
+   single `compact`. Running it repeatedly is always safe.
+2. **State-preserving (observable equivalence)** — every contract read
+   (`storage_list_unread`, `storage_history`, and the projected state an `export`
+   re-imports to) returns the **same result** before and after a `compact`. Only
+   the physical footprint (event count / bytes) shrinks; no visible message,
+   read-state, or ordering changes.
+3. **Read-coalescing** — redundant `message_read` markers for the same
+   `(team, agent, msg_id)` collapse to one. This is the primary size win and the
+   minimum a driver must do. (`storage_mark_read_batch` is itself write-idempotent,
+   so such duplicates do not arise in single-writer use; they come from a racing
+   writer or a merged `import`, and compaction is the backstop that cleans them up.)
+4. **Monotonic** — `compact` never increases the stored event count.
+5. **Cursor-safe (never skip)** — `compact` must **not invalidate a delivery
+   cursor (§2.2) already handed out**. A cursor issued before a `compact` must,
+   when replayed after it, still deliver every `message_sent` that falls after it
+   — none may be skipped. A driver whose physical cursor would be broken by
+   compaction (e.g. a `jsonl` byte offset invalidated by a log rewrite) must use a
+   **logical, compaction-stable cursor** so that, in the worst case, a stale
+   cursor **degrades to at-least-once re-delivery and never to a dropped
+   message**. The bundled sqlite driver gets this for free: it never deletes or
+   renumbers `message_sent` rows, and it issues cursors from a monotonic
+   high-water (`sqlite_sequence`) that a `DELETE`-based compaction cannot move
+   backwards.
+
+Compaction must never touch `message_sent` records; it operates only on the
+redundant read-state markers layered over them.
 
 ## 3. CLI mapping
 

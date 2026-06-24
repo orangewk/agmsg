@@ -151,6 +151,90 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [ "$status" -ne 0 ]
 }
 
+# --- compaction contract (§2.7) --------------------------------------------
+# These pin storage_compact's behavioural guarantees through the facade, so they
+# hold for every driver: idempotent, state-preserving, cursor-safe, monotonic tip.
+
+@test "contract: compact is state-preserving (unread + history unchanged)" {
+  local a b c
+  a=$(storage_send agsuite alice bob "p1")
+  b=$(storage_send agsuite alice bob "p2")
+  c=$(storage_send agsuite bob alice "p3")
+  storage_mark_read_batch agsuite bob "$a"
+  # redundant markers — fodder compaction should coalesce away invisibly
+  storage_mark_read_batch agsuite bob "$a"
+  storage_mark_read_batch agsuite bob "$a"
+  local unread_before history_before
+  unread_before=$(storage_list_unread agsuite bob)
+  history_before=$(storage_history agsuite bob)
+  storage_compact
+  [ "$(storage_list_unread agsuite bob)" = "$unread_before" ]
+  [ "$(storage_history agsuite bob)" = "$history_before" ]
+}
+
+@test "contract: compact is idempotent (second compact is a no-op for visible state)" {
+  local id; id=$(storage_send agsuite alice bob "i1")
+  storage_mark_read_batch agsuite bob "$id"
+  storage_mark_read_batch agsuite bob "$id"
+  storage_compact
+  local after_one; after_one=$(storage_export "$TEST_SKILL_DIR/c1.jsonl"; cat "$TEST_SKILL_DIR/c1.jsonl")
+  storage_compact
+  storage_export "$TEST_SKILL_DIR/c2.jsonl"
+  [ "$(cat "$TEST_SKILL_DIR/c2.jsonl")" = "$after_one" ]
+}
+
+@test "contract: compact is cursor-safe (a pre-compact cursor skips nothing)" {
+  local tip; tip=$(storage_watch_tip agsuite:bob)
+  storage_send agsuite alice bob "c1"
+  storage_send agsuite alice bob "c2"
+  # pile up redundant read markers AFTER the sends, so compaction deletes the
+  # highest-seq rows — the case that would regress a naive MAX(seq) cursor.
+  local x; x=$(storage_send agsuite alice carol "noise")
+  storage_mark_read_batch agsuite carol "$x"
+  storage_mark_read_batch agsuite carol "$x"
+  storage_mark_read_batch agsuite carol "$x"
+  storage_compact
+  run storage_watch_after "$tip" agsuite:bob
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"c1"* ]]
+  [[ "$output" == *"c2"* ]]
+}
+
+@test "contract: the delivery tip never regresses across a compact (monotonic)" {
+  storage_send agsuite alice bob "m1"
+  local id; id=$(storage_send agsuite alice bob "m2")
+  storage_mark_read_batch agsuite bob "$id"
+  storage_mark_read_batch agsuite bob "$id"   # redundant tail markers
+  local tip_before; tip_before=$(storage_watch_tip agsuite:bob)
+  storage_compact
+  local tip_after; tip_after=$(storage_watch_tip agsuite:bob)
+  [ "$tip_after" -ge "$tip_before" ]
+}
+
+# --- sqlite-specific: compaction physically shrinks the log -----------------
+
+@test "contract(sqlite): compact coalesces duplicate read markers and shrinks the log" {
+  local db; db="$(agmsg_db_path)"
+  local id; id=$(storage_send agsuite alice bob "s1")
+  # mark_read_batch is write-idempotent (a NOT EXISTS guard), so duplicate
+  # message_read rows only arise from a racing writer or a merged import. Inject
+  # them directly — that race/import residue is exactly what compact cleans up.
+  agmsg_sqlite "$db" "INSERT INTO events (type,id,team,agent,msg_id,at) VALUES
+    ('message_read','r1','agsuite','bob','$id','2026-01-01T00:00:01Z'),
+    ('message_read','r2','agsuite','bob','$id','2026-01-01T00:00:02Z'),
+    ('message_read','r3','agsuite','bob','$id','2026-01-01T00:00:03Z');"
+  local reads_before total_before
+  reads_before=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';" | tr -d '\r')
+  total_before=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events;" | tr -d '\r')
+  [ "$reads_before" -eq 3 ]
+  storage_compact
+  local reads_after total_after
+  reads_after=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';" | tr -d '\r')
+  total_after=$(agmsg_sqlite "$db" "SELECT COUNT(*) FROM events;" | tr -d '\r')
+  [ "$reads_after" -eq 1 ]                 # coalesced to one
+  [ "$total_after" -lt "$total_before" ]   # strictly shrank (2 dupes removed)
+}
+
 # --- sqlite-specific: legacy messages-table compatibility (§2.4) ------------
 # These assert the sqlite driver's read-only UNION of the pre-event-log store;
 # they are intentionally NOT driver-agnostic (a fresh jsonl/redis store has no

@@ -185,9 +185,18 @@ storage_mark_read_batch() {
 
 # --- contract: delivery cursor ---------------------------------------------
 
+# The delivery tip is the monotonic AUTOINCREMENT high-water (largest rowid ever
+# assigned to `events`), read from sqlite_sequence — NOT MAX(seq) over live rows.
+# A DELETE-based storage_compact can lower MAX(seq) (e.g. by coalescing the
+# tail message_read) but never the high-water, so a cursor issued before a
+# compaction stays valid and a fresh tip never moves backwards (§2.7 cursor-safe).
+_sqlite_highwater() {
+  printf "COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0)"
+}
+
 storage_watch_tip() {
   storage_init >/dev/null
-  _sqlite_data "SELECT COALESCE(MAX(seq),0) FROM events;"
+  _sqlite_data "SELECT $(_sqlite_highwater);"
 }
 
 storage_watch_after() {
@@ -202,8 +211,7 @@ storage_watch_after() {
       AND (team || ':' || to_agent) IN ($pairs)
     ORDER BY seq ASC;
     SELECT json_object('type','cursor','cursor',
-                       CAST(COALESCE(MAX(seq), $cursor) AS TEXT))
-    FROM events;
+                       CAST(MAX($cursor, $(_sqlite_highwater)) AS TEXT));
   "
 }
 
