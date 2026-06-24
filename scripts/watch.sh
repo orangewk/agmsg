@@ -318,8 +318,12 @@ while true; do
           # despawn target) must NOT act on it — its $TMUX_PANE is the leader's
           # own pane, so killing it would take down the leader's session. The
           # spawned member's watcher runs in actas mode (ACTIVE_NAME=$to) in its
-          # own pane; that's the one meant to respond. The trailing cursor still
-          # advances the watermark past this control message at the batch end. See #109.
+          # own pane; that's the one meant to respond. A broad watcher `continue`s
+          # and reaches the trailing cursor at batch end, so its watermark advances
+          # past this control message. The target watcher below exits BEFORE the
+          # cursor record, so it does not persist a cursor — harmless, since it
+          # drops the role and won't resume as it; a same-session resume would
+          # re-read the despawn (at-least-once) and re-tear-down idempotently. See #109.
           if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
             continue
           fi
