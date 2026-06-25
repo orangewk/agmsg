@@ -213,6 +213,20 @@ _cursor_of() { printf '%s\n' "$1" | sed -n 's/.*"type":"cursor","cursor":"\([^"]
   [[ "$output" != *ok* ]]             # never a false "ok"
 }
 
+@test "contract(jsonl): compact keys reads by tuple, not a space-join (no collision)" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (compaction key)"
+  storage_init
+  local log; log="$(dirname "$(agmsg_db_path)")/events.jsonl"
+  # Two DISTINCT (team, agent, msg_id) tuples that a space-joined key would merge:
+  #   ("a b","c","1")  and  ("a","b c","1")  both flatten to "a b c 1".
+  printf '%s\n%s\n' \
+    '{"type":"message_read","id":"r1","msg_id":"1","team":"a b","agent":"c","at":"x"}' \
+    '{"type":"message_read","id":"r2","msg_id":"1","team":"a","agent":"b c","at":"y"}' >> "$log"
+  storage_compact
+  run grep -c '"type":"message_read"' "$log"   # both are distinct read-state; keep both
+  [ "$output" -eq 2 ]
+}
+
 @test "contract(jsonl): mark_read_batch fails non-zero on a corrupt log" {
   [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific (corrupt JSONL)"
   storage_send agsuite alice bob "x" >/dev/null

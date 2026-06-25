@@ -287,6 +287,6 @@ _jsonl_compact_do() {
   # single-quoted jq string in this position desyncs the macOS system bash 3.2
   # parser and breaks the rest of the file (a no-error `bash -n`, but a real
   # source failure). Keep new jq one-liners here.
-  jq -c -s 'reduce .[] as $e ({out:[], seen:{}}; if $e.type=="message_sent" then .out += [$e] elif $e.type=="message_read" then ([$e.team,$e.agent,$e.msg_id]|join(" ")) as $k | if .seen[$k] then . else .seen[$k]=true | .out += [$e] end else . end) | .out[]' "$log" > "$tmp" || { rm -f "$tmp"; return 1; }
+  jq -c -s 'reduce .[] as $e ({out:[], seen:{}}; if $e.type=="message_sent" then .out += [$e] elif $e.type=="message_read" then ([$e.team,$e.agent,$e.msg_id]|tojson) as $k | if .seen[$k] then . else .seen[$k]=true | .out += [$e] end else . end) | .out[]' "$log" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$log"
 }
