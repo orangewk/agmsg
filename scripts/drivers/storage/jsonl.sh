@@ -23,6 +23,11 @@
 
 # --- helpers ---------------------------------------------------------------
 
+# Where this driver (and its companion duckdb .sql) lives — captured at source
+# time so the optional duckdb path can read the query from a data file rather than
+# carry apostrophe-laden SQL inline (which the macOS bash 3.2 parser mis-handles).
+_JSONL_DRIVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+
 _jsonl_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _jsonl_log() { printf '%s\n' "$(dirname "$(agmsg_db_path)")/events.jsonl"; }
 
@@ -154,25 +159,24 @@ storage_list_unread() {
 # read_json_auto, whose type inference would parse `at` as a TIMESTAMP and re-emit
 # it as "Y-M-D H:M:S", losing the canonical ISO-8601 "...T...Z" the jq path keeps.
 _jsonl_unread_duckdb() {
-  local team="$1" agent="$2" log="$3"
+  local team="$1" agent="$2" log="$3" tl al lg sql tpl
   # SQL-escape every value spliced into the query (team/agent are not apostrophe-
   # free per validate.sh, and the path may contain one) so a legal team/agent that
   # the jq path handles can't break — or silently misbehave on — the duckdb path.
-  local tl al lg
   tl="$(printf '%s' "$team"  | sed "s/'/''/g")"
   al="$(printf '%s' "$agent" | sed "s/'/''/g")"
   lg="$(printf '%s' "$log"   | sed "s/'/''/g")"
-  local cols="columns={type:'VARCHAR', id:'VARCHAR', team:'VARCHAR', \"from\":'VARCHAR', \"to\":'VARCHAR', body:'VARCHAR', at:'VARCHAR', msg_id:'VARCHAR', agent:'VARCHAR'}, format='newline_delimited'"
-  duckdb -noheader -list -newline $'\n' <<SQL 2>/dev/null
-SELECT to_json(struct_pack(type := 'message_sent', id := s.id, team := s.team,
-         "from" := s."from", "to" := s."to", body := s.body, at := s.at))
-FROM (SELECT * FROM read_json('$lg', $cols) WHERE type='message_sent'
-        AND team='$tl' AND "to"='$al') s
-WHERE s.id NOT IN (
-  SELECT msg_id FROM read_json('$lg', $cols)
-  WHERE type='message_read' AND team='$tl' AND agent='$al')
-ORDER BY s.at, s.id;
-SQL
+  # Read the query from the companion .sql DATA file and fill placeholders with
+  # plain bash substitution (literal, so a value with sed-special / regex chars is
+  # safe). Keeping the SQL out of this shell file is what makes the driver parse
+  # under macOS bash 3.2 (an inline apostrophe-laden SQL string desyncs its parser).
+  tpl="$_JSONL_DRIVER_DIR/jsonl-unread.duckdb.sql"
+  [ -f "$tpl" ] || return 1
+  sql="$(cat "$tpl")"
+  sql="${sql//__LG__/$lg}"
+  sql="${sql//__TL__/$tl}"
+  sql="${sql//__AL__/$al}"
+  printf '%s\n' "$sql" | duckdb -noheader -list 2>/dev/null
 }
 
 storage_mark_read_batch() {
@@ -278,15 +282,11 @@ _jsonl_compact_do() {
   local log tmp; log="$(_jsonl_log)"; tmp="$log.compact.$$"
   # Keep every message_sent in order; collapse duplicate message_read for the same
   # (team, agent, msg_id) to the first seen. message_sent order is preserved, so
-  # the ordinal delivery cursor stays valid (§2.7 cursor-safe).
-  jq -c -s '
-    reduce .[] as $e ({out:[], seen:{}};
-      if $e.type=="message_sent" then .out += [$e]
-      elif $e.type=="message_read" then
-        ($e.team + " " + $e.agent + " " + $e.msg_id) as $k
-        | if .seen[$k] then . else .seen[$k]=true | .out += [$e] end
-      else . end)
-    | .out[]
-  ' "$log" > "$tmp" || { rm -f "$tmp"; return 1; }
+  # the ordinal delivery cursor stays valid (compaction cursor-safety, spec 2.7).
+  # NOTE: this jq program is deliberately a SINGLE line — a multi-line
+  # single-quoted jq string in this position desyncs the macOS system bash 3.2
+  # parser and breaks the rest of the file (a no-error `bash -n`, but a real
+  # source failure). Keep new jq one-liners here.
+  jq -c -s 'reduce .[] as $e ({out:[], seen:{}}; if $e.type=="message_sent" then .out += [$e] elif $e.type=="message_read" then ([$e.team,$e.agent,$e.msg_id]|join(" ")) as $k | if .seen[$k] then . else .seen[$k]=true | .out += [$e] end else . end) | .out[]' "$log" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$log"
 }
