@@ -43,11 +43,17 @@ fi
 mv "$OLD_DIR" "$NEW_DIR"
 
 # --- Update name in config.json ---
+# Read the config with readfile() (not `.param set`, whose dot-command tokenizer
+# does NOT honour SQL '' escaping, so an apostrophe in the config content breaks
+# the binding) and escape the new team name as a SQL string literal (#223, #87):
+# a team name may contain a single quote (validate.sh only blocks path traversal).
+# Mirrors join.sh's readfile-based, apostrophe-safe registry read.
 NEW_CONFIG="$NEW_DIR/config.json"
 if [ -f "$NEW_CONFIG" ]; then
-  CONFIG_ESCAPED=$(sed "s/'/''/g" "$NEW_CONFIG")
-  UPDATED=$(agmsg_sqlite_mem ".param set :json '$CONFIG_ESCAPED'" \
-    "SELECT json_set(:json, '\$.name', '$NEW_TEAM');")
+  CONFIG_SQL=$(agmsg_sql_readfile_path "$NEW_CONFIG")
+  NEW_TEAM_LIT=$(agmsg_sqlesc "$NEW_TEAM")
+  UPDATED=$(agmsg_sqlite_mem \
+    "SELECT json_set(CAST(readfile('$CONFIG_SQL') AS TEXT), '\$.name', '$NEW_TEAM_LIT');")
   echo "$UPDATED" > "$NEW_CONFIG"
 fi
 
@@ -55,11 +61,16 @@ fi
 # Rewrite the team name in BOTH stores: the event log (where storage_send now
 # writes) and the legacy messages table (pre-event-log installs). Without the
 # events update a rename would orphan every message sent after the storage flip.
+# Escape both team names as SQL string literals (#223, #87): a team name may
+# contain a single quote (validate.sh only blocks path traversal), which would
+# otherwise break the UPDATE and is an injection surface.
 if [ -f "$DB" ]; then
-  agmsg_sqlite "$DB" "UPDATE messages SET team='$NEW_TEAM' WHERE team='$OLD_TEAM';"
+  OLD_LIT=$(agmsg_sqlesc "$OLD_TEAM")
+  NEW_LIT=$(agmsg_sqlesc "$NEW_TEAM")
+  agmsg_sqlite "$DB" "UPDATE messages SET team='$NEW_LIT' WHERE team='$OLD_LIT';"
   # events may not exist yet on an install that has not sent since the storage
   # flip — best-effort, never abort the rename over a missing optional table.
-  agmsg_sqlite "$DB" "UPDATE events SET team='$NEW_TEAM' WHERE team='$OLD_TEAM';" 2>/dev/null || true
+  agmsg_sqlite "$DB" "UPDATE events SET team='$NEW_LIT' WHERE team='$OLD_LIT';" 2>/dev/null || true
 fi
 
 echo "Renamed team $OLD_TEAM → $NEW_TEAM"

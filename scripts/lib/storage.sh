@@ -107,6 +107,17 @@ agmsg_sql_readfile_path() {
   printf '%s' "$path" | sed "s/'/''/g"
 }
 
+# Escape an arbitrary scalar for safe interpolation into a SQL string literal
+# (double every single quote). Same semantics as the sqlite driver's internal
+# _sqlite_lit / storage_send escaping, but driver-agnostic and available to the
+# registry scripts that still write the legacy messages table directly
+# (rename.sh / rename-team.sh). A team or agent name may legitimately contain a
+# single quote (validate.sh only blocks path traversal), which would otherwise
+# break the INSERT/UPDATE and is an injection surface (#223, #87).
+agmsg_sqlesc() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
 # ── Storage driver facade (storage axis) ─────────────────────────────────────
 # The helpers above resolve the legacy sqlite path and run raw SQL; call sites
 # keep using them until #206 migrates them onto the contract below. The facade

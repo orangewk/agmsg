@@ -281,6 +281,61 @@ teardown() {
   [[ "$output" =~ "same" ]]
 }
 
+# --- SQL string-literal escaping for interpolated names (#223, #87) ---
+# Team and agent names may contain a single quote (validate.sh only blocks path
+# traversal). Before escaping, such a name broke the INSERT/UPDATE and was an
+# injection surface (a name could widen the WHERE predicate). These pin the
+# escaping so a quoted name round-trips and a crafted name cannot touch other
+# rows.
+
+@test "rename-team: escapes quoted team names and migrates only the matching team" {
+  bash "$SCRIPTS/join.sh" "a'team"    alice claude-code /tmp/proj-a
+  bash "$SCRIPTS/join.sh" "a'team"    bob   claude-code /tmp/proj-b
+  bash "$SCRIPTS/join.sh" "keep'team" carol claude-code /tmp/proj-c
+  bash "$SCRIPTS/join.sh" "keep'team" dave  claude-code /tmp/proj-d
+  bash "$SCRIPTS/send.sh" "a'team"    alice bob  "moved"
+  bash "$SCRIPTS/send.sh" "keep'team" carol dave "stay"
+
+  run bash "$SCRIPTS/rename-team.sh" "a'team" "n'team"
+  [ "$status" -eq 0 ]
+  [ ! -d "$TEST_SKILL_DIR/teams/a'team" ]
+  [ -f "$TEST_SKILL_DIR/teams/n'team/config.json" ]
+
+  # config "name" field updated to the quoted new name (json_set value escaped)
+  run sqlite_mem "SELECT json_extract(readfile('$(rf "$TEST_SKILL_DIR/teams/n'team/config.json")'), '\$.name');"
+  [ "$output" = "n'team" ]
+
+  # the message moved to the new quoted team name (messages + events UPDATE escaped)
+  run bash "$SCRIPTS/inbox.sh" "n'team" bob
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "moved" ]]
+
+  # the other quoted team is untouched — the WHERE predicate was not widened
+  run bash "$SCRIPTS/inbox.sh" "keep'team" dave
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "stay" ]]
+}
+
+@test "rename: escapes the agent name in the messages UPDATE without widening it" {
+  # rename.sh rewrites the legacy messages table directly. Seed it with the
+  # renamed agent's row plus an unrelated victim row that an unscoped/injection
+  # predicate would wrongly rewrite.
+  local db="$TEST_SKILL_DIR/db/messages.db"
+  sqlite3 "$db" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('t', 'alice', 'x', 'a-msg');"
+  sqlite3 "$db" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('t', 'keepme', 'x', 'k-msg');"
+  bash "$SCRIPTS/join.sh" t alice claude-code /tmp/proj
+
+  run bash "$SCRIPTS/rename.sh" t alice carol
+  [ "$status" -eq 0 ]
+
+  # the renamed agent's row moved to the new name ...
+  run sqlite3 "$db" "SELECT from_agent FROM messages WHERE body='a-msg';"
+  [ "$output" = "carol" ]
+  # ... and the unrelated row was NOT rewritten (predicate stayed scoped)
+  run sqlite3 "$db" "SELECT from_agent FROM messages WHERE body='k-msg';"
+  [ "$output" = "keepme" ]
+}
+
 @test "join: rejects unknown agent type" {
   run bash "$SCRIPTS/join.sh" myteam alice claude /tmp/proj
   [ "$status" -ne 0 ]
