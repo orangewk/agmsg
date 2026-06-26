@@ -96,6 +96,11 @@ PROJECT_HASH="$(printf '%s' "$PROJECT" | agmsg_sha1)"
 SERVER_LOG="$RUN_DIR/codex-app-server.$PROJECT_HASH.log"
 SERVER_PID="$RUN_DIR/codex-app-server.$PROJECT_HASH.pid"
 PORT_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.port"
+# Records the codex version that launched the reusable app-server. A TUI from a
+# newer/older codex can't speak to an app-server from a different build, so a
+# stale server left running across a codex upgrade must not be reused (#NNN).
+VERSION_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.version"
+CODEX_VERSION="$("$REAL_CODEX" --version 2>/dev/null || true)"
 
 mkdir -p "$RUN_DIR"
 
@@ -110,12 +115,24 @@ PORT=""
 if [ -f "$PORT_FILE" ] && [ -f "$SERVER_PID" ]; then
   existing_port="$(cat "$PORT_FILE" 2>/dev/null || true)"
   existing_pid="$(cat "$SERVER_PID" 2>/dev/null || true)"
+  existing_version="$(cat "$VERSION_FILE" 2>/dev/null || true)"
   # Reuse only when OUR recorded app-server is still alive AND its port answers,
   # so a foreign process that grabbed the same port after ours died is not
   # mistaken for the bridge app-server.
   if [ -n "$existing_port" ] && [ -n "$existing_pid" ] \
     && kill -0 "$existing_pid" 2>/dev/null && port_alive "$existing_port"; then
-    PORT="$existing_port"
+    # ...and only when it was launched by THIS codex build. A codex upgrade leaves
+    # the old app-server process running on the recorded port; its port still
+    # answers, but a new TUI's --remote can't speak to the old server and dies
+    # with "failed to connect to remote app server". Treat a version mismatch as
+    # stale: kill the old server and start a fresh one. (If we can't read the
+    # current version, fall back to liveness-only reuse — the prior behaviour.)
+    if [ -z "$CODEX_VERSION" ] || [ "$existing_version" = "$CODEX_VERSION" ]; then
+      PORT="$existing_port"
+    else
+      kill "$existing_pid" 2>/dev/null || true
+      rm -f "$PORT_FILE" "$SERVER_PID" "$VERSION_FILE"
+    fi
   fi
 fi
 
@@ -141,10 +158,13 @@ if [ -z "$PORT" ]; then
     echo "codex-monitor: app-server did not report a listening port; starting codex without the agmsg bridge" >&2
     echo "codex-monitor: see $SERVER_LOG" >&2
     kill "$server_bg" 2>/dev/null || true
-    rm -f "$SERVER_PID"
+    rm -f "$SERVER_PID" "$VERSION_FILE"
     exec_plain_codex
   fi
   printf '%s' "$PORT" > "$PORT_FILE"
+  # Stamp the version that owns this server so a later launch from a different
+  # codex build recreates it instead of reusing a stale one.
+  printf '%s' "$CODEX_VERSION" > "$VERSION_FILE"
 fi
 
 if ! port_alive "$PORT"; then
