@@ -71,6 +71,27 @@ case "$CODEX_COMMAND" in
 esac
 
 PROJECT="$(cd "$PROJECT" && pwd)"
+
+# Fail-open: never let a broken bridge block codex. If the agmsg app-server can't
+# be brought up — e.g. a codex release changes the app-server interface and the
+# launch/port detection fails — hand off to a plain codex session (no --remote
+# bridge) instead of erroring out. The user keeps a working codex; only the
+# agmsg monitor delivery is skipped for this launch.
+#
+# This is a LOUD fallback: it only runs on UNEXPECTED failure (the explicit
+# AGMSG_CODEX_SHIM_DISABLE=1 bypass is handled in codex-shim.sh and never reaches
+# here), so it must tell the user, on screen, that real-time delivery is off —
+# otherwise message receipt stops silently. The earlier echoes give the specific
+# reason + log path; this prints the one-line summary just before handoff.
+exec_plain_codex() {
+  echo "agmsg: Codex monitor bridge unavailable - launching plain Codex. Real-time agmsg delivery is OFF this session (messages still queue; check your inbox manually). Likely cause: the Codex app-server interface changed in 0.142+. Fix in progress." >&2
+  cd "$PROJECT" 2>/dev/null || true
+  case "$CODEX_COMMAND" in
+    codex)  exec "$REAL_CODEX" ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
+    resume) exec "$REAL_CODEX" resume ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
+  esac
+}
+
 PROJECT_HASH="$(printf '%s' "$PROJECT" | agmsg_sha1)"
 SERVER_LOG="$RUN_DIR/codex-app-server.$PROJECT_HASH.log"
 SERVER_PID="$RUN_DIR/codex-app-server.$PROJECT_HASH.pid"
@@ -105,24 +126,31 @@ if [ -z "$PORT" ]; then
   # it degrades on its own if Node is missing rather than taking down the TUI. See #170.
   : > "$SERVER_LOG"
   "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 &
-  echo "$!" > "$SERVER_PID"
+  server_bg="$!"
+  echo "$server_bg" > "$SERVER_PID"
   for _ in $(seq 1 100); do
     PORT="$(sed -n 's#.*listening on: ws://127\.0\.0\.1:\([0-9][0-9]*\).*#\1#p' "$SERVER_LOG" | head -1)"
     [ -n "$PORT" ] && break
+    # Stop waiting the moment the app-server exits (e.g. a codex release dropped
+    # `app-server --listen ws://`): no point burning the full timeout before we
+    # fail open.
+    kill -0 "$server_bg" 2>/dev/null || break
     sleep 0.1
   done
   if [ -z "$PORT" ]; then
-    echo "codex-monitor: app-server did not report a listening port" >&2
+    echo "codex-monitor: app-server did not report a listening port; starting codex without the agmsg bridge" >&2
     echo "codex-monitor: see $SERVER_LOG" >&2
-    exit 1
+    kill "$server_bg" 2>/dev/null || true
+    rm -f "$SERVER_PID"
+    exec_plain_codex
   fi
   printf '%s' "$PORT" > "$PORT_FILE"
 fi
 
 if ! port_alive "$PORT"; then
-  echo "codex-monitor: app-server did not start on ws://127.0.0.1:$PORT" >&2
+  echo "codex-monitor: app-server not reachable on ws://127.0.0.1:$PORT; starting codex without the agmsg bridge" >&2
   echo "codex-monitor: see $SERVER_LOG" >&2
-  exit 1
+  exec_plain_codex
 fi
 SOCKET_URL="ws://127.0.0.1:$PORT"
 
