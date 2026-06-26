@@ -96,11 +96,13 @@ TEAMS_DIR="$SCRIPT_DIR/../teams"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/roster.sh"
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 AGENT_TYPE_SQL=$(printf '%s' "$AGENT_TYPE" | sed "s/'/''/g")
 
 if [ ! -d "$TEAMS_DIR" ]; then
-  echo "not_joined=true available_teams=none"
+  echo "not_joined=true available_teams=none suggested=$(agmsg_suggest_names __new-team__ 5 | paste -sd, -)"
   exit 0
 fi
 
@@ -149,7 +151,9 @@ for config_file in "$TEAMS_DIR"/*/config.json; do
 done
 
 if [ -z "$EXACT_MATCHES" ] && [ -z "$SUGGESTED_MATCHES" ]; then
-  echo "not_joined=true available_teams=${ALL_TEAMS:-none}"
+  FIRST_TEAM="${ALL_TEAMS%%,*}"
+  SUGGESTED_NAMES="$(agmsg_suggest_names "${FIRST_TEAM:-__new-team__}" 5 | paste -sd, -)"
+  echo "not_joined=true available_teams=${ALL_TEAMS:-none} suggested=$SUGGESTED_NAMES"
   exit 0
 fi
 
@@ -157,7 +161,9 @@ if [ -z "$EXACT_MATCHES" ]; then
   # SUGGESTED_MATCHES is "team\tagent" per line; preserve that order.
   AGENT_NAMES=$(echo "$SUGGESTED_MATCHES" | cut -f2 | awk '!seen[$0]++' | paste -sd, -)
   TEAM_NAMES=$(echo "$SUGGESTED_MATCHES" | cut -f1 | awk '!seen[$0]++' | paste -sd, -)
-  echo "suggest=true agents=$AGENT_NAMES teams=$TEAM_NAMES type=$AGENT_TYPE project=$PROJECT_PATH available_teams=${ALL_TEAMS:-none}"
+  FIRST_TEAM="${TEAM_NAMES%%,*}"
+  SUGGESTED_NAMES="$(agmsg_suggest_names "$FIRST_TEAM" 5 | paste -sd, -)"
+  echo "suggest=true agents=$AGENT_NAMES teams=$TEAM_NAMES type=$AGENT_TYPE project=$PROJECT_PATH available_teams=${ALL_TEAMS:-none} suggested=$SUGGESTED_NAMES"
   exit 0
 fi
 

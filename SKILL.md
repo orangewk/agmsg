@@ -35,10 +35,12 @@ After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip St
 ```bash
 ~/.agents/skills/agmsg/scripts/whoami.sh "$(pwd)" <type>
 # type: claude-code, codex, gemini, antigravity, copilot
-# Returns: agent=... / multiple=true ... / suggest=true ... / not_joined=true ...
+# Returns: agent=... / multiple=true ... / suggest=true ... / not_joined=true ...; join-needed paths may include suggested=<n1,n2,...>
 ```
 
 ### Step 2a: If not in a team — join one
+
+If whoami output includes `suggested=`, show those unused roster-aware identity names as options for the agent name. They are advisory; the user may still type a different name.
 
 Ask the user for a team name and agent name, then run:
 

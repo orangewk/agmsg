@@ -22,7 +22,7 @@ Four possible outputs:
 → Ask the user which agent name to use for this session, then go to **Execute**.
 
 **C) Not in a team:**
-`not_joined=true available_teams=<t1,t2,...>` (or `available_teams=none`)
+`not_joined=true available_teams=<t1,t2,...>` (or `available_teams=none`), optionally `suggested=<n1,n2,...>`
 → Show the user the available teams from the output, then:
 
   > **First-time setup required.**
@@ -31,7 +31,7 @@ Four possible outputs:
   > - **Agent name**: this agent's identity within the team
 
   1. Ask: "Enter a team name (joins existing or creates new)"
-  2. Ask: "Enter a name for this agent"
+  2. If the output includes `suggested=`, show those unused roster-aware identity names as options. Ask: "Enter a name for this agent"; empty input may use the first suggested name.
   3. **You MUST use join.sh** — run: `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <agent_name> codex "$(pwd)"`
   4. Show the result and explain:
 
@@ -68,10 +68,10 @@ Four possible outputs:
   6. Then check inbox for the newly joined team.
 
 **D) Suggestions for reuse:**
-`suggest=true agents=<n1,n2,...> teams=<t1,t2,...> type=codex project=<path> available_teams=<t1,t2,...>`
+`suggest=true agents=<n1,n2,...> teams=<t1,t2,...> type=codex project=<path> available_teams=<t1,t2,...>`, optionally `suggested=<n1,n2,...>`
 → No exact registration exists for this project, but there are same-type agent names registered elsewhere.
 
-  1. Show the suggested agent names to the user.
+  1. Show the reuse candidates from `agents=` and the unused roster-aware names from `suggested=` (if present).
   2. Ask whether to reuse one of those names or choose a new one.
   3. Ask for the team name to join (existing or new).
   4. Run: `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <agent_name> codex "$(pwd)"`

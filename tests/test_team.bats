@@ -151,6 +151,7 @@ teardown() {
   run bash "$SCRIPTS/whoami.sh" /tmp/unknown claude-code
   [ "$status" -eq 0 ]
   [[ "$output" =~ "not_joined=true" ]]
+  [[ "$output" =~ "suggested=" ]]
 }
 
 @test "whoami: returns multiple when multiple identities" {
@@ -167,6 +168,7 @@ teardown() {
   bash "$SCRIPTS/join.sh" team1 alice claude-code /tmp/other
   run bash "$SCRIPTS/whoami.sh" /tmp/nothere claude-code
   [[ "$output" =~ "available_teams=team1" ]]
+  [[ "$output" =~ "suggested=" ]]
 }
 
 @test "whoami: finds re-joined agent in another project registration" {
@@ -185,6 +187,7 @@ teardown() {
   [[ "$output" =~ "suggest=true" ]]
   [[ "$output" =~ "agents=alice" ]]
   [[ "$output" =~ "available_teams=myteam" ]]
+  [[ "$output" =~ "suggested=" ]]
 }
 
 @test "whoami: auto-detects claude-code from CLAUDE_CODE_SESSION_ID env" {
