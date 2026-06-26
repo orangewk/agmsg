@@ -201,11 +201,13 @@ launcher_cmd="${AGMSG_CODEX_BRIDGE_LAUNCHER_CMD:-$SCRIPT_DIR/codex-bridge-launch
 "$launcher_cmd" codex "$PROJECT" "$SOCKET_URL" "$$" >/dev/null 2>&1 &
 
 cd "$PROJECT"
+# Guard the array expansion: under bash 3.2 + `set -u`, "${CODEX_ARGS[@]}" on an
+# empty array errors with "unbound variable" (a no-arg `codex`/`codex resume`).
 case "$CODEX_COMMAND" in
   codex)
-    exec "$REAL_CODEX" --remote "$SOCKET_URL" "${CODEX_ARGS[@]}"
+    exec "$REAL_CODEX" --remote "$SOCKET_URL" ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"}
     ;;
   resume)
-    exec "$REAL_CODEX" resume --remote "$SOCKET_URL" "${CODEX_ARGS[@]}"
+    exec "$REAL_CODEX" resume --remote "$SOCKET_URL" ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"}
     ;;
 esac
