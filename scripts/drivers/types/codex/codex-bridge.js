@@ -803,6 +803,7 @@ class CodexBridge {
     const handle = `agmsg-watch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.watchHandle = handle;
     const command = [
+      BASH_BIN,
       path.join(SCRIPT_DIR, "watch-once.sh"),
       this.opts.project,
       this.opts.type,
