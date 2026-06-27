@@ -48,13 +48,22 @@ _agmsg_run_dir() { printf '%s/run' "$SKILL_DIR"; }
 # literal value. The `cd` runs in a command-substitution subshell, so the
 # caller's working directory is never affected. See #160.
 agmsg_canonical_path() {
-  local p="$1" phys
+  local p="$1" phys in_path out_path
   [ -n "$p" ] || { printf '%s' "$p"; return 0; }
-  if phys=$(cd -- "$p" 2>/dev/null && pwd -P); then
-    printf '%s' "$phys"
-  else
-    printf '%s' "$p"
+  in_path="$p"
+  _agmsg_detect_platform
+  if [ "$_agmsg_platform" = "msys" ] && command -v cygpath >/dev/null 2>&1; then
+    in_path=$(cygpath -u "$p" 2>/dev/null || printf '%s' "$p")
   fi
+  if phys=$(cd -- "$in_path" 2>/dev/null && pwd -P); then
+    out_path="$phys"
+  else
+    out_path="$p"
+  fi
+  if [ "$_agmsg_platform" = "msys" ] && command -v cygpath >/dev/null 2>&1; then
+    out_path=$(cygpath -m "$out_path" 2>/dev/null || printf '%s' "$out_path")
+  fi
+  printf '%s' "$out_path"
 }
 
 # Map an agent type to the binary basename(s) its process may carry.
@@ -76,7 +85,7 @@ _agmsg_agent_binaries() {
 agmsg_pid_is_agent() {
   local pid="$1" type="$2"
   [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  compat_pid_alive "$pid" || return 1
   local binaries comm first base bin
   binaries=$(_agmsg_agent_binaries "$type")
   comm=$(compat_get_comm "$pid" 2>/dev/null || true)
@@ -156,7 +165,7 @@ agmsg_marker_gc_stale() {
     [ -f "$f" ] || continue
     pid=${f##*/proj.}; pid=${pid%.project}
     case "$pid" in ''|*[!0-9]*) continue ;; esac
-    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+    compat_pid_alive "$pid" || rm -f "$f"
   done
 }
 
@@ -185,7 +194,11 @@ agmsg_registered_projects() {
       SELECT DISTINCT json_extract(r.value, '\$.project')
       FROM agents, json_each(agents.registrations) AS r
       WHERE json_extract(r.value, '\$.type') = '$type_sql';
-    " | tr -d '\r'
+    " | tr -d '\r' | while IFS= read -r project; do
+      [ -n "$project" ] || continue
+      agmsg_canonical_path "$project"
+      printf '\n'
+    done
   done
 }
 
@@ -205,6 +218,7 @@ agmsg_gitcommon_project() {
   # --git-common-dir may be relative to <start>; make it absolute.
   case "$common" in /*) ;; *) common="$start/$common" ;; esac
   main=$(cd "$(dirname "$common")" 2>/dev/null && pwd) || return 1
+  main=$(agmsg_canonical_path "$main")
   projects="$(agmsg_registered_projects "$type")"
   [ -n "$projects" ] || return 1
   printf '%s\n' "$projects" | grep -Fxq "$main" || return 1
@@ -214,16 +228,18 @@ agmsg_gitcommon_project() {
 # Echo the nearest ancestor of <start> (inclusive) that is a registered project
 # for <type>. return 1 when none matches.
 agmsg_ancestor_project() {
-  local start="$1" type="$2" projects d
+  local start="$1" type="$2" projects d next
   projects="$(agmsg_registered_projects "$type")"
   [ -n "$projects" ] || return 1
-  d="$start"
+  d="$(agmsg_canonical_path "$start")"
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
     if printf '%s\n' "$projects" | grep -Fxq "$d"; then
       printf '%s' "$d"
       return 0
     fi
-    d=$(dirname "$d")
+    next=$(dirname "$d")
+    [ "$next" = "$d" ] && break
+    d="$next"
   done
   return 1
 }
@@ -253,6 +269,6 @@ agmsg_resolve_project() {
   if gitc="$(agmsg_gitcommon_project "$pwd_path" "$type")" && [ -n "$gitc" ]; then
     printf '%s' "$gitc"; return 0
   fi
-  # 4) Unchanged fallback.
-  printf '%s' "$pwd_path"
+  # 4) Canonicalized fallback.
+  agmsg_canonical_path "$pwd_path"
 }

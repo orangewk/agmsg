@@ -15,13 +15,16 @@ set -euo pipefail
 
 PROJECT_PATH="${1:?Usage: identities.sh <project_path> <agent_type>}"
 AGENT_TYPE="${2:?Missing agent_type}"
-PROJECT_SQL=$(printf '%s' "$PROJECT_PATH" | sed "s/'/''/g")
 AGENT_TYPE_SQL=$(printf '%s' "$AGENT_TYPE" | sed "s/'/''/g")
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEAMS_DIR="$SCRIPT_DIR/../teams"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/resolve-project.sh"
+PROJECT_CANONICAL="$(agmsg_canonical_path "$PROJECT_PATH")"
 
 [ -d "$TEAMS_DIR" ] || exit 0
 
@@ -35,7 +38,6 @@ for config_file in "$TEAMS_DIR"/*/config.json; do
   ")
   [ -z "$TEAM_NAME" ] && continue
   [ "$TEAM_NAME" = "null" ] && continue
-  TEAM_SQL=$(printf '%s' "$TEAM_NAME" | sed "s/'/''/g")
 
   sqlite3 -separator $'\t' :memory: "
     WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
@@ -49,10 +51,14 @@ for config_file in "$TEAMS_DIR"/*/config.json; do
         END AS registrations
       FROM cfg, json_each(json_extract(cfg.json, '\$.agents'))
     )
-    SELECT DISTINCT '$TEAM_SQL' AS team, name
+    SELECT DISTINCT name, json_extract(r.value, '\$.project') AS project
     FROM agents, json_each(agents.registrations) AS r
-    WHERE json_extract(r.value, '\$.project') = '$PROJECT_SQL'
-      AND json_extract(r.value, '\$.type') = '$AGENT_TYPE_SQL'
-    ORDER BY team, name;
-  " | tr -d '\r'
+    WHERE json_extract(r.value, '\$.type') = '$AGENT_TYPE_SQL'
+    ORDER BY name, project;
+  " | tr -d '\r' | while IFS=$'\t' read -r agent_name registered_project; do
+    [ -n "$agent_name" ] || continue
+    [ -n "$registered_project" ] || continue
+    [ "$(agmsg_canonical_path "$registered_project")" = "$PROJECT_CANONICAL" ] || continue
+    printf '%s\t%s\n' "$TEAM_NAME" "$agent_name"
+  done
 done

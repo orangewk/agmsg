@@ -14,6 +14,8 @@ RUN_DIR="$SKILL_DIR/run"
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 # shellcheck source=../../../lib/compat.sh
 source "$SCRIPT_DIR/../../../lib/compat.sh"
+# shellcheck source=../../../lib/resolve-project.sh
+source "$SCRIPT_DIR/../../../lib/resolve-project.sh"
 
 PROJECT="$(pwd)"
 SOCKET_PATH=""
@@ -72,7 +74,7 @@ case "$CODEX_COMMAND" in
     ;;
 esac
 
-PROJECT="$(cd "$PROJECT" && pwd)"
+PROJECT="$(agmsg_canonical_path "$PROJECT")"
 
 # Fail-open: never let a broken bridge block codex. If the agmsg app-server can't
 # be brought up — e.g. a codex release changes the app-server interface and the
@@ -122,7 +124,7 @@ if [ -f "$PORT_FILE" ] && [ -f "$SERVER_PID" ]; then
   # so a foreign process that grabbed the same port after ours died is not
   # mistaken for the bridge app-server.
   if [ -n "$existing_port" ] && [ -n "$existing_pid" ] \
-    && kill -0 "$existing_pid" 2>/dev/null && port_alive "$existing_port"; then
+    && compat_pid_alive "$existing_pid" && port_alive "$existing_port"; then
     # Confirm the recorded pid is actually OUR codex app-server before trusting OR
     # killing it: a recycled pid could belong to an unrelated process while the
     # recorded port happens to answer via something else. Only reuse/kill when the
@@ -168,7 +170,7 @@ if [ -z "$PORT" ]; then
     # Stop waiting the moment the app-server exits (e.g. a codex release dropped
     # `app-server --listen ws://`): no point burning the full timeout before we
     # fail open.
-    kill -0 "$server_bg" 2>/dev/null || break
+    compat_pid_alive "$server_bg" || break
     sleep 0.1
   done
   if [ -z "$PORT" ]; then

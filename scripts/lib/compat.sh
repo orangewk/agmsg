@@ -19,6 +19,51 @@ _agmsg_detect_platform() {
   esac
 }
 
+compat_get_native_cmdline() {
+  local pid="$1"
+  [ -z "$pid" ] && return 1
+  _agmsg_detect_platform
+  [ "$_agmsg_platform" = "msys" ] || return 1
+  command -v powershell.exe >/dev/null 2>&1 || return 1
+  AGMSG_COMPAT_PID="$pid" powershell.exe -NoProfile -NonInteractive -Command '
+    $pidValue = 0
+    if (-not [int]::TryParse($env:AGMSG_COMPAT_PID, [ref]$pidValue)) { exit 1 }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+    if (-not $proc) { exit 1 }
+    [Console]::Out.Write(($proc.CommandLine -as [string]))
+  ' 2>/dev/null | tr -d '\r'
+}
+
+# Does <pid> refer to a live process? When <cmdline_glob> is supplied, the live
+# process must also have a command line matching that shell-style glob. On
+# Windows/Git Bash, native Win32 children can be invisible to `kill -0`, so use
+# CIM as a fallback while keeping the POSIX fast path for MSYS-owned children.
+compat_pid_alive() {
+  local pid="$1" cmdline_glob="${2:-}" cmdline
+  [ -z "$pid" ] && return 1
+  case "$pid" in *[!0-9]*) return 1 ;; esac
+  _agmsg_detect_platform
+
+  if kill -0 "$pid" 2>/dev/null; then
+    if [ -z "$cmdline_glob" ]; then
+      return 0
+    fi
+    cmdline=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+    case "$cmdline" in $cmdline_glob) return 0 ;; esac
+  fi
+
+  [ "$_agmsg_platform" = "msys" ] || return 1
+  command -v powershell.exe >/dev/null 2>&1 || return 1
+  AGMSG_COMPAT_PID="$pid" AGMSG_COMPAT_PATTERN="$cmdline_glob" powershell.exe -NoProfile -NonInteractive -Command '
+    $pidValue = 0
+    if (-not [int]::TryParse($env:AGMSG_COMPAT_PID, [ref]$pidValue)) { exit 1 }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+    if (-not $proc) { exit 1 }
+    $pattern = $env:AGMSG_COMPAT_PATTERN
+    if ($pattern -and (($proc.CommandLine -as [string]) -notlike $pattern)) { exit 1 }
+    exit 0
+  ' >/dev/null 2>&1
+}
 # Get parent PID of a process.  Replaces: ps -o ppid= -p <pid>
 compat_get_ppid() {
   local pid="$1"
@@ -47,7 +92,7 @@ compat_get_cmdline() {
       if [ -r "/proc/$pid/cmdline" ]; then
         tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null
       else
-        ps -l -p "$pid" 2>/dev/null | awk 'NR==2{print $NF}'
+        compat_get_native_cmdline "$pid" 2>/dev/null || ps -l -p "$pid" 2>/dev/null | awk 'NR==2{print $NF}'
       fi
       ;;
     *)
@@ -66,7 +111,7 @@ compat_get_comm() {
       if [ -r "/proc/$pid/cmdline" ]; then
         tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1 | xargs basename 2>/dev/null
       else
-        ps -l -p "$pid" 2>/dev/null | awk 'NR==2{print $NF}' | xargs basename 2>/dev/null
+        (compat_get_native_cmdline "$pid" 2>/dev/null || ps -l -p "$pid" 2>/dev/null | awk 'NR==2{print $NF}') | awk '{print $1}' | xargs basename 2>/dev/null
       fi
       ;;
     *)

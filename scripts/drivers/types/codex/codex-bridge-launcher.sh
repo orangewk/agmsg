@@ -20,6 +20,8 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
 # shellcheck source=../../../lib/hash.sh
 source "$SCRIPT_DIR/../../../lib/hash.sh"
+# shellcheck source=../../../lib/compat.sh
+source "$SCRIPT_DIR/../../../lib/compat.sh"
 PROJECT_HASH="$(printf '%s' "$PROJECT" | agmsg_sha1)"
 REQUEST_FILE="$RUN_DIR/codex-bridge-request.$PROJECT_HASH"
 
@@ -39,7 +41,7 @@ resolve_identity() {  # prints "team<TAB>name" lines for the project's codex rol
 # actas may register the role a moment after launch, so retry while the parent
 # (codex-monitor.sh) is alive. Proceed only when exactly one identity resolves.
 team="" name=""
-while kill -0 "$PARENT_PID" 2>/dev/null; do
+while compat_pid_alive "$PARENT_PID"; do
   ids="$(resolve_identity || true)"
   count="$(printf '%s\n' "$ids" | grep -c . || true)"
   if [ "$count" = "1" ]; then
@@ -69,7 +71,7 @@ else
   bridge_run=("$NODE_BIN" "$SCRIPT_DIR/codex-bridge.js")
 fi
 
-while kill -0 "$PARENT_PID" 2>/dev/null; do
+while compat_pid_alive "$PARENT_PID"; do
   # Resolve the app-server URL (and thread) this iteration would launch against
   # FIRST, so the reuse check can compare a live bridge's bound server with the
   # current one. Thread source: a request file (older-codex hook) wins; otherwise
@@ -89,7 +91,7 @@ EOF
 
   if [ -f "$pidfile" ]; then
     bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
+    if [ -n "$bridge_pid" ] && compat_pid_alive "$bridge_pid"; then
       # Reuse only when the live bridge is bound to the CURRENT app-server. A
       # codex upgrade makes codex-monitor.sh kill the stale app-server and start a
       # fresh one on a new port (#237); a bridge still bound to the old URL stays
