@@ -21,6 +21,7 @@ function parseArgs(argv) {
     else if (arg === "--app-server") opts.appServer = argv[++i];
     else if (arg === "--thread") opts.thread = argv[++i];
     else if (arg === "--request-timeout-ms") opts.requestTimeoutMs = Number(argv[++i]);
+    else if (arg === "--skip-resume") opts.skipResume = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
   return opts;
@@ -239,15 +240,17 @@ async function main() {
     threadId = ids[0];
   }
 
-  const resumed = await client.request("thread/resume", {
+  if (!opts.skipResume) {
+    const resumed = await client.request("thread/resume", {
     threadId,
     cwd: path.resolve(opts.project),
     runtimeWorkspaceRoots: [path.resolve(opts.project)],
     excludeTurns: true,
   });
-  if (!resumed.thread || resumed.thread.id !== threadId) throw new Error("thread/resume did not return the requested thread");
-  const statusType = resumed.thread.status && resumed.thread.status.type;
-  if (statusType === "active") throw new Error("thread is active; idle-wake test requires an idle thread");
+    if (!resumed.thread || resumed.thread.id !== threadId) throw new Error("thread/resume did not return the requested thread");
+    const statusType = resumed.thread.status && resumed.thread.status.type;
+    if (statusType === "active") throw new Error("thread is active; idle-wake test requires an idle thread");
+  }
 
   await client.request("turn/start", {
     threadId,
@@ -263,4 +266,5 @@ main().catch((error) => {
   console.error(`codex-idle-wake-adapter: ${error.message}`);
   process.exit(1);
 });
+
 

@@ -222,3 +222,55 @@ Classification:
 Interpretation:
 
 This confirms that the next real wake smoke needs an actual terminal/PTY-backed Codex CLI session, not a background `child_process.spawn` with piped/ignored stdio. On Windows this likely means either a visible terminal launched with `Start-Process` or a PTY-capable harness. The Desktop target is still a later step; this is the CLI-remote stepping stone.
+## visible TTY codex --remote wake probe
+
+A visible PowerShell terminal was launched with:
+
+```text
+codex.exe --remote <owned-endpoint> --cd C:\dev\MathDesk --no-alt-screen
+```
+
+First attempt with the normal adapter path reached a loaded thread but failed at `thread/resume`:
+
+```text
+codex-idle-wake-adapter: no rollout found for thread id <id>
+```
+
+Classification:
+
+- owned app-server: OK
+- visible TTY remote session: OK enough for `thread/loaded/list` to return a loaded thread
+- adapter path: failed at `thread/resume`; this appears specific to remote loaded threads without rollout metadata
+
+Added PoC-only adapter option:
+
+```text
+--skip-resume
+```
+
+Second attempt used `--skip-resume` and called `turn/start` directly on the loaded thread. Result:
+
+```json
+{"ok":true,"threadId":"019f0cfd-c2be-7b93-9501-726c508e8228"}
+```
+
+Interpretation:
+
+- Real Windows `codex-cli --remote` with a real TTY can attach to a supervisor-owned app-server.
+- The disposable adapter can discover the loaded remote thread.
+- `turn/start` is accepted by the real app-server when called directly on that loaded thread.
+- For this remote-session path, `thread/resume` is not the right prerequisite; it fails because no rollout exists for the loaded remote thread.
+
+Current AC4 result:
+
+- Fake app-server turn/start: yes.
+- Supervisor -> adapter -> fake app-server turn/start: yes.
+- Supervisor-owned native app-server lifecycle: yes for start/stop and port persistence after owner returns.
+- Real codex-cli --remote TTY + direct `turn/start`: yes, request accepted.
+- Full user-visible processing/wake observation: partially observed via request acceptance; a longer manual observation can verify the remote TUI rendered/processed the injected turn.
+- Desktop path: still not tested; CLI remote is the stepping stone.
+
+Cleanup:
+
+- owned app-server endpoint was closed after stop
+- visible PowerShell/Codex probe process tree was stopped

@@ -87,15 +87,20 @@ function paths(runDir) {
 }
 
 function spawnCodex(codex, args, logFile) {
-  const out = fs.openSync(logFile, "a");
+  const stdout = fs.openSync(logFile, "a");
+  const stderr = fs.openSync(logFile, "a");
   if (process.platform === "win32" && codex.toLowerCase().endsWith(".ps1")) {
     return childProcess.spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", codex, ...args], {
-      stdio: ["ignore", out, out],
+      stdio: ["ignore", stdout, stderr],
       detached: false,
       windowsHide: true,
     });
   }
-  return childProcess.spawn(codex, args, { stdio: ["ignore", fs.openSync(logFile, "a"), fs.openSync(logFile, "a")], detached: false, windowsHide: true });
+  return childProcess.spawn(codex, args, {
+    stdio: ["ignore", stdout, stderr],
+    detached: process.platform === "win32",
+    windowsHide: true,
+  });
 }
 
 function readPid(file) {
@@ -156,6 +161,7 @@ main().catch((error) => {
   console.error(`codex-app-server-owner: ${error.message}`);
   process.exit(1);
 });
+
 
 
 
