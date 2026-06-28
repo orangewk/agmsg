@@ -346,3 +346,34 @@ Interpretation:
 
 - The PoC now proves supervisor -> adapter -> visible Codex remote -> active thread as one integrated path.
 - This is still not Codex Desktop direct injection. It is the strongest CLI-remote stepping stone so far and should be the base for deciding whether/how to bridge into Desktop.
+
+## feasibility verdict and liveness design handoff
+
+Feasibility verdict for this PoC:
+
+- The integrated stepping-stone path is proven on Windows:
+  `delivery-supervisor -> Codex adapter -> visible TTY codex --remote -> thread/status/changed active`.
+- This is enough to stop expanding the heartbeat-based PoC core.
+- The PoC should remain a feasibility artifact, not become production monitor design by accretion.
+
+Liveness handoff:
+
+- Decision owner for the heartbeat prohibition: orange.
+- Design owner for the replacement liveness model: Anna.
+- Implementation owner for the later build slice: Eiji/Codex, after the feasibility verdict is accepted.
+
+Build-stage direction from Anna's design note (`C:\dev\rt-monitor-rnd\design-supervisor-liveness.md`):
+
+- Replace timestamp heartbeat with held-connection liveness.
+- Do not ask the LLM to emit heartbeat/ping messages.
+- Do not add per-session timer processes just to keep liveness fresh.
+- Treat the already-required delivery connection as the liveness primitive:
+  - open connection/register frame = live seat binding
+  - transport drop = dead
+  - reconnect with cursor = resume
+- For Codex, register/bind the target seat to the remote/app-server/thread identity rather than guessing a delivery target.
+
+Implication for PR #3:
+
+- No further investment should go into `lastHeartbeat`, `heartbeat`, or `markStale` beyond their current disposable PoC role.
+- Any next implementation PR should start from held-connection liveness, using this PR only for the adapter and Windows remote feasibility evidence.
