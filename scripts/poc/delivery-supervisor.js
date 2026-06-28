@@ -246,6 +246,12 @@ class Supervisor {
         appendEvent(this.p, "adapter-fail", { id: message.id, status: result.status, stderr: (result.stderr || "").trim() });
         return false;
       }
+      appendEvent(this.p, "adapter-ok", {
+        id: message.id,
+        status: result.status,
+        stdout: (result.stdout || "").trim(),
+        stderr: (result.stderr || "").trim(),
+      });
     }
     appendLine(this.p.adapterLog, JSON.stringify(delivery));
     this.delivered.add(message.id);

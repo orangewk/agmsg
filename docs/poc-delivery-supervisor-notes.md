@@ -306,3 +306,43 @@ Cleanup:
 
 - app-server owner stopped pid `19792`
 - visible terminal process tree was requested to stop; a follow-up process scan found no leftover probe app-server/remote process
+
+## supervisor-to-visible-remote smoke update
+
+Added a Windows-only visible smoke script:
+
+- `tests/poc/smoke-supervisor-codex-remote-visible.ps1`
+
+The script validates the full stepping-stone path:
+
+1. start supervisor-owned native Codex app-server
+2. launch a visible TTY-backed `codex.exe --remote <endpoint> --cd <project> --no-alt-screen`
+3. start `delivery-supervisor.js` with the real Codex adapter command
+4. attach a live `mathdesk-desktop/Eiji` session
+5. send one supervisor message from `Anna` to `Eiji`
+6. verify supervisor cursor advances and adapter stdout reports `thread/status/changed` with `status: active`
+
+Supervisor now records adapter success output as an `adapter-ok` event. This gives the smoke script a durable place to verify the adapter's observed Codex events without coupling the supervisor core to Codex internals.
+
+Clean smoke result:
+
+```json
+{
+  "ok": true,
+  "endpoint": "ws://127.0.0.1:57889",
+  "cursor": 1,
+  "threadId": "019f0d24-8be8-7183-9df6-8f3216e8484d",
+  "observed": [
+    {
+      "method": "thread/status/changed",
+      "threadId": "019f0d24-8be8-7183-9df6-8f3216e8484d",
+      "status": "active"
+    }
+  ]
+}
+```
+
+Interpretation:
+
+- The PoC now proves supervisor -> adapter -> visible Codex remote -> active thread as one integrated path.
+- This is still not Codex Desktop direct injection. It is the strongest CLI-remote stepping stone so far and should be the base for deciding whether/how to bridge into Desktop.

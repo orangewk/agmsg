@@ -143,9 +143,14 @@ function waitForPort() {
     sleep(500);
     const methods = seen.map((msg) => msg.method).filter(Boolean);
     assert.deepStrictEqual(methods, ["initialize", "initialized", "thread/loaded/list", "thread/resume", "turn/start"]);
-    assert.strictEqual((await jsonRunAsync(["status"])).cursor, 1);
+    const status = await jsonRunAsync(["status"]);
+    assert.strictEqual(status.cursor, 1);
+    const events = fs.readFileSync(status.files.eventLog, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    const adapterOk = events.find((event) => event.event === "adapter-ok");
+    assert(adapterOk, "adapter-ok event was not recorded");
+    assert.match(adapterOk.stdout, /"ok":true/);
     await jsonRunAsync(["stop"]);
-    console.log(JSON.stringify({ ok: true, methods }, null, 2));
+    console.log(JSON.stringify({ ok: true, methods, adapterOk: true }, null, 2));
   } finally {
     if (!proc.killed) proc.kill();
     fakeServer.close();
