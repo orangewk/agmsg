@@ -6,14 +6,14 @@ const net = require("net");
 const path = require("path");
 
 function usage() {
-  console.log(`Usage: codex-idle-wake-adapter.js --project <path> --app-server ws://host:port [--thread <id|loaded|new>] [--request-timeout-ms <n>]
+  console.log(`Usage: codex-idle-wake-adapter.js --project <path> --app-server ws://host:port [--thread <id|loaded|new>] [--request-timeout-ms <n>] [--wait-after-start-ms <n>]
 
 PoC one-shot adapter. Reads AGMSG_SUPERVISOR_MESSAGE_JSON and starts a Codex turn.
 This is intentionally disposable and not wired into production delivery.`);
 }
 
 function parseArgs(argv) {
-  const opts = { thread: "loaded", requestTimeoutMs: 10000 };
+  const opts = { thread: "loaded", requestTimeoutMs: 10000, waitAfterStartMs: 0 };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") opts.help = true;
@@ -21,6 +21,7 @@ function parseArgs(argv) {
     else if (arg === "--app-server") opts.appServer = argv[++i];
     else if (arg === "--thread") opts.thread = argv[++i];
     else if (arg === "--request-timeout-ms") opts.requestTimeoutMs = Number(argv[++i]);
+    else if (arg === "--wait-after-start-ms") opts.waitAfterStartMs = Number(argv[++i]);
     else if (arg === "--skip-resume") opts.skipResume = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -39,6 +40,7 @@ class WsJsonRpcClient {
     this.requestTimeoutMs = opts.requestTimeoutMs || 0;
     this.nextId = 1;
     this.pending = new Map();
+    this.handlers = new Map();
     this.buffer = Buffer.alloc(0);
     this.handshakeBuffer = Buffer.alloc(0);
     this.handshakeComplete = false;
@@ -134,7 +136,11 @@ class WsJsonRpcClient {
   handleLine(line) {
     if (!line.trim()) return;
     const message = JSON.parse(line);
-    if (!Object.prototype.hasOwnProperty.call(message, "id")) return;
+    if (!Object.prototype.hasOwnProperty.call(message, "id")) {
+      const handlers = this.handlers.get(message.method) || [];
+      for (const handler of handlers) handler(message.params || {});
+      return;
+    }
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
@@ -162,6 +168,12 @@ class WsJsonRpcClient {
 
   notify(method, params = {}) {
     this.sendJson({ jsonrpc: "2.0", method, params });
+  }
+
+  on(method, handler) {
+    const handlers = this.handlers.get(method) || [];
+    handlers.push(handler);
+    this.handlers.set(method, handlers);
   }
 
   sendJson(value) {
@@ -208,6 +220,19 @@ function buildPrompt(message) {
   ].join("\n");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function observeEvent(observed, method, params) {
+  observed.push({
+    method,
+    threadId: params && params.threadId,
+    turnId: params && (params.turnId || params.turn_id),
+    status: params && params.status && params.status.type,
+  });
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) { usage(); return; }
@@ -217,6 +242,10 @@ async function main() {
   if (!message.to) throw new Error("AGMSG_SUPERVISOR_MESSAGE_JSON is missing to");
 
   const client = new WsJsonRpcClient(parseWsTarget(opts.appServer), { requestTimeoutMs: opts.requestTimeoutMs });
+  const observed = [];
+  for (const method of ["turn/started", "turn/completed", "turn/failed", "thread/status/changed"]) {
+    client.on(method, (params) => observeEvent(observed, method, params));
+  }
   await client.start();
   await client.request("initialize", {
     clientInfo: { name: "agmsg-supervisor-poc", title: "agmsg Supervisor PoC", version: "poc" },
@@ -258,8 +287,9 @@ async function main() {
     cwd: path.resolve(opts.project),
     runtimeWorkspaceRoots: [path.resolve(opts.project)],
   });
+  if (opts.waitAfterStartMs > 0) await sleep(opts.waitAfterStartMs);
   client.stop();
-  console.log(JSON.stringify({ ok: true, threadId }));
+  console.log(JSON.stringify({ ok: true, threadId, observed }));
 }
 
 main().catch((error) => {

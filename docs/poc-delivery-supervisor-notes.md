@@ -274,3 +274,35 @@ Cleanup:
 
 - owned app-server endpoint was closed after stop
 - visible PowerShell/Codex probe process tree was stopped
+
+## visible TTY remote wake observation update
+
+Added adapter-side notification observation:
+
+- `--wait-after-start-ms <n>` keeps the disposable adapter connected briefly after `turn/start`
+- observed JSON-RPC notifications are returned in the adapter output
+- current PoC records `turn/started`, `turn/completed`, `turn/failed`, and `thread/status/changed`
+
+Fake app-server verification now emits `turn/started` and `thread/status/changed`, and the adapter test asserts both are observed.
+
+Real visible TTY probe:
+
+- supervisor-owned app-server endpoint: `ws://127.0.0.1:59436`
+- launched visible `codex.exe --remote <endpoint> --cd C:\dev\MathDesk --no-alt-screen`
+- adapter args included `--thread loaded --skip-resume --wait-after-start-ms 10000`
+- adapter exited 0 with:
+
+```json
+{"ok":true,"threadId":"019f0d0c-e2ce-7542-ac4c-eeff35b94137","observed":[{"method":"thread/status/changed","threadId":"019f0d0c-e2ce-7542-ac4c-eeff35b94137","status":"active"}]}
+```
+
+Interpretation:
+
+- `turn/start` is not only accepted by the real Windows remote app-server path; the loaded remote thread changes to `active` after injection.
+- This is stronger than the previous request-accepted-only result.
+- The PoC still has not injected into Codex Desktop directly. The validated stepping stone is: supervisor-owned native app-server + visible TTY `codex --remote` + direct `turn/start` on the loaded thread.
+
+Cleanup:
+
+- app-server owner stopped pid `19792`
+- visible terminal process tree was requested to stop; a follow-up process scan found no leftover probe app-server/remote process

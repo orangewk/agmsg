@@ -132,6 +132,10 @@ function startServer() {
           else if (msg.method === "thread/resume") result = { thread: { id: msg.params.threadId, status: { type: "idle" } } };
           else if (msg.method === "turn/start") result = { turn: { id: "turn-fake-1" } };
           socket.write(encodeFrame({ jsonrpc: "2.0", id: msg.id, result }));
+          if (msg.method === "turn/start") {
+            socket.write(encodeFrame({ jsonrpc: "2.0", method: "turn/started", params: { threadId: msg.params.threadId, turnId: "turn-fake-1" } }));
+            socket.write(encodeFrame({ jsonrpc: "2.0", method: "thread/status/changed", params: { threadId: msg.params.threadId, status: { type: "active" } } }));
+          }
         }
       });
     });
@@ -145,7 +149,7 @@ function startServer() {
     ...process.env,
     AGMSG_SUPERVISOR_MESSAGE_JSON: JSON.stringify({ id: 7, team: "mathdesk-desktop", from: "Anna", to: "Eiji", body: "wake please" }),
   };
-  const result = await runAdapter([adapter, "--project", project, "--app-server", `ws://127.0.0.1:${port}`, "--thread", "loaded"], env);
+  const result = await runAdapter([adapter, "--project", project, "--app-server", `ws://127.0.0.1:${port}`, "--thread", "loaded", "--wait-after-start-ms", "50"], env);
   server.close();
   assert.strictEqual(result.status, 0, `adapter failed\nseen=${JSON.stringify(seen)}\nstdout=${result.stdout}\nstderr=${result.stderr}\nerror=${result.error && result.error.message}`);
   const methods = seen.map((msg) => msg.method).filter(Boolean);
@@ -154,7 +158,10 @@ function startServer() {
   assert.strictEqual(turnStart.params.threadId, "thread-fake-1");
   assert.match(turnStart.params.input[0].text, /wake please/);
   assert.match(turnStart.params.input[0].text, /From: Anna/);
-  console.log(JSON.stringify({ ok: true, methods }, null, 2));
+  const output = JSON.parse(result.stdout);
+  assert.deepStrictEqual(output.observed.map((event) => event.method), ["turn/started", "thread/status/changed"]);
+  assert.strictEqual(output.observed[0].threadId, "thread-fake-1");
+  console.log(JSON.stringify({ ok: true, methods, observed: output.observed }, null, 2));
 })().catch((error) => {
   if (server) server.close();
   console.error(error.stack || error.message);
