@@ -189,3 +189,36 @@ Interpretation:
 Cleanup:
 
 - Leftover PoC `codex.exe app-server` process was identified by command line and stopped.
+## codex-cli --remote smoke attempt
+
+Added a self-contained smoke script:
+
+- `tests/poc/smoke-codex-remote-wake.cjs`
+
+Goal:
+
+1. start supervisor-owned native `codex.exe app-server --listen ws://127.0.0.1:<port>`
+2. start `codex --remote <endpoint> --cd <project> --no-alt-screen`
+3. use the disposable adapter to inject `turn/start`
+4. observe whether an idle real Codex CLI remote session wakes
+
+Result:
+
+- app-server owner started and exposed `ws://127.0.0.1:57482`
+- remote CLI process failed immediately with:
+
+```text
+Error: stdin is not a terminal
+```
+
+- adapter then saw `connect ECONNREFUSED` because the remote/app-server side was no longer available
+
+Classification:
+
+- supervisor owner: started successfully
+- adapter: not the primary failure in this run
+- real remote session harness: blocked, because `codex --remote` requires a real TTY
+
+Interpretation:
+
+This confirms that the next real wake smoke needs an actual terminal/PTY-backed Codex CLI session, not a background `child_process.spawn` with piped/ignored stdio. On Windows this likely means either a visible terminal launched with `Start-Process` or a PTY-capable harness. The Desktop target is still a later step; this is the CLI-remote stepping stone.
