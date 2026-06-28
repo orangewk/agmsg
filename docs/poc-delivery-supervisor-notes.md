@@ -377,3 +377,81 @@ Implication for PR #3:
 
 - No further investment should go into `lastHeartbeat`, `heartbeat`, or `markStale` beyond their current disposable PoC role.
 - Any next implementation PR should start from held-connection liveness, using this PR only for the adapter and Windows remote feasibility evidence.
+
+## next-target-B closure probes
+
+Anna requested two remaining checks before declaring target 2 closed.
+
+### Check 1: Codex Desktop GUI direct route
+
+Status: FAIL / blocked by missing external Desktop app-server endpoint.
+
+Observed on the real Codex Desktop app (Windows):
+
+- Codex Desktop GUI process is running.
+- It owns a child process:
+  `resources\codex.exe app-server --analytics-default-enabled`.
+- That process does not expose a localhost WebSocket listener for external `turn/start` injection.
+- `Get-NetTCPConnection` for the Desktop app-server pid showed outbound HTTPS connections only, not a local `ws://127.0.0.1:<port>` listener.
+- `codex app-server proxy` attempts to connect to `C:\Users\orang\.codex\app-server-control\app-server-control.sock` and fails on Windows.
+- `codex remote-control start --json` and `codex app-server daemon version` both fail with:
+  `codex app-server daemon lifecycle is only supported on Unix platforms`.
+- Named pipe `\\.\pipe\codex-ipc` exists, but it is not a documented app-server JSON-RPC/WebSocket endpoint and was not used as a workaround.
+
+Conclusion:
+
+- The current PoC cannot honestly claim `supervisor -> adapter -> existing Codex Desktop GUI app-server -> turn/start`.
+- To test or build Desktop GUI direct injection, Codex Desktop needs one of:
+  - a supported WebSocket listener / remote-control endpoint on Windows,
+  - a documented Desktop IPC bridge for app-server JSON-RPC,
+  - or an explicit app-internal tool route accepted as a different integration surface.
+- Fake Desktop substitution is intentionally rejected.
+
+### Check 2: one step past active/render evidence
+
+Status: PASS for the CLI-remote stepping-stone path; strict `turn/completed` notification is not emitted to the adapter, but completion is confirmed through active->idle plus Codex Desktop thread record.
+
+Prompt override was added to the disposable adapter:
+
+- `--prompt-text <text>` bypasses the default `[$agmsg]` prompt wrapper for probe turns.
+- Reason: the default wrapper triggers the agmsg skill in remote Codex and can block on identity/sqlite setup, which is not the render/completion question.
+
+Smoke script was extended:
+
+- `-PromptText <text>`
+- `-RequireIdleAfterActive`
+- `-RequireCompleted` remains available as a strict notification check, but it is not satisfied in this environment.
+
+Clean completion probe:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\poc\smoke-supervisor-codex-remote-visible.ps1 `
+  -Project C:\dev\MathDesk `
+  -WaitAfterStartMs 30000 `
+  -PromptText 'Reply exactly POC_RENDER_OK. Do not run tools.' `
+  -RequireIdleAfterActive
+```
+
+Adapter evidence:
+
+```json
+{
+  "ok": true,
+  "threadId": "019f0d61-af7a-7c52-bce9-f584a2da32d7",
+  "observed": [
+    { "method": "thread/status/changed", "status": "active" },
+    { "method": "thread/status/changed", "status": "idle" }
+  ]
+}
+```
+
+Codex Desktop thread record evidence:
+
+- thread id: `019f0d61-af7a-7c52-bce9-f584a2da32d7`
+- turn status: `completed`
+- final answer: `POC_RENDER_OK`
+
+Conclusion:
+
+- The CLI-remote path renders/processes a turn and reaches completed state, even though the adapter observes status notifications rather than a `turn/completed` notification.
+- This closes the render/completion concern for the remote stepping stone, not for existing Desktop GUI direct injection.

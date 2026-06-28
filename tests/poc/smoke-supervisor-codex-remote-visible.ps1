@@ -1,6 +1,9 @@
 param(
   [string]$Project = (Get-Location).Path,
-  [int]$WaitAfterStartMs = 10000
+  [int]$WaitAfterStartMs = 10000,
+  [string]$PromptText = "",
+  [switch]$RequireCompleted,
+  [switch]$RequireIdleAfterActive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,7 +76,7 @@ try {
   $summary.remotePid = $remoteProcess.Id
   Start-Sleep -Seconds 8
 
-  $adapterCmd = @(
+  $adapterArgs = @(
     (Quote-CommandArg $Node),
     (Quote-CommandArg $Adapter),
     '--project', (Quote-CommandArg $Project),
@@ -82,7 +85,11 @@ try {
     '--skip-resume',
     '--request-timeout-ms', '30000',
     '--wait-after-start-ms', [string]$WaitAfterStartMs
-  ) -join ' '
+  )
+  if ($PromptText) {
+    $adapterArgs += @('--prompt-text', (Quote-CommandArg $PromptText))
+  }
+  $adapterCmd = $adapterArgs -join ' '
   $summary.adapterCmd = $adapterCmd
 
   $supervisorOut = Join-Path $RunDir 'supervisor.stdout.log'
@@ -111,8 +118,18 @@ try {
   $adapterOutput = $adapterOk.stdout | ConvertFrom-Json
   $active = @($adapterOutput.observed | Where-Object { $_.method -eq 'thread/status/changed' -and $_.status -eq 'active' })
   if ($active.Count -lt 1) { throw "no active status observed in adapter stdout: $($adapterOk.stdout)" }
+  if ($RequireCompleted) {
+    $completed = @($adapterOutput.observed | Where-Object { $_.method -eq 'turn/completed' })
+    if ($completed.Count -lt 1) { throw "no turn/completed observed in adapter stdout: $($adapterOk.stdout)" }
+  }
+  if ($RequireIdleAfterActive) {
+    $idle = @($adapterOutput.observed | Where-Object { $_.method -eq 'thread/status/changed' -and $_.status -eq 'idle' })
+    if ($idle.Count -lt 1) { throw "no idle status observed after active in adapter stdout: $($adapterOk.stdout)" }
+  }
   $summary.threadId = $adapterOutput.threadId
   $summary.observed = $adapterOutput.observed
+  $summary.requireCompleted = [bool]$RequireCompleted
+  $summary.requireIdleAfterActive = [bool]$RequireIdleAfterActive
   $summary.ok = $true
 } finally {
   try { Invoke-NodeJson $Supervisor 'stop' '--run-dir' $RunDir '--project' $Project | Out-Null } catch {}

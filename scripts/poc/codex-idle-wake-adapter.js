@@ -6,7 +6,7 @@ const net = require("net");
 const path = require("path");
 
 function usage() {
-  console.log(`Usage: codex-idle-wake-adapter.js --project <path> --app-server ws://host:port [--thread <id|loaded|new>] [--request-timeout-ms <n>] [--wait-after-start-ms <n>]
+  console.log(`Usage: codex-idle-wake-adapter.js --project <path> --app-server ws://host:port [--thread <id|loaded|new>] [--request-timeout-ms <n>] [--wait-after-start-ms <n>] [--prompt-text <text>]
 
 PoC one-shot adapter. Reads AGMSG_SUPERVISOR_MESSAGE_JSON and starts a Codex turn.
 This is intentionally disposable and not wired into production delivery.`);
@@ -22,6 +22,7 @@ function parseArgs(argv) {
     else if (arg === "--thread") opts.thread = argv[++i];
     else if (arg === "--request-timeout-ms") opts.requestTimeoutMs = Number(argv[++i]);
     else if (arg === "--wait-after-start-ms") opts.waitAfterStartMs = Number(argv[++i]);
+    else if (arg === "--prompt-text") opts.promptText = argv[++i];
     else if (arg === "--skip-resume") opts.skipResume = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -283,7 +284,7 @@ async function main() {
 
   await client.request("turn/start", {
     threadId,
-    input: [{ type: "text", text: buildPrompt(message), text_elements: [] }],
+    input: [{ type: "text", text: opts.promptText || buildPrompt(message), text_elements: [] }],
     cwd: path.resolve(opts.project),
     runtimeWorkspaceRoots: [path.resolve(opts.project)],
   });
