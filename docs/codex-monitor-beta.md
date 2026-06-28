@@ -223,6 +223,43 @@ fi
 # exit 2 (nothing pending) falls through and the worker ends cheaply.
 ```
 
+### Windows Codex Desktop: notify-only gate
+
+On Windows Codex Desktop, a useful first step can be even smaller than launching
+an agent on a hit: keep Codex in `turn` mode and use `watch-once.sh` only as a
+notification gate.
+
+This shape is for users who want a mailbox light, not autonomous handling:
+
+1. A Windows scheduler runs `watch-once.sh --timeout 0` for one `(team, agent)`.
+2. Exit `2` means no pending message; the task exits quietly.
+3. Exit `0` means unread inbound exists; the task writes a trigger file.
+4. A separate lightweight notifier watches the trigger file and shows the user-facing notification.
+5. The next normal Codex turn still reads the inbox and decides what to do.
+
+Keep this opt-in and default-off. Do not put the notification UI directly in the
+short-interval scheduled probe: a bad PowerShell/Scheduled Task launch can flash
+a window or steal focus. Keep the probe headless, let a user-session notifier own
+notifications, and document the stop path next to the enable path:
+
+```powershell
+# enable
+Enable-ScheduledTask -TaskName agmsg-watch-once-<agent>
+
+# disable
+Disable-ScheduledTask -TaskName agmsg-watch-once-<agent>
+
+# status
+Get-ScheduledTask -TaskName agmsg-watch-once-<agent>
+Get-ScheduledTaskInfo -TaskName agmsg-watch-once-<agent>
+
+# uninstall
+Unregister-ScheduledTask -TaskName agmsg-watch-once-<agent> -Confirm:$false
+```
+
+Do not mark messages read, auto-reply, or start a Codex turn from this gate. It
+is a notification backstop for `turn` mode, not a monitor replacement.
+
 ### Defense in depth
 
 For an unattended worker, layer these on top of the gate:
