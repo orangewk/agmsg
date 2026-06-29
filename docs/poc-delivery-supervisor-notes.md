@@ -455,3 +455,46 @@ Conclusion:
 
 - The CLI-remote path renders/processes a turn and reaches completed state, even though the adapter observes status notifications rather than a `turn/completed` notification.
 - This closes the render/completion concern for the remote stepping stone, not for existing Desktop GUI direct injection.
+
+## app-internal conditional wake dogfood
+
+Goal:
+
+- Do not wake the target Codex Desktop thread on empty polling runs.
+- Wake the target thread only when agmsg reports unread mail for that target identity.
+- Keep unread message content in agmsg until the target thread reads it with the official inbox script.
+
+Setup used in MathDesk dogfood:
+
+- collector runner thread: `019f0e3b-c3c1-7ab0-8781-166cdb12c7d4`
+- target thread: `JunoMaCoder中学受験` / `019f0794-1b19-7f80-81be-b823e3035b5e`
+- target identity: `JunoMaCoder`
+- team: `mathdesk-desktop`
+- unread oracle: `scripts/drivers/types/codex/watch-once.sh`
+- target wake route: Codex app-internal `send_message_to_thread`
+- state file: `C:\tmp\agmsg-junoma-conditional-waker-state.json`
+
+Observed flow:
+
+1. With no unread mail, `watch-once.sh` returned `status=timeout`; the target thread received no turn.
+2. Eiji sent one agmsg message to JunoMaCoder.
+3. The collector heartbeat observed `status=pending count=1 max_id=171` via `watch-once.sh`.
+4. The collector wrote `last_notified_max_id=171` and sent one wake prompt to the target thread.
+5. JunoMaCoder woke, ran the official inbox path, read the message, and replied to Eiji.
+6. Later collector runs saw no unread mail and did not send duplicate wake prompts.
+
+Result:
+
+- PASS for "unread-only target wake" in Codex Desktop, using an app-internal thread tool route.
+- PASS for preserving unread ownership: the watcher did not read message content or mark it read.
+- PASS for duplicate suppression in this smoke run.
+
+Boundary:
+
+- This is not direct Desktop GUI app-server injection.
+- This depends on a Codex app-internal `send_message_to_thread` route that is available to Codex agents in this environment, not a standalone shell-only process.
+- Empty polling runs still consume the collector thread, but they do not consume or wake the target work thread.
+
+Interpretation:
+
+This gives a practical companion design for Codex Desktop today: keep polling and no-op noise in a dedicated collector session, and wake the actual work session only when the official agmsg unread oracle reports pending mail. It should be described as a companion/waker path, not as monitor bridge completion.
