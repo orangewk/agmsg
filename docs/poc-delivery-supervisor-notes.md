@@ -498,3 +498,30 @@ Boundary:
 Interpretation:
 
 This gives a practical companion design for Codex Desktop today: keep polling and no-op noise in a dedicated collector session, and wake the actual work session only when the official agmsg unread oracle reports pending mail. It should be described as a companion/waker path, not as monitor bridge completion.
+
+## PoC verdict: stop standalone exploration
+
+Verdict:
+
+- Stop expanding this standalone PoC.
+- Move back to mainline design work with the findings below.
+- Keep this PR as a Draft PoC record unless/until the integration direction is explicitly accepted.
+
+What is now answered:
+
+- `watch-once.sh` is a usable unread oracle because it detects pending mail without reading message content or advancing the inbox cursor.
+- A collector/waker session can keep empty polling noise out of the target work thread.
+- A target Codex Desktop thread can be woken only when unread mail exists, using the app-internal `send_message_to_thread` route.
+- The same collector heartbeat can multiplex several explicit targets; MathDesk dogfood covered Eiji, JunoMaCoder, and Deneb.
+- Target threads can then read the official inbox themselves and reply over agmsg.
+
+What remains outside this PoC:
+
+- Direct external injection into an existing Codex Desktop GUI app-server endpoint.
+- A standalone shell-only process that wakes Codex Desktop without an app-internal thread route.
+- Registry/management UX for mapping identities to thread ids and state files.
+- Production lifecycle management on Windows.
+
+Recommendation:
+
+Treat the companion/waker route as the current practical Windows Codex Desktop direction, and treat direct monitor bridge work as blocked on a supported Desktop control surface. The next useful work should be mainline design/API shape, not more ad hoc dogfood expansion.
