@@ -525,3 +525,19 @@ What remains outside this PoC:
 Recommendation:
 
 Treat the companion/waker route as the current practical Windows Codex Desktop direction, and treat direct monitor bridge work as blocked on a supported Desktop control surface. The next useful work should be mainline design/API shape, not more ad hoc dogfood expansion.
+
+## Final review caveats to carry forward
+
+Anna final review verdict:
+
+- Closure verdict is accurate.
+- Draft/local-only landing is right for this PoC code.
+- The next useful work is mainline design/API shape, not more standalone dogfood expansion.
+
+Caveats that must be visible outside the long notes before this branch is abandoned:
+
+1. The real visible remote path observed `thread/status/changed` active -> idle through the adapter. A completed turn was confirmed out-of-band via the Codex Desktop thread record, not through a `turn/completed` adapter notification.
+2. The validated `codex --remote` path required the PoC-only `--skip-resume` option because `thread/resume` failed on loaded remote threads with `no rollout found`. The normal resume-first protocol sequence is not proven for that path.
+3. The multiplex conditional wake claim is based on MathDesk dogfood across Eiji, JunoMaCoder, and Deneb. Detailed step-by-step notes are strongest for JunoMaCoder, with Eiji/Deneb confirmed by state files and live thread wake/read/reply observations.
+4. The supervisor heartbeat core is feasibility-only. It should not become production liveness by accumulation; the later mainline design should use held-connection liveness.
+5. Desktop GUI direct injection was blocked in this environment: codex-cli `0.138.0` and the current Codex Desktop Windows app exposed no supported localhost WebSocket/Desktop control endpoint for external `turn/start`.
