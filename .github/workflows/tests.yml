@@ -16,8 +16,10 @@ name: tests
 # reported; on docs-only PRs it just reports green in seconds without running
 # the suite.
 #
-# What counts as "docs-only": the docs tree (`docs/**`), the marketing site
-# (`site/**` — a standalone Astro app with no bearing on the bash suite),
+# What counts as "docs-only" (= safe to skip the bash suite): the docs tree
+# (`docs/**`), the marketing site (`site/**` — a standalone Astro app with no
+# bearing on the bash suite), the desktop app (`app/**` — Rust/TS the bats
+# suite never reads; it gets its own `app typecheck` job below instead),
 # `llms.txt` / `llms-full.txt`, and the top-level prose docs (README,
 # CHANGELOG, etc). SKILL.md is deliberately EXCLUDED — the suite asserts on it
 # (tests/test_install.bats checks it has no unsubstituted placeholder), so a
@@ -40,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
+      app_changed: ${{ steps.detect.outputs.app_changed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,25 +57,29 @@ jobs:
           if [ "$EVENT" != "pull_request" ]; then
             echo "Event is '$EVENT' (not pull_request) — running the full suite."
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           echo "Changed files:"
           echo "$changed"
           docs_only=true
+          app_changed=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
               docs/*) ;;
               site/*) ;;
+              app/*) app_changed=true ;;
               llms.txt|llms-full.txt) ;;
               README.md|CHANGELOG.md|CONTRIBUTING.md|PRIVACY.md|ARCHITECTURE.md|RELEASING.md|LICENSE) ;;
               # NOTE: SKILL.md is intentionally not here — the suite tests it.
               *) docs_only=false ;;
             esac
           done <<< "$changed"
-          echo "Result: docs_only=$docs_only"
+          echo "Result: docs_only=$docs_only app_changed=$app_changed"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "app_changed=$app_changed" >> "$GITHUB_OUTPUT"
 
   bats:
     name: bats (${{ matrix.os }})
@@ -202,3 +209,65 @@ jobs:
           else
             bats --print-output-on-failure ${{ matrix.target }}
           fi
+
+  # The desktop app (app/**) is Rust + TypeScript — the bats suite never
+  # reads it, and the full Tauri build only runs on app-v* release tags via
+  # app-release.yml. Without this job an app-only PR would merge with zero
+  # compile verification (the bats legs skip via the app/* allowlist above).
+  # cargo check + tsc --noEmit is a few minutes, not the full-bundle cost.
+  # Same always-report pattern as bats: the job always completes, and only
+  # the heavy steps are gated, so it can be promoted to a required check
+  # without ever leaving a PR stuck pending. Pushes to main always run it.
+  # Fail-open mirrors bats too: steps skip only on an EXPLICIT
+  # app_changed=false — if the changes job breaks and its output is empty,
+  # the typecheck runs rather than green-washing a possibly-app diff.
+  app-check:
+    name: app typecheck
+    needs: changes
+    if: ${{ !cancelled() }}
+    # macOS: Tauri's crates (wry etc.) compile against system frameworks that
+    # are already on the runner — ubuntu would need the webkit2gtk/gtk dev
+    # stack installed first. Also matches the release build environment.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No app changes — skipping typecheck
+        if: needs.changes.outputs.app_changed == 'false'
+        run: echo "Diff does not touch app/ — reporting green without running the typecheck."
+
+      - uses: pnpm/action-setup@v4
+        if: needs.changes.outputs.app_changed != 'false'
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        if: needs.changes.outputs.app_changed != 'false'
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.app_changed != 'false'
+
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.app_changed != 'false'
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install frontend deps
+        if: needs.changes.outputs.app_changed != 'false'
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript typecheck
+        if: needs.changes.outputs.app_changed != 'false'
+        run: pnpm exec tsc --noEmit
+
+      - name: Rust check
+        if: needs.changes.outputs.app_changed != 'false'
+        run: cargo check --manifest-path src-tauri/Cargo.toml
