@@ -11,8 +11,11 @@ bridge, hook, or monitor tool.
 
 **macOS**
 ```sh
-brew tap fujibee/agmsg && brew install --cask agmsg
+brew tap fujibee/agmsg && brew trust fujibee/agmsg
+brew install --cask agmsg
 ```
+(`brew trust` is required on recent Homebrew versions, which refuse to load
+casks from untrusted third-party taps.)
 or download the `.dmg` directly from the [Releases page](https://github.com/fujibee/agmsg/releases) —
 look for the newest `app-vX.Y.Z` tag. The app is signed and notarized, so it opens
 normally with no Gatekeeper right-click workaround needed.
