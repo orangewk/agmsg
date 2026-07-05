@@ -65,6 +65,9 @@ Do NOT manually edit config files. Always use join.sh.
 # List team members
 ~/.agents/skills/agmsg/scripts/team.sh <team>
 
+# Show read-only delivery visibility status
+~/.agents/skills/agmsg/scripts/status.sh [team]
+
 # Leave a team
 ~/.agents/skills/agmsg/scripts/leave.sh <team> <agent_id>
 
