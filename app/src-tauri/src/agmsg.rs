@@ -27,7 +27,18 @@ fn home_dir_string() -> Option<String> {
 }
 
 /// Base dir of the agmsg install (skill layout: db/, teams/, scripts/, ...).
+///
+/// `AGMSG_APP_BASE`, when set to a non-empty path, overrides the derived
+/// location. This is the command layer's injection point — the test harness
+/// points it at a temp dir of fake `scripts/*.sh` (mirrors resolve_bash's
+/// `AGMSG_APP_BASH` override). In normal operation it is unset and the base is
+/// `<home>/.agents/skills/agmsg`.
 fn agmsg_base() -> PathBuf {
+    if let Ok(over) = std::env::var("AGMSG_APP_BASE") {
+        if !over.is_empty() {
+            return PathBuf::from(over);
+        }
+    }
     let home = home_dir_string().unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".agents/skills/agmsg")
 }
@@ -682,7 +693,9 @@ pub fn start_watcher(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_semver, to_bash_slashes};
+    use super::{agmsg_base, parse_semver, run_script, to_bash_slashes};
+    use serial_test::serial;
+    use std::io::Write;
 
     #[test]
     fn strips_verbatim_prefix_and_converts_to_posix() {
@@ -752,5 +765,108 @@ mod tests {
         assert!(parse_semver("1.1.10") > parse_semver("1.1.9"));
         assert!(parse_semver("1.1.4") < parse_semver("1.2.0"));
         assert!(parse_semver("1.1.4") < parse_semver("2.0.0"));
+    }
+
+    // --- command-layer harness (fake agmsg-core scripts) ---
+    //
+    // run_script() resolves <base>/scripts/<name>, runs it through bash, and maps
+    // stdout→Ok / stderr→Err. Pointing AGMSG_APP_BASE at a temp dir of fake
+    // scripts lets us exercise that whole path (the 0.1.1→0.1.3 regressions all
+    // lived here) without a real agmsg install. AGMSG_APP_BASE is process-global,
+    // so any test that reads it is #[serial]; add #[serial] to future ones too.
+    // The run_script cases are skipped on Windows: resolve_bash there is Git-Bash
+    // -specific and is covered by the windows-latest app-test CI job instead.
+
+    /// Restores an env var to its prior value (or unsets it) on drop, so a
+    /// panicking test can't leak an override into the next one — the manual
+    /// remove_var-at-end approach loses that on unwind.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            EnvGuard { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// A temp install base whose `scripts/` holds the given `(name, body)` fakes,
+    /// with AGMSG_APP_BASE pointed at it. Bind it for the test's duration; on drop
+    /// the temp dir is removed and AGMSG_APP_BASE is restored.
+    struct FakeBase {
+        _dir: tempfile::TempDir,
+        _env: EnvGuard,
+    }
+    fn fake_base(scripts: &[(&str, &str)]) -> FakeBase {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sdir = dir.path().join("scripts");
+        std::fs::create_dir_all(&sdir).unwrap();
+        for (name, body) in scripts {
+            let mut f = std::fs::File::create(sdir.join(name)).unwrap();
+            writeln!(f, "#!/usr/bin/env bash").unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+        }
+        let env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        FakeBase { _dir: dir, _env: env }
+    }
+
+    #[test]
+    #[serial]
+    fn agmsg_base_honors_the_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        assert_eq!(agmsg_base(), dir.path());
+    }
+
+    #[test]
+    #[serial]
+    fn agmsg_base_falls_back_when_override_is_empty() {
+        let _env = EnvGuard::set("AGMSG_APP_BASE", "");
+        assert!(agmsg_base().ends_with(".agents/skills/agmsg"));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn run_script_returns_stdout_on_success() {
+        let _base = fake_base(&[("ok.sh", "echo hello-from-fake")]);
+        let out = run_script("ok.sh", &[]).expect("should succeed");
+        assert_eq!(out.trim(), "hello-from-fake");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn run_script_returns_stderr_as_err_on_failure() {
+        let _base = fake_base(&[("boom.sh", "echo the-error >&2; exit 1")]);
+        let err = run_script("boom.sh", &[]).unwrap_err();
+        assert!(err.contains("the-error"), "stderr not surfaced: {err:?}");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn run_script_passes_arguments_through_in_order() {
+        let _base = fake_base(&[("args.sh", "printf '%s\\n' \"$@\"")]);
+        let out = run_script("args.sh", &["a", "b c", "d"]).unwrap();
+        assert_eq!(out.lines().collect::<Vec<_>>(), ["a", "b c", "d"]);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn run_script_errors_when_the_script_is_missing() {
+        let _base = fake_base(&[]);
+        assert!(run_script("nope.sh", &[]).is_err());
     }
 }
