@@ -388,6 +388,29 @@ EOF
             "$RUN_DIR/codex-app-server.$project_hash.version" \
             "$RUN_DIR/codex-app-server.$project_hash.log"
     fi
+
+    # Stop this app-server's idle-TTL reaper loop too (WP2, idle-ttl.sh /
+    # codex-monitor.sh's IDLE_TTL_PID_FILE): with the app-server already gone,
+    # the loop's own next poll would exit on its own (its `kill -0
+    # "$server_pid"` check fails, see idle-ttl.sh's idle_ttl_run_loop), but
+    # `set off` is an explicit immediate-teardown request — do not leave a
+    # reaper loop sleeping up to $IDLE_TTL_POLL_SECONDS before it notices.
+    # Confirm-before-kill via cmdline, same discipline as the app-server kill
+    # just above (msys-space plain `&` launch — see codex-monitor.sh's PID
+    # STABILITY NOTE — so kill -0/compat_get_cmdline, not the native-space
+    # helpers the codex-bridge reaper needs).
+    local ttl_pidfile ttl_pid ttl_cmd
+    ttl_pidfile="$RUN_DIR/codex-app-server.$project_hash.idle-ttl.pid"
+    if [ -f "$ttl_pidfile" ]; then
+      ttl_pid="$(cat "$ttl_pidfile" 2>/dev/null || true)"
+      if [ -n "$ttl_pid" ] && kill -0 "$ttl_pid" 2>/dev/null; then
+        ttl_cmd="$(compat_get_cmdline "$ttl_pid" 2>/dev/null || true)"
+        case "$ttl_cmd" in
+          *idle_ttl_run_loop*) kill "$ttl_pid" 2>/dev/null || true ;;
+        esac
+      fi
+      rm -f "$ttl_pidfile" "$RUN_DIR/codex-app-server.$project_hash.idle-ttl.log"
+    fi
   fi
 
   echo "$killed"

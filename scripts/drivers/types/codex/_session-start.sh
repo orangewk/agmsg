@@ -102,7 +102,16 @@ agmsg_session_start() {
   pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
   if [ -f "$pidfile" ]; then
     bridge_pid=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
+    # bridge_pid is a Windows-native pid: codex-bridge.js's writeMeta() writes
+    # its own process.pid directly (no nohup subshell involved from the
+    # bridge's own perspective — see manifest.sh's PID SPACE DECISION). A
+    # plain `kill -0` here checks MSYS pid space and always reports "dead" for
+    # a native pid, so this reuse check silently never fired and every
+    # SessionStart relaunched a fresh bridge even when a live one was already
+    # attached (orangewk/agmsg#8 WP1 finding; fixed here in WP2). Use the
+    # native-space liveness helper instead, same as stop_codex_bridge
+    # (delivery.sh) and gc.sh's own codex-bridge pidfile reaper.
+    if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid" 2>/dev/null; then
       exit 0
     fi
   fi

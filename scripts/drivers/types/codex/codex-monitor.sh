@@ -16,6 +16,10 @@ source "$SCRIPT_DIR/../../../lib/hash.sh"
 source "$SCRIPT_DIR/../../../lib/compat.sh"
 # shellcheck source=../../../lib/manifest.sh
 source "$SCRIPT_DIR/../../../lib/manifest.sh"
+# idle-ttl.sh is NOT sourced here: this script never calls idle_ttl_run_loop
+# itself (only launches it as a separate `bash -c "source ...; idle_ttl_run_loop
+# ..."` process below, see the "Ensure an idle-TTL reaper loop" block), so
+# sourcing it into THIS process's own function table would be dead weight.
 
 PROJECT="$(pwd)"
 SOCKET_PATH=""
@@ -105,6 +109,15 @@ PORT_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.port"
 # stale server left running across a codex upgrade must not be reused.
 VERSION_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.version"
 CODEX_VERSION="$("$REAL_CODEX" --version 2>/dev/null || true)"
+# Idle-TTL reaper loop pid for THIS app-server (see idle-ttl.sh). One loop per
+# shared app-server, not per bridge/session — keyed on the same PROJECT_HASH
+# as the server it watches.
+IDLE_TTL_PID_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.idle-ttl.pid"
+IDLE_TTL_LOG="$RUN_DIR/codex-app-server.$PROJECT_HASH.idle-ttl.log"
+# Default 15 minutes, matching the WP2 brief's default. Both are overridable
+# per-invocation for tests / operators who want a different budget.
+IDLE_TTL_SECONDS="${AGMSG_CODEX_APPSERVER_IDLE_TTL_SECONDS:-900}"
+IDLE_TTL_POLL_SECONDS="${AGMSG_CODEX_APPSERVER_IDLE_POLL_SECONDS:-30}"
 
 mkdir -p "$RUN_DIR"
 
@@ -192,6 +205,48 @@ if [ -z "$PORT" ]; then
   # Stamp the version that owns this server so a later launch from a different
   # codex build recreates it instead of reusing a stale one.
   printf '%s' "$CODEX_VERSION" > "$VERSION_FILE"
+fi
+
+# Ensure an idle-TTL reaper loop is watching THIS app-server (see idle-ttl.sh
+# for the held-connection design). Covers both the fresh-launch path above
+# (no loop exists yet) and the reuse path (a prior codex-monitor.sh's loop may
+# already be running, or may have exited abnormally and left a stale pidfile —
+# start one only when no confirmed-alive loop for the CURRENT $SERVER_PID
+# already exists, so two concurrent codex-monitor.sh launches for the same
+# project never race into two competing reapers).
+#
+# PID STABILITY NOTE: launched as `bash -c "<script>" &` (NOT `nohup ... &`,
+# and NOT a bare `( ... ) &` subshell). Confirmed empirically (WP2 repro):
+#   - a bare `( ... ) &` subshell whose last command is a simple external
+#     command gets exec-optimized away — bash's $! then names the LAST
+#     command run inside the loop (a `sleep` invocation), a pid that changes
+#     every poll interval, not the stable loop process.
+#   - `bash -c "<script>"` containing a `while :; do ... done` loop does NOT
+#     get exec-optimized (a shell builtin loop is not a single simple
+#     command), so $! is bash's own pid for the entire loop lifetime, AND
+#     /proc/<pid>/cmdline for that pid is the full script text — which is what
+#     lets the reaper_alive check below positively identify "this pid IS our
+#     idle-ttl loop for THIS project" instead of trusting a bare pid alone.
+existing_reaper_pid="$(cat "$IDLE_TTL_PID_FILE" 2>/dev/null || true)"
+reaper_alive=0
+if [ -n "$existing_reaper_pid" ] && kill -0 "$existing_reaper_pid" 2>/dev/null; then
+  reaper_cmd="$(compat_get_cmdline "$existing_reaper_pid" 2>/dev/null || true)"
+  case "$reaper_cmd" in
+    *"idle_ttl_run_loop $PORT "*) reaper_alive=1 ;;
+  esac
+fi
+if [ "$reaper_alive" != 1 ]; then
+  rm -f "$IDLE_TTL_PID_FILE"
+  server_bg_for_ttl="$(cat "$SERVER_PID" 2>/dev/null || true)"
+  if [ -n "$server_bg_for_ttl" ]; then
+    idle_ttl_script="source $(printf '%q' "$SCRIPT_DIR/../../../lib/manifest.sh"); \
+source $(printf '%q' "$SCRIPT_DIR/../../../lib/idle-ttl.sh"); \
+idle_ttl_run_loop $(printf '%q' "$PORT") $(printf '%q' "$server_bg_for_ttl") \
+$(printf '%q' "$SERVER_PID") $(printf '%q' "$IDLE_TTL_SECONDS") $(printf '%q' "$IDLE_TTL_POLL_SECONDS")"
+    SKILL_DIR="$SKILL_DIR" bash -c "$idle_ttl_script" >>"$IDLE_TTL_LOG" 2>&1 &
+    idle_ttl_bg="$!"
+    echo "$idle_ttl_bg" > "$IDLE_TTL_PID_FILE"
+  fi
 fi
 
 if ! port_alive "$PORT"; then
