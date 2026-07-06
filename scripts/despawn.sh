@@ -29,6 +29,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # actas-lock.sh requires SKILL_DIR
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/manifest.sh"
 
 die() { echo "despawn: $*" >&2; exit 1; }
 
@@ -75,6 +77,7 @@ if [ "$FORCE" = "1" ]; then
   fi
   owner="$(actas_lock_owner "$TEAM" "$NAME")"
   [ -n "$owner" ] && actas_lock_release "$TEAM" "$NAME" "$owner" 2>/dev/null || true
+  manifest_record_dispose state-file "$(manifest_state_file_id "$SPAWN_REC")" "despawn.sh --force"
   rm -f "$SPAWN_REC" 2>/dev/null || true
   echo "status=forced name=$NAME team=$TEAM"
   exit 0
@@ -85,6 +88,7 @@ state="$(actas_lock_state "$TEAM" "$NAME" "" 2>/dev/null || echo free)"
 case "$state" in
   free)
     echo "despawn: '$NAME' holds no live actas lock — nothing to confirm a teardown against (a codex member has no watcher; a tmux member may already be gone). If a window remains, use --force." >&2
+    manifest_record_dispose state-file "$(manifest_state_file_id "$SPAWN_REC")" "despawn.sh (no-live-lock)"
     rm -f "$SPAWN_REC" 2>/dev/null || true
     echo "status=ok name=$NAME team=$TEAM note=no-live-lock"
     exit 0
@@ -106,5 +110,6 @@ while true; do
   waited=$((waited + 1))
 done
 
+manifest_record_dispose state-file "$(manifest_state_file_id "$SPAWN_REC")" "despawn.sh (graceful)"
 rm -f "$SPAWN_REC" 2>/dev/null || true
 echo "status=ok name=$NAME team=$TEAM after=${waited}s"

@@ -57,6 +57,24 @@ _compat_cim_cmdline() {
     | tr -d '\r' | tr '\\' '/'
 }
 
+# Get the full command line of a process ALREADY KNOWN to be a native Windows
+# pid (not an MSYS pid) — e.g. Node's own `process.pid` when Node was launched
+# directly as a Windows binary from a bash script (`nohup node ... &` backgrounds
+# a bash SUBSHELL, so `$!` in that case is a *different*, MSYS-space pid; the
+# child's own reported process.pid is the only reliable native identifier —
+# see manifest.sh's pidSpace field and orangewk/agmsg#8 for the full story).
+# CIM's ProcessId filter is native-space already, so this is a thin, no-Windows-
+# specific-branch wrapper: _compat_cim_cmdline's "winpid" param IS a native pid,
+# despite the name it inherited from its original MSYS-pid-translation caller.
+# No-op (empty output) on non-Windows platforms.
+compat_get_native_cmdline() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  _agmsg_detect_platform
+  [ "$_agmsg_platform" = "msys" ] || return 1
+  _compat_cim_cmdline "$pid"
+}
+
 # Get full command line of a process.  Replaces: ps -o args= -p <pid>
 compat_get_cmdline() {
   local pid="$1"

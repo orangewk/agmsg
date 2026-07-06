@@ -44,6 +44,10 @@ source "$SCRIPT_DIR/lib/hash.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/manifest.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/gc.sh"
 
 # Identity sanity check — no point launching a watcher with an empty pair set.
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
@@ -169,6 +173,14 @@ done
 # above, since the liveness check enumerates the remaining cc-instance.*
 # files. See #62.
 actas_lock_gc_stale >/dev/null 2>&1 || true
+
+# Garbage-collect codex bridge / codex app-server artifacts (pidfiles whose
+# process is confirmed dead, or manifest-recorded processes with no live
+# owner) left behind when a session ends without running `delivery.sh set
+# off codex` — hard kill, PC restart, or simply forgetting. See #8. Never
+# kills a live, cmdline-confirmed bridge or app-server; only reaps what's
+# already dead or provably orphaned.
+agmsg_gc_run_all 2>/dev/null || true
 
 # --- Record this session's real project root, keyed by the agent process. ---
 # Slash commands resolve the project from $(pwd), which breaks when the user
