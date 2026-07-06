@@ -1,5 +1,7 @@
 # agmsg
 
+*[日本語](README.ja.md)*
+
 [![CI](https://img.shields.io/github/actions/workflow/status/fujibee/agmsg/tests.yml?branch=main&label=CI&logo=github)](https://github.com/fujibee/agmsg/actions/workflows/tests.yml)
 [![release](https://img.shields.io/github/v/release/fujibee/agmsg?label=release)](https://github.com/fujibee/agmsg/releases/latest)
 [![license](https://img.shields.io/github/license/fujibee/agmsg)](LICENSE)
@@ -195,7 +197,19 @@ By default `spawn` **blocks until the new agent is actually listening** — its 
 
 Options: `--boot-prompt <text>` (initial task; see above), `--project <path>` (default: current project), `--team <team>` (auto-resolved when the project has a single team), and `--terminal <tmpl>` / `$AGMSG_TERMINAL` / config `spawn.terminal` to override the terminal command on the non-tmux path (a `{cmd}` placeholder is replaced with the path to the generated boot script). On macOS the default opens whichever terminal you're currently in (iTerm or Terminal, via `$TERM_PROGRAM`) using `open -a` — a plain app launch, so it does **not** trigger the Automation/AppleScript permission prompts that scripting the terminal directly would.
 
-Only `claude-code` and `codex` are supported today. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
+To always pass a given agent type extra CLI flags on spawn (e.g. a default permission mode or sandbox policy), set them in a YAML **spawn options** file — one section per type, a flat `--flag: value` map underneath. Path: `$AGMSG_SPAWN_OPTIONS_FILE`, else `~/.agmsg/config/spawn_options.yaml`; a missing file or section is a no-op.
+
+```yaml
+claude-code:
+  --permission-mode: acceptEdits
+  --dangerously-skip-permissions: true   # a `true` value emits the flag with no argument
+
+codex:
+  --sandbox: workspace-write
+  --dangerously-skip-permissions: false  # a `false` value suppresses the flag entirely
+```
+
+Eight of the nine agent types are spawnable — `claude-code`, `codex`, `grok-build`, `cursor`, `gemini`, `antigravity`, `copilot`, `opencode`. `hermes` is not: its CLI has no mode that starts an interactive session pre-seeded with an initial prompt (#279). macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
 
 ### Tear down a spawned agent (`despawn`)
 
@@ -275,9 +289,9 @@ $agmsg                          — or /skills → agmsg
 
 Codex supports `mode monitor` as a **beta** app-server bridge, plus `mode turn` and `mode off`.
 
-> ⚠️ **The monitor beta changes how Codex starts — opt in only if you understand it.** Codex has no Monitor tool, so `mode monitor` installs a shim at `~/.agents/bin/codex` and asks you to put `~/.agents/bin` **first on your PATH**, so `codex` then resolves to the shim instead of the real binary. In monitor-mode projects the shim routes interactive launches through a bridge that turns incoming agmsg messages into turns on the current Codex thread; `codex exec` and non-monitor projects pass straight through to the real Codex. It depends on experimental Codex app-server behavior and has known rough edges (orphans on TUI close — #149; one identity per project — #150).
+> ⚠️ **The monitor beta changes how Codex starts — opt in only if you understand it.** Codex has no Monitor tool, so `mode monitor` prints a shell function that makes `codex` route through agmsg's monitor shim in your interactive shell. In monitor-mode projects the shim routes interactive launches through a bridge that turns incoming agmsg messages into turns on the current Codex thread; `codex exec` and non-monitor projects pass straight through to the real Codex. It depends on experimental Codex app-server behavior and has known rough edges (orphans on TUI close — #149; one identity per project — #150).
 
-If the shim can't be installed, launch with `~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup, PATH notes, and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
+If you prefer a global PATH shim, run `~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-shim-install.sh install` and put `~/.agents/bin` before the real Codex binary on PATH. You can also launch with `~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh`. Codex sandboxing must allow writes to the skill's `db/`, `teams/`, and `run/` dirs — `install.sh` configures those `writable_roots` when `~/.codex/config.toml` exists. Setup notes and internals: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md).
 
 ### GitHub Copilot CLI
 
@@ -368,11 +382,16 @@ DB and team configs are preserved. Only scripts and assets are updated.
 
 ## Uninstall
 
+An `uninstall.sh` copy ships inside every install, so this works whether you
+installed via `git clone`, `npx agmsg`, or the curl one-liner:
+
 ```bash
-./uninstall.sh              # Interactive (confirms each step)
-./uninstall.sh --yes        # Remove everything
-./uninstall.sh --keep-data  # Remove skill but keep DB and teams
+~/.agents/skills/agmsg/uninstall.sh              # Interactive (confirms each step)
+~/.agents/skills/agmsg/uninstall.sh --yes        # Remove everything
+~/.agents/skills/agmsg/uninstall.sh --keep-data  # Remove skill but keep DB and teams
 ```
+
+(If you have a `git clone` checkout handy, `./uninstall.sh` from the repo root works the same way.)
 
 Auto-detects installed skill directories and cleans up: skill files, slash commands, hooks, AGENTS.md sections, and team configs.
 
@@ -516,6 +535,16 @@ and its trust state with `agmsg plugin list`.
 Full discovery order, the trust model, and authoring guidance:
 [docs/plugins.md](docs/plugins.md) (design rationale in
 [ADR 0002](docs/adr/0002-driver-discovery-and-plugin-opt-in.md)).
+
+## Building on agmsg
+
+Writing something *outside* agmsg's own scripts that reads or drives agmsg —
+a GUI app, a bot, a derivative project (`agmsg-shogi`, `agmsg-go`,
+`agmsg-mcp`, …)? Read data via `scripts/api.sh` (JSON out, no need to touch
+`messages.db` or `teams/*/config.json` directly — those are internal and free
+to change), and write through the existing scripts (`send.sh`, `join.sh`,
+…) rather than the database. Full guidance:
+[docs/building-on-agmsg.md](docs/building-on-agmsg.md).
 
 ## Community
 

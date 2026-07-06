@@ -58,6 +58,22 @@ function die(message) {
   process.exit(1);
 }
 
+// Convert a native Windows path into the MSYS/Git-Bash POSIX form that agmsg
+// registration data is keyed by (Git Bash stores e.g. `/c/Users/me/proj`).
+// A drive-letter path `C:\...`/`C:/...` becomes `/c/...` and its backslashes
+// become forward slashes; a UNC path `\\host\share` becomes `//host/share`.
+// Only inputs carrying a Windows drive-letter or UNC prefix are rewritten, so
+// an already-POSIX path is returned byte-for-byte unchanged - including a POSIX
+// path that legitimately contains a backslash in a filename, which must not be
+// mangled on macOS/Linux.
+function toPosixPath(p) {
+  if (typeof p !== "string" || p.length === 0) return p;
+  if (/^\\\\/.test(p)) return p.replace(/\\/g, "/"); // UNC: \\host\share -> //host/share
+  const match = /^([A-Za-z]):[\\/]/.exec(p);
+  if (!match) return p; // already POSIX (no drive letter): leave exactly as-is
+  return `/${match[1].toLowerCase()}${p.slice(2).replace(/\\/g, "/")}`;
+}
+
 function parseArgs(argv) {
   const opts = {
     type: "codex",
@@ -156,7 +172,7 @@ function runScript(script, args) {
 }
 
 function resolveIdentity(opts) {
-  const result = runScript("identities.sh", [opts.project, opts.type]);
+  const result = runScript("identities.sh", [toPosixPath(opts.project), opts.type]);
   if (result.status !== 0) {
     die(`identity resolution failed: ${(result.stderr || result.stdout).trim()}`);
   }
@@ -805,7 +821,10 @@ class CodexBridge {
     const command = [
       BASH_BIN,
       path.join(SCRIPT_DIR, "watch-once.sh"),
-      this.opts.project,
+      // watch-once.sh resolves the subscription set through the same exact
+      // project-key lookup as identities.sh, so it needs the POSIX form of the
+      // project path. The spawn cwd below stays native for the app-server.
+      toPosixPath(this.opts.project),
       this.opts.type,
       "--team",
       this.identity.team,
@@ -1209,4 +1228,8 @@ async function main() {
   await bridge.run();
 }
 
-main().catch((error) => die(error.message));
+if (require.main === module) {
+  main().catch((error) => die(error.message));
+}
+
+module.exports = { toPosixPath };

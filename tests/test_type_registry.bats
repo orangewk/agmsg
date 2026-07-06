@@ -29,11 +29,11 @@ write_node_launcher_fixtures() {
   printf '// stub node launcher fixture\n' > "$nd/nodetype-launcher.mjs"
 }
 
-@test "type-registry: known_types lists the nine built-ins" {
+@test "type-registry: known_types lists the ten built-ins" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode" ]
+  [ "$output" = "agmsg-app,antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode" ]
 }
 
 @test "type-registry: is_known_type accepts a built-in and rejects a bogus type" {
@@ -64,7 +64,10 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
-@test "type-registry: spawnable set is exactly claude-code, codex, grok-build and hermes" {
+@test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
+  # hermes deliberately stays out (#279): no known CLI mode starts it
+  # interactive with a seeded initial prompt. agmsg-app also stays out: it's
+  # the desktop app itself (spawnable=no), not a spawnable agent type.
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'
      while IFS= read -r t; do
@@ -72,7 +75,7 @@ write_node_launcher_fixtures() {
        [ \"\$(agmsg_type_get \"\$t\" spawnable)\" = yes ] && echo \"\$t\"
      done <<< \"\$(agmsg_known_types | sort -u)\" | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "claude-code,codex,grok-build,hermes" ]
+  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,opencode" ]
 }
 
 @test "type-registry: detection manifests carry the expected env / proc keys" {
@@ -205,4 +208,43 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
   ! echo "$output" | grep -q "is not supported by spawn yet"
   ! echo "$output" | grep -q "unknown agent type"
+}
+
+@test "spawn: the node-launcher path also splices spawn-options tokens (before --initial-input) (#273)" {
+  write_node_launcher_fixtures
+  local proj="$BATS_TEST_TMPDIR/nodeproj"
+  mkdir -p "$proj"
+  bash "$SCRIPTS/join.sh" nodeteam existing claude-code "$proj"
+
+  local stub_bin="$BATS_TEST_TMPDIR/stub-bin"
+  mkdir -p "$stub_bin"
+  local capture="$BATS_TEST_TMPDIR/launch-capture.txt"
+  cat > "$stub_bin/record.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$capture"
+EOF
+  chmod +x "$stub_bin/record.sh"
+
+  local opts="$BATS_TEST_TMPDIR/spawn_options.yaml"
+  cat > "$opts" <<'YAML'
+nodetype:
+  --extra-flag: extra-value
+YAML
+
+  run env -u TMUX AGMSG_TERMINAL="$stub_bin/record.sh {cmd}" \
+    AGMSG_SPAWN_OPTIONS_FILE="$opts" \
+    bash "$SCRIPTS/spawn.sh" nodetype nodeagent --project "$proj" --no-wait
+  [ "$status" -eq 0 ]
+  local boot; boot="$(cat "$capture")"
+  [ -f "$boot" ]
+  run cat "$boot"
+  [[ "$output" == *"nodetype-launcher.mjs"* ]]
+  [[ "$output" == *"--extra-flag"* ]]
+  [[ "$output" == *"extra-value"* ]]
+  # spawn-options tokens land before --initial-input, matching the direct-CLI
+  # path's "before the actas prompt" placement.
+  local before_flag after_flag before_input
+  before_flag=$(grep -n -- "--extra-flag" "$boot" | head -1 | cut -d: -f1)
+  before_input=$(grep -n -- "--initial-input" "$boot" | head -1 | cut -d: -f1)
+  [ "$before_flag" -lt "$before_input" ]
 }

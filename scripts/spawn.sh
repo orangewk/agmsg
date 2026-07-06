@@ -50,6 +50,13 @@ set -euo pipefail
 #                      ids); the flag spelling comes from the type's manifest
 #                      `model_arg=`. Refused for a type with no model_arg.
 #
+# Spawn options: extra CLI args to always pass a given type's launched
+# binary (e.g. a default permission mode or sandbox policy), configured
+# per-type in a YAML file rather than hardcoded — see
+# scripts/lib/spawn-options.sh. File: $AGMSG_SPAWN_OPTIONS_FILE, else
+# ~/.agmsg/config/spawn_options.yaml. Optional; a missing file/section is a
+# no-op.
+#
 # Readiness: by default spawn blocks until the new agent's watcher attaches and
 # is receiving (it prints `status=ready ...`), so a leader can safely send work
 # right after spawn returns without racing the agent's cold start. Codex has no
@@ -70,6 +77,10 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/spawn-options.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/resolve-project.sh"
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
@@ -164,19 +175,28 @@ if [ ! -d "$PROJECT" ]; then
   die "project path does not exist: $PROJECT"
 fi
 PROJECT="$(cd "$PROJECT" && pwd)"
+PROJECT="$(agmsg_normalize_project_path "$PROJECT")"
 
 # --- Resolve the launch method from the manifest ---
 # A non-empty `spawn=` launcher means this type runs via a Node launcher (e.g. an
 # external add-on); otherwise it is a direct-CLI launch. The `cli=` binary is
 # REQUIRED for direct-CLI types and OPTIONAL for node launchers (which resolve
 # their own runtime). No per-type case — all data-driven from the manifest.
+#
+# `cli=` is trusted manifest data (agmsg ships it, not runtime user input), so
+# it may be a single binary name OR a fixed command-line prefix of several
+# space-separated tokens — a subcommand and/or fixed flags a CLI needs before
+# its own options (e.g. `opencode run --interactive`, whose message is not a
+# top-level argument). Only the first word names the actual executable to
+# resolve/check; the rest are passed through as-is in the boot script below.
 SPAWN_LAUNCHER="$(agmsg_type_get "$AGENT_TYPE" spawn)"
 CLI_BIN="$(agmsg_type_get "$AGENT_TYPE" cli)"
+CLI_BIN_EXE="${CLI_BIN%% *}"
 CLI_PATH=""
 if [ -n "$CLI_BIN" ]; then
-  command -v "$CLI_BIN" >/dev/null 2>&1 \
-    || die "'$CLI_BIN' not found on PATH — install the ${AGENT_TYPE} CLI first"
-  CLI_PATH="$(command -v "$CLI_BIN")"
+  command -v "$CLI_BIN_EXE" >/dev/null 2>&1 \
+    || die "'$CLI_BIN_EXE' not found on PATH — install the ${AGENT_TYPE} CLI first"
+  CLI_PATH="$(command -v "$CLI_BIN_EXE")"
 elif [ -z "$SPAWN_LAUNCHER" ]; then
   die "agent type '$AGENT_TYPE' manifest declares neither a 'cli' binary nor a 'spawn' launcher"
 fi
@@ -190,6 +210,41 @@ MODEL_ARG="$(agmsg_type_get "$AGENT_TYPE" model_arg)"
 if [ -n "$MODEL_ID" ] && [ -z "$MODEL_ARG" ]; then
   die "agent type '$AGENT_TYPE' does not support --model (no model_arg in its manifest)"
 fi
+
+# Some CLIs don't accept the actas prompt as a bare positional argument — they
+# require it as the value of a named flag instead (e.g. antigravity's
+# `--prompt-interactive <text>`, copilot's `-i/--interactive <text>`; their
+# `-p/--prompt` equivalents are a DIFFERENT one-shot, non-interactive mode and
+# would not work here). `prompt_arg=` in the manifest names that flag; unset
+# (the default) keeps today's bare-positional behavior.
+PROMPT_ARG="$(agmsg_type_get "$AGENT_TYPE" prompt_arg)"
+
+# Session-identity env vars to strip from a spawned same-type child (issue #294).
+# A terminal launcher (tmux new-window/split-window, a new OS terminal) copies
+# the parent shell's exported environment verbatim. When the spawner is itself a
+# session of the SAME CLI type (e.g. a claude-code session running
+# `agmsg spawn claude-code <name>`), the child inherits the parent's
+# session-identity vars (claude-code's CLAUDE_CODE_SESSION_ID) and mistakes the
+# parent's session for its own — every turn then fails with an Authentication
+# error despite valid credentials. Unset them in the generated boot script so the
+# child starts with a clean identity.
+#
+# This reads a dedicated `spawn_unset_env=` manifest key, NOT `detect=`. `detect=`
+# names the vars whoami uses to recognize a live session of a type, but those are
+# not always session-identity vars: gemini's `detect=GEMINI_API_KEY ...` is a
+# CREDENTIAL, and unsetting it would break the spawned child's auth — the opposite
+# of the fix. `spawn_unset_env=` lists only vars that are safe (and necessary) to
+# drop on spawn; unset (the default) strips nothing.
+SPAWN_UNSET_VARS="$(agmsg_type_get "$AGENT_TYPE" spawn_unset_env)"
+
+# Extra CLI args for this type from the spawn options file (opt-in, see
+# scripts/lib/spawn-options.sh). Read line-by-line — never word-split — so a
+# value containing spaces stays a single token.
+SPAWN_OPT_TOKENS=()
+while IFS= read -r _spawn_opt_tok; do
+  SPAWN_OPT_TOKENS+=("$_spawn_opt_tok")
+done < <(agmsg_spawn_options_tokens "$AGENT_TYPE")
+
 # Resolve the node launcher path from the manifest (not hardcoded), if any.
 SPAWN_AGENT=""
 if [ -n "$SPAWN_LAUNCHER" ]; then
@@ -206,13 +261,13 @@ fi
 # registered for this project (any type). Zero or many → require --team.
 resolve_team() {
   [ -d "$TEAMS_DIR" ] || return 0
-  local config_file team_name cfg_sql proj_sql count_for_project
+  local config_file team_name cfg_sql project_sql_in count_for_project
   local found=""
   # Read each config via readfile() and compare with SQL string literals rather
   # than `.param set` bindings: the sqlite3 shell's dot-command tokenizer does
   # NOT honour SQL '' escaping, so a value containing a single quote (a project
   # path like /tmp/pro'j) breaks `.param set`. SQL string literals do honour ''.
-  proj_sql=$(printf '%s' "$PROJECT" | sed "s/'/''/g")
+  project_sql_in=$(agmsg_project_sql_in_list "$PROJECT")
   for config_file in "$TEAMS_DIR"/*/config.json; do
     [ -f "$config_file" ] || continue
     cfg_sql=$(printf '%s' "$config_file" | sed "s/'/''/g")
@@ -231,7 +286,7 @@ resolve_team() {
       )
       SELECT COUNT(*)
       FROM agents, json_each(agents.registrations) AS r
-      WHERE json_extract(r.value, '\$.project') = '$proj_sql';
+      WHERE json_extract(r.value, '\$.project') IN ($project_sql_in);
     ")
     if [ "${count_for_project:-0}" -gt 0 ]; then
       found="${found:+$found
@@ -292,7 +347,15 @@ AGMSG_RESOLVE_PROJECT=0 "$SCRIPT_DIR/join.sh" "$TEAM" "$NAME" "$AGENT_TYPE" "$PR
 # to hand a one-shot goal to a codex peer, which has no Monitor and so never
 # notices a message sent after it goes idle (see docs/codex-monitor-beta.md).
 CMD_NAME="$(basename "$SKILL_DIR")"
-ACTAS_PROMPT="/${CMD_NAME} actas ${NAME}"
+# The skill-invocation prefix differs by CLI: Claude Code dispatches a "/" slash
+# command, while agentskills-based CLIs (codex, gemini, antigravity) invoke a
+# skill with "$" — a `codex '/agmsg actas ...'` boot prompt is not a reliable
+# skill invocation (#283). type.conf's cmd_prefix= names it per type; unset
+# defaults to "/" (Claude Code, the historical hardcoded value) so any type not
+# explicitly configured keeps today's behavior.
+CMD_PREFIX="$(agmsg_type_get "$AGENT_TYPE" cmd_prefix)"
+[ -n "$CMD_PREFIX" ] || CMD_PREFIX="/"
+ACTAS_PROMPT="${CMD_PREFIX}${CMD_NAME} actas ${NAME}"
 if [ -n "$PROMPT" ]; then
   ACTAS_PROMPT="${ACTAS_PROMPT}
 ${PROMPT}"
@@ -302,28 +365,52 @@ BOOT_DIR="${TMPDIR:-/tmp}/agmsg-spawn"
 mkdir -p "$BOOT_DIR" 2>/dev/null || true
 # Best-effort GC of boot scripts left behind by spawns whose window was closed
 # before the script could remove itself (see the trailing rm below).
-find "$BOOT_DIR" -name 'boot-*.command' -type f -mtime +1 -delete 2>/dev/null || true
+# GC matches both the bare and the .command-suffixed form (see the rename below).
+find "$BOOT_DIR" -name 'boot-*' -type f -mtime +1 -delete 2>/dev/null || true
 BOOT="$(mktemp "$BOOT_DIR/boot-XXXXXX")"
-mv "$BOOT" "$BOOT.command"   # .command so macOS `open` runs it in Terminal
-BOOT="$BOOT.command"
+# macOS `open -a Terminal` (launch_macos_terminal) only runs a file as a shell
+# script if it ends in .command, so rename there. Every other launcher invokes
+# the script through bash (Linux/Windows Terminal) or runs it via its shebang
+# (tmux) — and on Windows the .command extension makes Explorer/psmux open it in
+# Notepad instead of executing it (#282), so keep the bare executable path.
+case "$(uname -s)" in
+  Darwin) mv "$BOOT" "$BOOT.command"; BOOT="$BOOT.command" ;;
+esac
 {
   echo '#!/usr/bin/env bash'
   printf 'cd %q || exit 1\n' "$PROJECT"
+  # Drop inherited same-type session-identity vars before exec'ing the CLI (#294).
+  if [ -n "$SPAWN_UNSET_VARS" ]; then
+    printf 'unset %s\n' "$SPAWN_UNSET_VARS"
+  fi
   if [ -n "$SPAWN_AGENT" ]; then
     # Node-launcher path: pass the universal agmsg context + the actas prompt.
     # Type-specific config is the launcher's own default/env, so core stays
-    # generic and names no add-on.
+    # generic and names no add-on. Spawn-options tokens (if any) land before
+    # --initial-input, same relative position as the direct-CLI path below.
     printf '%q %q \\\n' "$NODE_BIN" "$SPAWN_AGENT"
     printf '  --name %q \\\n' "$NAME"
     printf '  --team %q \\\n' "$TEAM"
     printf '  --project %q \\\n' "$PROJECT"
+    for _tok in ${SPAWN_OPT_TOKENS[@]+"${SPAWN_OPT_TOKENS[@]}"}; do
+      printf '  %q \\\n' "$_tok"
+    done
     printf '  --initial-input %q\n' "$ACTAS_PROMPT"
   else
-    # Direct-CLI launch: `<cli> [<model_arg> <model_id>] "/<cmd> actas <name>"`.
-    # model_arg is the manifest flag spelling (not %q-quoted — a bare flag like
-    # --model or -m); the model id is quoted.
-    printf '%q' "$CLI_BIN"
+    # Direct-CLI launch:
+    # `<cli> [<model_arg> <model_id>] [spawn-options...] [<prompt_arg>] "/<cmd> actas <name>"`.
+    # cli is emitted unquoted — it is trusted fixed-prefix manifest data (see
+    # above) that may itself be several tokens (e.g. `opencode run --interactive`).
+    # model_arg/prompt_arg are the manifest flag spellings (not %q-quoted — bare
+    # flags like --model or -i); the model id, every spawn-options token, and the
+    # actas prompt are quoted. prompt_arg (when set) lands immediately before the
+    # prompt so there is no ambiguity about which token is its value.
+    printf '%s' "$CLI_BIN"
     [ -n "$MODEL_ID" ] && printf ' %s %q' "$MODEL_ARG" "$MODEL_ID"
+    for _tok in ${SPAWN_OPT_TOKENS[@]+"${SPAWN_OPT_TOKENS[@]}"}; do
+      printf ' %q' "$_tok"
+    done
+    [ -n "$PROMPT_ARG" ] && printf ' %s' "$PROMPT_ARG"
     printf ' %q\n' "$ACTAS_PROMPT"
   fi
   echo 'rm -f "$0" 2>/dev/null'   # self-clean once the agent exits

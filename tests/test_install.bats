@@ -45,6 +45,21 @@ teardown() {
   [ "$status" -eq 0 ]
 }
 
+@test "install: ships an executable uninstall.sh so npx/curl installs have one to run later" {
+  # setup.sh's temp checkout is deleted right after install, so a copy inside
+  # the skill dir is the only uninstaller npx/curl-installed users ever have.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  [ -x "$SK/uninstall.sh" ]
+  diff "$REPO_ROOT/uninstall.sh" "$SK/uninstall.sh"
+}
+
+@test "install: --update refreshes uninstall.sh even if it went missing" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  rm -f "$SK/uninstall.sh"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  [ -x "$SK/uninstall.sh" ]
+}
+
 @test "install: --update --cmd updates the named skill even when a backup skill exists" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   local backup="$FAKE_HOME/.agents/skills/agmsg.backup-keep"
@@ -59,6 +74,27 @@ teardown() {
   [ ! -f "$FAKE_HOME/.agents/agmsg.ps1" ]
   [ ! -f "$FAKE_HOME/.agents/agmsg.backup-keep.ps1" ]
   grep -q "backup sentinel" "$backup/SKILL.md"
+}
+
+@test "install: Claude Code command file gates actas/drop's fresh Monitor on delivery mode (#280)" {
+  # actas/drop used to invoke a fresh Monitor unconditionally, ignoring
+  # mode=off/turn (#280) — this is prompt-instruction text, not executable
+  # code, so a content assertion is the regression coverage available: both
+  # sections must carry the same delivery-mode gate the normal entry flow
+  # already has (line ~90 in the template). The Claude Code command file is
+  # only installed when ~/.claude exists (install.sh), separate from the
+  # shared codex-typed $SK/SKILL.md.
+  mkdir -p "$FAKE_HOME/.claude"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local cmd_file="$FAKE_HOME/.claude/commands/agmsg.md"
+  [ -f "$cmd_file" ]
+  local actas_block drop_block
+  actas_block="$(sed -n '/If argument starts with "actas"/,/If argument starts with "drop"/p' "$cmd_file")"
+  drop_block="$(sed -n '/If argument starts with "drop"/,/If argument starts with "spawn"/p' "$cmd_file")"
+  [[ "$actas_block" == *"delivery mode is"*"monitor"*"both"* ]]
+  [[ "$actas_block" == *"delivery.sh status"* ]]
+  [[ "$drop_block" == *"delivery mode is"*"monitor"*"both"* ]]
+  [[ "$drop_block" == *"delivery.sh status"* ]]
 }
 
 @test "install: --update warns to re-register delivery hooks (#133)" {
@@ -479,6 +515,16 @@ PY
   grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
   grep -q "^name: agmsg" "$hermes_skill"
   grep -q "~/.agents/skills/agmsg/scripts" "$hermes_skill"
+}
+
+@test "install: Hermes skill no longer advertises 'spawn hermes' as a valid example (#279)" {
+  mkdir -p "$FAKE_HOME/.hermes"
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
+  [ -f "$hermes_skill" ]
+  ! grep -q "spawn hermes reviewer" "$hermes_skill"
+  ! grep -q 'must be `claude-code`, `codex`, or `hermes`' "$hermes_skill"
+  grep -q "hermes.*is not spawnable\|hermes.*not spawnable" "$hermes_skill"
 }
 
 @test "install: custom command name is substituted in Hermes skill" {
