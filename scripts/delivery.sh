@@ -51,6 +51,10 @@ RUN_DIR="$SKILL_DIR/run"
 # primitives use it, so source storage first.
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/storage.sh"
+# manifest.sh provides manifest_record_dispose etc. — stop_codex_bridge
+# records disposal of the bridge/app-server processes it tears down (#8).
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/manifest.sh"
 # JSON/SQLite hook-file primitives (sourced after SKILL_NAME is set above —
 # strip/add reference it to detect agmsg-owned entries).
 # shellcheck disable=SC1091
@@ -335,8 +339,17 @@ stop_codex_bridge() {
       pidfile="$RUN_DIR/codex-bridge.$team.$name.pid"
       [ -f "$pidfile" ] || continue
       bpid=$(cat "$pidfile" 2>/dev/null || true)
-      if [ -n "$bpid" ] && kill -0 "$bpid" 2>/dev/null; then
+      # bpid is a Windows-native pid (codex-bridge.js's writeMeta() writes its
+      # own process.pid; the launcher's `nohup node ... &` means bash's $!
+      # would be the nohup subshell, not this pid — see manifest.sh's PID
+      # SPACE DECISION). Native liveness check, not kill -0.
+      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid" 2>/dev/null; then
         kill "$bpid" 2>/dev/null && killed=$((killed + 1))
+      fi
+      if [ -n "$bpid" ]; then
+        manifest_record_dispose process \
+          "$(manifest_process_id "$bpid" "" "" native)" \
+          "delivery.sh set off codex"
       fi
       # .appserver records which app-server URL the bridge was bound to (the
       # launcher's stale-binding guard); drop it with the rest so it cannot
@@ -364,6 +377,11 @@ EOF
         case "$server_cmd" in
           *codex*app-server*) kill "$server_pid" 2>/dev/null || true ;;
         esac
+      fi
+      if [ -n "$server_pid" ]; then
+        manifest_record_dispose process \
+          "$(manifest_process_id "$server_pid" "" "" msys)" \
+          "delivery.sh set off codex"
       fi
       rm -f "$RUN_DIR/codex-app-server.$project_hash.pid" \
             "$RUN_DIR/codex-app-server.$project_hash.port" \

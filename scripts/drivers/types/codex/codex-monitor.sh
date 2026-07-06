@@ -14,6 +14,8 @@ RUN_DIR="$SKILL_DIR/run"
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 # shellcheck source=../../../lib/compat.sh
 source "$SCRIPT_DIR/../../../lib/compat.sh"
+# shellcheck source=../../../lib/manifest.sh
+source "$SCRIPT_DIR/../../../lib/manifest.sh"
 
 PROJECT="$(pwd)"
 SOCKET_PATH=""
@@ -162,6 +164,14 @@ if [ -z "$PORT" ]; then
   "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 &
   server_bg="$!"
   echo "$server_bg" > "$SERVER_PID"
+  # server_bg is a plain (non-nohup) `&` background of a native codex.exe, so
+  # bash's $! IS the MSYS pid that maps 1:1 to that native process (confirmed
+  # empirically — this differs from the nohup-wrapped codex-bridge.js launch,
+  # where $! is a subshell pid instead; see manifest.sh's PID SPACE DECISION).
+  manifest_record_create process \
+    "$(manifest_process_id "$server_bg" "codex app-server --listen ws://127.0.0.1:0" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" msys)" \
+    "$$" \
+    "delivery.sh set off codex (stop_codex_bridge) kills by confirmed cmdline; gc reaps if dead"
   for _ in $(seq 1 100); do
     PORT="$(sed -n 's#.*listening on: ws://127\.0\.0\.1:\([0-9][0-9]*\).*#\1#p' "$SERVER_LOG" | head -1)"
     [ -n "$PORT" ] && break

@@ -12,6 +12,9 @@ const SCRIPT_DIR = __dirname;                              // .../scripts/driver
 const SKILL_DIR = path.resolve(SCRIPT_DIR, "..", "..", "..", "..");    // skill root
 const SCRIPTS_DIR = path.join(SKILL_DIR, "scripts");       // type-independent engine scripts (identities/inbox/send)
 const RUN_DIR = path.join(SKILL_DIR, "run");
+// Lifecycle ledger (orangewk/agmsg#8) — see lib/manifest.js for the pidSpace
+// rationale (this process's own process.pid is Windows-native space).
+const manifest = require(path.join(SCRIPTS_DIR, "lib", "manifest.js"));
 
 // Git Bash on Windows cannot exec a .sh path directly — spawnSync of the script
 // fails with EFTYPE. Invoke the helper scripts through bash on every platform.
@@ -729,6 +732,12 @@ class CodexBridge {
         `type=${this.opts.type}`,
       ].join("\n") + "\n",
     );
+    manifest.recordProcessCreate(RUN_DIR, {
+      pid: process.pid,
+      cmdline: process.argv.join(" "),
+      createdBy: `${this.identity.team}/${this.identity.name}`,
+      disposeHint: "delivery.sh set off codex (stop_codex_bridge) kills by confirmed cmdline; gc reaps if dead",
+    });
   }
 
   installSignals() {
@@ -1104,6 +1113,10 @@ class CodexBridge {
         // Best-effort cleanup.
       }
     }
+    manifest.recordProcessDispose(RUN_DIR, {
+      pid: process.pid,
+      disposedBy: "codex-bridge self-shutdown",
+    });
   }
 
   ensureSingleInstance() {
@@ -1114,6 +1127,10 @@ class CodexBridge {
       die(`bridge already running for ${this.identity.team}/${this.identity.name} (pid ${existing})`);
     } catch (error) {
       if (error && error.code === "ESRCH") {
+        manifest.recordProcessDispose(RUN_DIR, {
+          pid: existing,
+          disposedBy: "codex-bridge stale-pidfile takeover",
+        });
         for (const file of [this.pidfile, this.metafile]) {
           try {
             if (fs.existsSync(file)) fs.unlinkSync(file);

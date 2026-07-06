@@ -81,6 +81,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/spawn-options.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/manifest.sh"
 
 die() { echo "spawn: $*" >&2; exit 1; }
 
@@ -449,8 +451,20 @@ launch_in_tmux() {
   # Record placement so `despawn --force` can tear this member down even if its
   # watcher later can't respond to ctrl:despawn. tmux ids are self-describing:
   # %N = pane (kill-pane), @N = window (kill-window). See #109.
+  local _spawn_rec; _spawn_rec="$(agmsg_spawn_path "$TEAM" "$NAME")"
   printf '%s\t%s\t%s\n' "$target_id" "$PROJECT" "$AGENT_TYPE" \
-    > "$(agmsg_spawn_path "$TEAM" "$NAME")" 2>/dev/null || true
+    > "$_spawn_rec" 2>/dev/null || true
+  # Lifecycle ledger (#8): despawn.sh (both the graceful and --force path) and
+  # session-end's actas-lock release are the disposal side — see
+  # manifest_record_dispose calls added there. Best-effort; a missed record
+  # just means gc.sh's future scheduled-task/automation sweep (not yet
+  # implemented) won't see this placement as its own — it does not affect
+  # despawn's existing tmux-id-based teardown, which reads $_spawn_rec
+  # directly and does not consult the manifest.
+  manifest_record_create state-file \
+    "$(manifest_state_file_id "$_spawn_rec")" \
+    "$TEAM/$NAME" \
+    "despawn.sh (graceful ctrl:despawn, or --force) removes this record"
 }
 
 launch_macos_terminal() {
