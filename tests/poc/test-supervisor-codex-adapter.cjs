@@ -15,6 +15,11 @@ const adapter = path.join(repo, "scripts", "poc", "codex-idle-wake-adapter.js");
 const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "agmsg-supervisor-codex-adapter-"));
 const project = path.join(runDir, "project");
 fs.mkdirSync(project, { recursive: true });
+// Isolate the manifest.jsonl ledger (delivery-supervisor.js writes it via
+// AGMSG_SKILL_DIR, see that script's skillRunDir()) into this same scratch
+// dir — otherwise every run of this test appends real create/dispose lines
+// into the repo's own (untracked, non-gitignored) run/manifest.jsonl.
+const skillEnv = { ...process.env, AGMSG_SKILL_DIR: runDir };
 
 function sleep(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
@@ -91,7 +96,7 @@ function startFakeServer() {
 
 function runCli(args) {
   return new Promise((resolve) => {
-    const child = childProcess.spawn(process.execPath, [supervisor, ...args, "--run-dir", runDir, "--project", project], { cwd: repo });
+    const child = childProcess.spawn(process.execPath, [supervisor, ...args, "--run-dir", runDir, "--project", project], { cwd: repo, env: skillEnv });
     const stdout = [];
     const stderr = [];
     const timer = setTimeout(() => {
@@ -113,7 +118,7 @@ async function jsonRunAsync(args) {
   return JSON.parse(result.stdout);
 }
 function run(args) {
-  return childProcess.spawnSync(process.execPath, [supervisor, ...args, "--run-dir", runDir, "--project", project], { cwd: repo, encoding: "utf8" });
+  return childProcess.spawnSync(process.execPath, [supervisor, ...args, "--run-dir", runDir, "--project", project], { cwd: repo, encoding: "utf8", env: skillEnv });
 }
 
 function jsonRun(args) {
@@ -135,7 +140,7 @@ function waitForPort() {
 (async () => {
   const fakePort = await startFakeServer();
   const adapterCmd = `${JSON.stringify(process.execPath)} ${JSON.stringify(adapter)} --project ${JSON.stringify(project)} --app-server ws://127.0.0.1:${fakePort} --thread loaded`;
-  const proc = childProcess.spawn(process.execPath, [supervisor, "start", "--run-dir", runDir, "--project", project, "--heartbeat-timeout-ms", "1000", "--poll-ms", "100", "--adapter-cmd", adapterCmd], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+  const proc = childProcess.spawn(process.execPath, [supervisor, "start", "--run-dir", runDir, "--project", project, "--heartbeat-timeout-ms", "1000", "--poll-ms", "100", "--adapter-cmd", adapterCmd], { cwd: repo, stdio: ["ignore", "pipe", "pipe"], env: skillEnv });
   try {
     waitForPort();
     await jsonRunAsync(["attach", "--team", "mathdesk-desktop", "--name", "Eiji", "--session", "s1"]);

@@ -416,6 +416,136 @@ EOF
   echo "$killed"
 }
 
+# Stop the companion-waker PoC's delivery roles for a project
+# (scripts/poc/{delivery-supervisor,codex-app-server-owner}.js, #8 WP3a) and
+# remove their run artifacts. These are NOT part of the mainline codex bridge
+# (stop_codex_bridge above) — the PoC supervisor/owner are a separate,
+# standalone experiment (see docs/poc-delivery-supervisor-notes.md's "stop
+# expanding this standalone PoC" verdict) that never wires into identities.sh
+# pairs or the shared app-server this project's codex-bridge.js instances use.
+# Called alongside stop_codex_bridge from the codex type's on_disable plug so
+# `delivery.sh set off codex` tears down BOTH lifecycles a user would
+# otherwise have to remember separately (issue #8's whole point: don't make
+# teardown something you have to remember). Confirm-before-kill discipline
+# mirrors stop_codex_bridge exactly. Echoes how many waker processes were
+# killed.
+#
+# PID SPACE NOTE: both the supervisor's own pid (its lock file's JSON `pid`
+# field) and the app-server-owner's child pid (its pidfile) are Windows-NATIVE
+# pids — Node reporting `process.pid` / `child.pid` directly, the same shape
+# codex-bridge.js's writeMeta() uses (see manifest.sh's PID SPACE DECISION).
+# Native-space liveness/cmdline helpers only, never kill -0/compat_get_cmdline.
+stop_poc_waker() {
+  local project="$1"
+  local killed=0
+
+  # Kill a Windows-NATIVE pid. Plain `kill "$pid"` (bash's builtin) only
+  # operates in MSYS's own pid space and FAILS ("No such process") against a
+  # native pid — confirmed by direct repro while building this WP3a test
+  # suite: a real nohup-launched node child's native pid survived a plain
+  # `kill "$pid"` call from this same bash untouched, even though
+  # _agmsg_pid_alive/compat_get_native_cmdline (both native-space-aware)
+  # correctly confirmed it alive just beforehand. taskkill.exe (with /T to
+  # also take the fake-codex.ps1 PowerShell wrapper's own app-server child, /F
+  # to force) is the native-space kill primitive this repo already uses for
+  # exactly this case — see codex-app-server-owner.js's own stop(). Unix has
+  # no such split (msys vs native pid spaces are a Windows-only concept), so
+  # plain `kill` is correct there.
+  _stop_poc_waker_kill_native() {
+    local pid="$1"
+    case "${MSYSTEM:-}" in
+      MINGW*|MSYS*|CLANGARM*)
+        # MSYS_NO_PATHCONV=1: without it, MSYS bash's automatic POSIX->Windows
+        # path mangling rewrites the leading-slash argument "/PID" into a
+        # bogus path (observed: "C:/Program Files/Git/PID"), and taskkill.exe
+        # fails with "invalid argument" — confirmed by direct repro while
+        # building this WP3a test suite. Same fix instance-id.sh's own
+        # _agmsg_pid_alive already applies to its `tasklist /FI "PID eq ..."`
+        # call, for the identical reason.
+        MSYS_NO_PATHCONV=1 taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
+        ;;
+      *)
+        kill "$pid" 2>/dev/null
+        ;;
+    esac
+  }
+
+  # delivery-supervisor.js: one lock file per project, keyed by delivery-
+  # supervisor.js's OWN FNV hash of the project path (not agmsg_sha1 — a
+  # different hash function than the mainline codex-app-server uses, so this
+  # can't derive the key the way stop_codex_bridge derives $project_hash). Walk
+  # every lock file instead and match on the `project` field its JSON body
+  # carries (Supervisor.start(): `{pid, port, project}`), which is robust to
+  # the JS-side hash function changing without a bash-side re-implementation
+  # to keep in sync.
+  local sup_dir="$SKILL_DIR/run/poc-delivery-supervisor"
+  if [ -d "$sup_dir" ]; then
+    local f pid cmd lock_project prefix
+    for f in "$sup_dir"/supervisor.*.lock; do
+      [ -f "$f" ] || continue
+      lock_project="$(sed -n 's/.*"project"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)"
+      # Un-escape the JSON string value before comparing: delivery-supervisor.js
+      # writes the lock file via JSON.stringify (Supervisor.start():
+      # `JSON.stringify({pid, port, project})`), which escapes each backslash
+      # in a Windows path as \\ — so a raw sed extraction of the "project"
+      # field is the DOUBLY-escaped form (e.g. `C:\\Users\\...`), which never
+      # string-equals the plain $project this function received as $1.
+      # Confirmed by direct repro while building this WP3a test suite: this
+      # comparison silently failed closed (never matched, never killed) for
+      # every real Windows project path until this unescape was added.
+      lock_project="$(printf '%s' "$lock_project" | sed 's/\\\\/\\/g')"
+      [ "$lock_project" = "$project" ] || continue
+      pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+      prefix="${f%.lock}"
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid" 2>/dev/null; then
+        cmd="$(compat_get_native_cmdline "$pid" 2>/dev/null || true)"
+        case "$cmd" in
+          *delivery-supervisor*)
+            _stop_poc_waker_kill_native "$pid" && killed=$((killed + 1))
+            ;;
+        esac
+      fi
+      if [ -n "$pid" ]; then
+        manifest_record_dispose process \
+          "$(manifest_process_id "$pid" "" "" native)" \
+          "delivery.sh set off codex (stop_poc_waker)"
+      fi
+      manifest_record_dispose state-file "$(manifest_state_file_id "$prefix.port")" \
+        "delivery.sh set off codex (stop_poc_waker)"
+      rm -f "$f" "$prefix.port" "$prefix.mailbox.jsonl" "$prefix.state.json" "$prefix.events.log" "$prefix.adapter.log"
+    done
+  fi
+
+  # codex-app-server-owner.js: single pidfile under its own --run-dir (no
+  # per-project keying in the PoC script itself — one owner-managed app-server
+  # record per run-dir). Same confirm-before-kill discipline as the mainline
+  # app-server teardown above, but native-space (see PID SPACE NOTE).
+  local owner_dir="$SKILL_DIR/run/poc-codex-app-server"
+  if [ -d "$owner_dir" ] && [ -f "$owner_dir/codex-app-server.pid" ]; then
+    local owner_pidfile="$owner_dir/codex-app-server.pid"
+    local owner_pid owner_cmd
+    owner_pid="$(cat "$owner_pidfile" 2>/dev/null || true)"
+    if [ -n "$owner_pid" ] && _agmsg_pid_alive "$owner_pid" 2>/dev/null; then
+      owner_cmd="$(compat_get_native_cmdline "$owner_pid" 2>/dev/null || true)"
+      case "$owner_cmd" in
+        *codex*app-server*)
+          _stop_poc_waker_kill_native "$owner_pid" && killed=$((killed + 1))
+          ;;
+      esac
+    fi
+    if [ -n "$owner_pid" ]; then
+      manifest_record_dispose process \
+        "$(manifest_process_id "$owner_pid" "" "" native)" \
+        "delivery.sh set off codex (stop_poc_waker)"
+    fi
+    manifest_record_dispose state-file "$(manifest_state_file_id "$owner_pidfile")" \
+      "delivery.sh set off codex (stop_poc_waker)"
+    rm -f "$owner_pidfile" "$owner_dir/codex-app-server.port" "$owner_dir/codex-app-server.endpoint"
+  fi
+
+  echo "$killed"
+}
+
 do_set() {
   local MODE="${1:?Usage: delivery.sh set <mode> <type> <project_path>}"
   local TYPE="${2:?Missing type}"

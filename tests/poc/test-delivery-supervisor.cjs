@@ -13,11 +13,17 @@ const script = path.join(repo, "scripts", "poc", "delivery-supervisor.js");
 const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "agmsg-supervisor-poc-"));
 const project = path.join(runDir, "project");
 fs.mkdirSync(project, { recursive: true });
+// Isolate the manifest.jsonl ledger (delivery-supervisor.js writes it via
+// AGMSG_SKILL_DIR, see that script's skillRunDir()) into this same scratch
+// dir — otherwise every run of this test appends real create/dispose lines
+// into the repo's own (untracked, non-gitignored) run/manifest.jsonl.
+const skillEnv = { ...process.env, AGMSG_SKILL_DIR: runDir };
 
 function run(args, opts = {}) {
   return childProcess.spawnSync(process.execPath, [script, ...args, "--run-dir", runDir, "--project", project], {
     cwd: repo,
     encoding: "utf8",
+    env: skillEnv,
     ...opts,
   });
 }
@@ -26,6 +32,7 @@ function start() {
   const proc = childProcess.spawn(process.execPath, [script, "start", "--run-dir", runDir, "--project", project, "--heartbeat-timeout-ms", "700", "--poll-ms", "100"], {
     cwd: repo,
     stdio: ["ignore", "pipe", "pipe"],
+    env: skillEnv,
   });
   return proc;
 }

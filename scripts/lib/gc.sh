@@ -171,6 +171,99 @@ agmsg_gc_codex_idle_ttl_pidfiles() {
   echo "$reaped"
 }
 
+# Reap a dead companion-waker PoC codex-app-server-owner.js record
+# (scripts/poc/codex-app-server-owner.js): pid/port/endpoint/log written under
+# its own --run-dir (default run/poc-codex-app-server, NOT this repo's
+# manifest-tracked $SKILL_DIR/run — see that script's header comment on why
+# the ledger write target and the --run-dir it writes its OWN files under are
+# deliberately different paths).
+#
+# PID SPACE NOTE: the pidfile holds the app-server CHILD's pid as Node's own
+# `child_process.spawn(...).pid` reports it — a Windows-NATIVE pid, the same
+# reporting shape codex-bridge.js's writeMeta() uses (see manifest.sh's PID
+# SPACE DECISION). Liveness/cmdline MUST use the native-space helpers
+# (_agmsg_pid_alive, compat_get_native_cmdline) — a plain `kill -0` on this pid
+# reliably reports "dead" for a live process, which would delete a live
+# owner-managed app-server's record out from under it.
+#
+# Same confirm-before-touch discipline as the mainline bridge/app-server
+# reapers above: only ever removes an ALREADY-dead (or recycled-pid) record.
+# Never kills a live, confirmed process — this is reap-on-startup hygiene, not
+# `delivery.sh set off`'s teardown job.
+#
+# Usage: agmsg_gc_poc_waker_app_server_owner_pidfiles [run_dir]
+#   run_dir defaults to $SKILL_DIR/run/poc-codex-app-server (the PoC script's
+#   own default --run-dir when invoked with no override).
+# Echoes the number of record sets reaped.
+agmsg_gc_poc_waker_app_server_owner_pidfiles() {
+  local dir="${1:-$SKILL_DIR/run/poc-codex-app-server}"
+  [ -d "$dir" ] || { echo 0; return 0; }
+  local f="$dir/codex-app-server.pid"
+  [ -f "$f" ] || { echo 0; return 0; }
+  local pid cmd
+  pid="$(cat "$f" 2>/dev/null || true)"
+  local base="${f%.pid}"
+  if [ -z "$pid" ]; then
+    rm -f "$f" "$base.port" "$base.endpoint"
+    echo 1
+    return 0
+  fi
+  if _agmsg_pid_alive "$pid" 2>/dev/null; then
+    cmd="$(compat_get_native_cmdline "$pid" 2>/dev/null || true)"
+    case "$cmd" in
+      *codex*app-server*) echo 0; return 0 ;;  # alive and confirmed ours — leave it
+      *) ;;
+    esac
+  fi
+  rm -f "$f" "$base.port" "$base.endpoint"
+  echo 1
+}
+
+# Reap a dead companion-waker PoC delivery-supervisor.js record
+# (scripts/poc/delivery-supervisor.js): port/lock/mailbox/state/events/
+# adapter.log written under its own --run-dir (default
+# run/poc-delivery-supervisor, same "own --run-dir differs from the
+# manifest-tracked $SKILL_DIR/run" reasoning as the app-server-owner reaper
+# above). The lock file's JSON body carries the supervisor's own pid (see
+# delivery-supervisor.js Supervisor.start(): `{pid, port, project}`), the same
+# native-pid reporting shape as codex-bridge.js.
+#
+# Same confirm-before-touch discipline: only removes a record whose recorded
+# pid is dead, or alive-but-not-ours (recycled pid — cmdline no longer
+# mentions delivery-supervisor). Never kills a live, confirmed supervisor.
+#
+# Usage: agmsg_gc_poc_waker_delivery_supervisor_pidfiles [run_dir]
+#   run_dir defaults to $SKILL_DIR/run/poc-delivery-supervisor.
+# Echoes the number of record sets reaped (one project-keyed supervisor per
+# lock file; a run_dir can hold more than one, one per project hash).
+agmsg_gc_poc_waker_delivery_supervisor_pidfiles() {
+  local dir="${1:-$SKILL_DIR/run/poc-delivery-supervisor}"
+  [ -d "$dir" ] || { echo 0; return 0; }
+  local f pid cmd reaped=0
+  for f in "$dir"/supervisor.*.lock; do
+    [ -f "$f" ] || continue
+    pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+    local key="${f#"$dir"/supervisor.}"
+    key="${key%.lock}"
+    local prefix="$dir/supervisor.$key"
+    if [ -z "$pid" ]; then
+      rm -f "$f" "$prefix.port" "$prefix.mailbox.jsonl" "$prefix.state.json" "$prefix.events.log" "$prefix.adapter.log"
+      reaped=$((reaped + 1))
+      continue
+    fi
+    if _agmsg_pid_alive "$pid" 2>/dev/null; then
+      cmd="$(compat_get_native_cmdline "$pid" 2>/dev/null || true)"
+      case "$cmd" in
+        *delivery-supervisor*) continue ;;  # alive and confirmed ours — leave it
+        *) ;;
+      esac
+    fi
+    rm -f "$f" "$prefix.port" "$prefix.mailbox.jsonl" "$prefix.state.json" "$prefix.events.log" "$prefix.adapter.log"
+    reaped=$((reaped + 1))
+  done
+  echo "$reaped"
+}
+
 # Walk manifest.jsonl for kind=process entries with no matching dispose
 # event, and for each: if the recorded pid is dead, or alive-but-cmdline-
 # mismatched (recycled pid — never ours), record a dispose event and report
@@ -284,5 +377,7 @@ agmsg_gc_run_all() {
   agmsg_gc_codex_bridge_pidfiles >/dev/null 2>&1 || true
   agmsg_gc_codex_app_server_pidfiles >/dev/null 2>&1 || true
   agmsg_gc_codex_idle_ttl_pidfiles >/dev/null 2>&1 || true
+  agmsg_gc_poc_waker_app_server_owner_pidfiles >/dev/null 2>&1 || true
+  agmsg_gc_poc_waker_delivery_supervisor_pidfiles >/dev/null 2>&1 || true
   agmsg_gc_manifest_reap_dead >/dev/null 2>&1 || true
 }
