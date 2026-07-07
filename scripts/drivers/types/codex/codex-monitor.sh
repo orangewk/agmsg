@@ -174,7 +174,20 @@ if [ -z "$PORT" ]; then
   # free of any Node dependency — only the bridge (codex-bridge.js) needs Node, and
   # it degrades on its own if Node is missing rather than taking down the TUI. See #170.
   : > "$SERVER_LOG"
-  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 &
+  # </dev/null: this background job (and, transitively, any grandchild it
+  # forks — e.g. a `python3 - <<'PY'` fake app-server under bats, or codex's
+  # own app-server process under a real launch) must not inherit this script's
+  # stdin. Root-caused while chasing this WP2-fix's Blocking-1 (macOS/Ubuntu CI
+  # failing "all tests ok, then job exit 1" AFTER the idle-ttl reaper's own
+  # launch below was already given `</dev/null`): the reaper fix alone was not
+  # enough on macOS, because THIS line — pre-existing, not new in this WP —
+  # still left the app-server holding an inherited stdio fd. Under
+  # tests/test_codex_monitor.bats (bats (macos-latest)/(ubuntu-latest), which
+  # exercise this exact line via a fake $REAL_CODEX) a fd held open across the
+  # whole bats run is exactly what makes the runner's own end-of-job pipe/fd
+  # wait hang, well past every individual test reporting ok. Closing it here
+  # removes that hold regardless of which reaper fix landed.
+  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" </dev/null >>"$SERVER_LOG" 2>&1 &
   server_bg="$!"
   echo "$server_bg" > "$SERVER_PID"
   # server_bg is a plain (non-nohup) `&` background of a native codex.exe, so
