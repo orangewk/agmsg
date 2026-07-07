@@ -92,6 +92,21 @@ agmsg_gc_codex_bridge_pidfiles() {
 # tearing it down is out of scope for a startup reaper and stays with
 # `delivery.sh set off`.
 #
+# NOTE: codex-app-server.<hash>.idle-ttl.pid (the WP2 idle-TTL reaper loop's
+# OWN pidfile, see idle-ttl.sh / codex-monitor.sh) also matches the
+# codex-app-server.*.pid glob below by construction (it shares the
+# codex-app-server.<hash> prefix). It is deliberately skipped here and handled
+# by agmsg_gc_codex_idle_ttl_pidfiles instead — it names a different process
+# (a bash reaper loop, not the app-server) with a different liveness check and
+# a different "is this mine" confirmation string, so folding it into this
+# function's codex*app-server* cmdline match would either wrongly treat a live
+# reaper as a dead app-server record (different process, same glob) or
+# wrongly confirm a dead reaper pidfile as live via an app-server's own cmdline
+# happening to also match *codex*app-server* (the reaper's OWN cmdline does
+# contain that substring, being a `source ...idle-ttl.sh; idle_ttl_run_loop
+# ...` script — but that is not "is this our app-server", it would be a false
+# positive for the wrong question).
+#
 # Echoes the number of record sets reaped.
 agmsg_gc_codex_app_server_pidfiles() {
   local dir; dir="$(_gc_run_dir)"
@@ -99,6 +114,7 @@ agmsg_gc_codex_app_server_pidfiles() {
   local f pid cmd reaped=0
   for f in "$dir"/codex-app-server.*.pid; do
     [ -f "$f" ] || continue
+    case "$f" in *.idle-ttl.pid) continue ;; esac
     pid="$(cat "$f" 2>/dev/null || true)"
     local base="${f%.pid}"
     if [ -z "$pid" ]; then
@@ -114,6 +130,42 @@ agmsg_gc_codex_app_server_pidfiles() {
       esac
     fi
     rm -f "$f" "$base.port" "$base.log" "$base.version"
+    reaped=$((reaped + 1))
+  done
+  echo "$reaped"
+}
+
+# Reap dead codex-app-server.<hash>.idle-ttl.{pid,log} sets — the WP2 idle-TTL
+# reaper loop's own bookkeeping (see idle-ttl.sh / codex-monitor.sh's
+# IDLE_TTL_PID_FILE). This loop is launched `bash -c "<script>" &` (msys
+# space — plain `&`, no nohup — so bash's own $! IS the loop's pid directly,
+# same as the app-server's own launch; see codex-monitor.sh's PID STABILITY
+# NOTE), so liveness/cmdline here use the same msys-space helpers as the
+# app-server pidfile reaper above, not the native-space ones the codex-bridge
+# reaper needs.
+#
+# Echoes the number of record sets reaped.
+agmsg_gc_codex_idle_ttl_pidfiles() {
+  local dir; dir="$(_gc_run_dir)"
+  [ -d "$dir" ] || { echo 0; return 0; }
+  local f pid cmd reaped=0
+  for f in "$dir"/codex-app-server.*.idle-ttl.pid; do
+    [ -f "$f" ] || continue
+    pid="$(cat "$f" 2>/dev/null || true)"
+    local base="${f%.pid}"
+    if [ -z "$pid" ]; then
+      rm -f "$f" "$base.log"
+      reaped=$((reaped + 1))
+      continue
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      cmd="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
+      case "$cmd" in
+        *idle_ttl_run_loop*) continue ;;  # alive and confirmed ours — leave it
+        *) ;;
+      esac
+    fi
+    rm -f "$f" "$base.log"
     reaped=$((reaped + 1))
   done
   echo "$reaped"
@@ -231,5 +283,6 @@ agmsg_gc_manifest_kill_orphans() {
 agmsg_gc_run_all() {
   agmsg_gc_codex_bridge_pidfiles >/dev/null 2>&1 || true
   agmsg_gc_codex_app_server_pidfiles >/dev/null 2>&1 || true
+  agmsg_gc_codex_idle_ttl_pidfiles >/dev/null 2>&1 || true
   agmsg_gc_manifest_reap_dead >/dev/null 2>&1 || true
 }

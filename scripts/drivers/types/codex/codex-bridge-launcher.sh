@@ -20,6 +20,8 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
 # shellcheck source=../../../lib/hash.sh
 source "$SCRIPT_DIR/../../../lib/hash.sh"
+# shellcheck source=../../../lib/instance-id.sh
+source "$SCRIPT_DIR/../../../lib/instance-id.sh"
 PROJECT_HASH="$(printf '%s' "$PROJECT" | agmsg_sha1)"
 REQUEST_FILE="$RUN_DIR/codex-bridge-request.$PROJECT_HASH"
 
@@ -89,7 +91,18 @@ EOF
 
   if [ -f "$pidfile" ]; then
     bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [ -n "$bridge_pid" ] && kill -0 "$bridge_pid" 2>/dev/null; then
+    # bridge_pid is a Windows-native pid (codex-bridge.js's writeMeta() writes
+    # its own process.pid; this launcher backgrounds it as `nohup node ... &`,
+    # so bash's $! in THIS script would be the nohup subshell, not the Node
+    # process — see manifest.sh's PID SPACE DECISION). A plain `kill -0` here
+    # checks MSYS pid space and always reports "dead" for a native pid, so
+    # this reuse-detection loop never actually found a live bridge — it always
+    # fell through to killing (a no-op against an already-"dead"-looking pid)
+    # and relaunching, defeating the "reuse a live, correctly-bound bridge"
+    # purpose of this whole loop (orangewk/agmsg#8 WP1 finding; fixed here in
+    # WP2). Use the native-space liveness helper instead, same as
+    # stop_codex_bridge (delivery.sh) and gc.sh's own codex-bridge reaper.
+    if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid" 2>/dev/null; then
       # Reuse only when the live bridge is bound to the CURRENT app-server. A
       # codex upgrade makes codex-monitor.sh kill the stale app-server and start a
       # fresh one on a new port (#237); a bridge still bound to the old URL stays

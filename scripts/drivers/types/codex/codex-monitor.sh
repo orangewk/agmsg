@@ -16,6 +16,10 @@ source "$SCRIPT_DIR/../../../lib/hash.sh"
 source "$SCRIPT_DIR/../../../lib/compat.sh"
 # shellcheck source=../../../lib/manifest.sh
 source "$SCRIPT_DIR/../../../lib/manifest.sh"
+# idle-ttl.sh is NOT sourced here: this script never calls idle_ttl_run_loop
+# itself (only launches it as a separate `bash -c "source ...; idle_ttl_run_loop
+# ..."` process below, see the "Ensure an idle-TTL reaper loop" block), so
+# sourcing it into THIS process's own function table would be dead weight.
 
 PROJECT="$(pwd)"
 SOCKET_PATH=""
@@ -105,6 +109,15 @@ PORT_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.port"
 # stale server left running across a codex upgrade must not be reused.
 VERSION_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.version"
 CODEX_VERSION="$("$REAL_CODEX" --version 2>/dev/null || true)"
+# Idle-TTL reaper loop pid for THIS app-server (see idle-ttl.sh). One loop per
+# shared app-server, not per bridge/session — keyed on the same PROJECT_HASH
+# as the server it watches.
+IDLE_TTL_PID_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.idle-ttl.pid"
+IDLE_TTL_LOG="$RUN_DIR/codex-app-server.$PROJECT_HASH.idle-ttl.log"
+# Default 15 minutes, matching the WP2 brief's default. Both are overridable
+# per-invocation for tests / operators who want a different budget.
+IDLE_TTL_SECONDS="${AGMSG_CODEX_APPSERVER_IDLE_TTL_SECONDS:-900}"
+IDLE_TTL_POLL_SECONDS="${AGMSG_CODEX_APPSERVER_IDLE_POLL_SECONDS:-30}"
 
 mkdir -p "$RUN_DIR"
 
@@ -161,7 +174,20 @@ if [ -z "$PORT" ]; then
   # free of any Node dependency — only the bridge (codex-bridge.js) needs Node, and
   # it degrades on its own if Node is missing rather than taking down the TUI. See #170.
   : > "$SERVER_LOG"
-  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 &
+  # </dev/null: this background job (and, transitively, any grandchild it
+  # forks — e.g. a `python3 - <<'PY'` fake app-server under bats, or codex's
+  # own app-server process under a real launch) must not inherit this script's
+  # stdin. Root-caused while chasing this WP2-fix's Blocking-1 (macOS/Ubuntu CI
+  # failing "all tests ok, then job exit 1" AFTER the idle-ttl reaper's own
+  # launch below was already given `</dev/null`): the reaper fix alone was not
+  # enough on macOS, because THIS line — pre-existing, not new in this WP —
+  # still left the app-server holding an inherited stdio fd. Under
+  # tests/test_codex_monitor.bats (bats (macos-latest)/(ubuntu-latest), which
+  # exercise this exact line via a fake $REAL_CODEX) a fd held open across the
+  # whole bats run is exactly what makes the runner's own end-of-job pipe/fd
+  # wait hang, well past every individual test reporting ok. Closing it here
+  # removes that hold regardless of which reaper fix landed.
+  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" </dev/null >>"$SERVER_LOG" 2>&1 &
   server_bg="$!"
   echo "$server_bg" > "$SERVER_PID"
   # server_bg is a plain (non-nohup) `&` background of a native codex.exe, so
@@ -193,6 +219,70 @@ if [ -z "$PORT" ]; then
   # codex build recreates it instead of reusing a stale one.
   printf '%s' "$CODEX_VERSION" > "$VERSION_FILE"
 fi
+
+# Ensure an idle-TTL reaper loop is watching THIS app-server (see idle-ttl.sh
+# for the held-connection design). Covers both the fresh-launch path above
+# (no loop exists yet) and the reuse path (a prior codex-monitor.sh's loop may
+# already be running, or may have exited abnormally and left a stale pidfile —
+# start one only when no confirmed-alive loop for the CURRENT $SERVER_PID
+# already exists, so two concurrent codex-monitor.sh launches for the same
+# project never race into two competing reapers).
+#
+# PID STABILITY NOTE: launched as `bash -c "<script>" &` (NOT `nohup ... &`,
+# and NOT a bare `( ... ) &` subshell). Confirmed empirically (WP2 repro):
+#   - a bare `( ... ) &` subshell whose last command is a simple external
+#     command gets exec-optimized away — bash's $! then names the LAST
+#     command run inside the loop (a `sleep` invocation), a pid that changes
+#     every poll interval, not the stable loop process.
+#   - `bash -c "<script>"` containing a `while :; do ... done` loop does NOT
+#     get exec-optimized (a shell builtin loop is not a single simple
+#     command), so $! is bash's own pid for the entire loop lifetime, AND
+#     /proc/<pid>/cmdline for that pid is the full script text — which is what
+#     lets the reaper_alive check below positively identify "this pid IS our
+#     idle-ttl loop for THIS project" instead of trusting a bare pid alone.
+# Windows/MSYS-only for now: idle_ttl_established_count (idle-ttl.sh) reads
+# liveness via Get-NetTCPConnection, a Windows-only cmdlet, and returns
+# "unknown" (empty, fail-closed) on every other platform — see that function's
+# own MSYSTEM guard and header comment. Starting the reaper loop unconditionally
+# on macOS/Linux therefore launches a loop that can NEVER observe a non-zero
+# idle streak (every tick is "count unknown" -> reset, forever): not a no-op,
+# but a background process that never exits on its own until the app-server
+# itself dies, which is exactly the kind of dangling long-lived process this
+# WP2-fix was asked to stop shipping (confirmed root cause of the macOS/Ubuntu
+# bats CI failures — residual background processes/fds after the suite exits).
+# Gate the whole reaper-launch block on the same MSYSTEM check idle-ttl.sh
+# itself uses, so a Unix codex-monitor.sh run logs plainly that idle-TTL
+# reaping is unavailable there (loud, not silent) instead of spinning up a
+# loop doomed to run forever. Unix `ss`/`lsof` liveness support is tracked as
+# follow-up, not added here — out of scope for this reaper-lifecycle-safety fix.
+case "${MSYSTEM:-}" in
+  MINGW*|MSYS*|CLANGARM*)
+    existing_reaper_pid="$(cat "$IDLE_TTL_PID_FILE" 2>/dev/null || true)"
+    reaper_alive=0
+    if [ -n "$existing_reaper_pid" ] && kill -0 "$existing_reaper_pid" 2>/dev/null; then
+      reaper_cmd="$(compat_get_cmdline "$existing_reaper_pid" 2>/dev/null || true)"
+      case "$reaper_cmd" in
+        *"idle_ttl_run_loop $PORT "*) reaper_alive=1 ;;
+      esac
+    fi
+    if [ "$reaper_alive" != 1 ]; then
+      rm -f "$IDLE_TTL_PID_FILE"
+      server_bg_for_ttl="$(cat "$SERVER_PID" 2>/dev/null || true)"
+      if [ -n "$server_bg_for_ttl" ]; then
+        idle_ttl_script="source $(printf '%q' "$SCRIPT_DIR/../../../lib/manifest.sh"); \
+source $(printf '%q' "$SCRIPT_DIR/../../../lib/idle-ttl.sh"); \
+idle_ttl_run_loop $(printf '%q' "$PORT") $(printf '%q' "$server_bg_for_ttl") \
+$(printf '%q' "$SERVER_PID") $(printf '%q' "$IDLE_TTL_SECONDS") $(printf '%q' "$IDLE_TTL_POLL_SECONDS")"
+        SKILL_DIR="$SKILL_DIR" bash -c "$idle_ttl_script" </dev/null >>"$IDLE_TTL_LOG" 2>&1 &
+        idle_ttl_bg="$!"
+        echo "$idle_ttl_bg" > "$IDLE_TTL_PID_FILE"
+      fi
+    fi
+    ;;
+  *)
+    echo "codex-monitor: idle-TTL reaping is Windows/MSYS-only (idle_ttl_established_count has no Unix liveness backend yet) - this app-server will NOT be auto-reaped for inactivity on this platform" >&2
+    ;;
+esac
 
 if ! port_alive "$PORT"; then
   echo "codex-monitor: app-server not reachable on ws://127.0.0.1:$PORT; starting codex without the agmsg bridge" >&2
