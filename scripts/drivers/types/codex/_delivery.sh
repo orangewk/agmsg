@@ -42,6 +42,15 @@ agmsg_delivery_on_disable() {
   if [ "${stopped:-0}" -gt 0 ]; then
     echo "Stopped $stopped Codex bridge process(es) for this project and cleaned their run files."
   fi
+  # Companion-waker PoC teardown (#8 WP3a): a separate, standalone experiment
+  # (docs/poc-delivery-supervisor-notes.md) from the mainline bridge/app-server
+  # above, so it gets its own stop call rather than being folded into
+  # stop_codex_bridge's bridge/app-server/idle-ttl trio.
+  local waker_stopped
+  waker_stopped=$(stop_poc_waker "$project")
+  if [ "${waker_stopped:-0}" -gt 0 ]; then
+    echo "Stopped $waker_stopped companion-waker PoC process(es) for this project and cleaned their run files."
+  fi
   echo "Note: shell profile functions are not changed automatically."
   echo "  If you installed the optional global shim and no other project uses monitor mode, remove it:"
   echo "    $SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh remove"

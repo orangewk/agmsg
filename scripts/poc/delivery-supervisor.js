@@ -7,6 +7,15 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 
+// Lifecycle wiring (orangewk/agmsg#8, WP3a): the supervisor process itself,
+// and the state files it writes under --run-dir (port/lock/mailbox/state/
+// events/adapter.log), are delivery-role artifacts. Record them in the
+// SAME repo-wide ledger every other delivery-role artifact uses
+// ($SKILL_DIR/run/manifest.jsonl) so gc.sh's reap-on-startup pass and
+// `delivery.sh set off` can find this PoC's residue too — not this script's
+// own --run-dir, which is PoC-local and can point anywhere.
+const manifest = require(path.join(__dirname, "..", "lib", "manifest.js"));
+
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 3000;
 const DEFAULT_POLL_MS = 250;
 
@@ -67,6 +76,20 @@ function parseArgs(argv) {
 
 function repoRoot() {
   return path.resolve(__dirname, "..", "..");
+}
+
+// Where the shared manifest.jsonl ledger lives. Defaults to this repo's own
+// run/ (mirrors every bash caller's $SKILL_DIR/run), but tests must be able to
+// point this at a scratch directory — otherwise every test run that starts a
+// real supervisor process (see tests/poc/test-delivery-supervisor*.cjs)
+// appends real create/dispose lines into THIS repo's own run/manifest.jsonl,
+// which is untracked but not gitignored (an install-destination artifact, not
+// a repo-development one), rather than an isolated fixture dir. AGMSG_SKILL_DIR
+// mirrors the bash test harness's own SKILL_DIR override convention (see
+// tests/test-manifest-gc.cjs / tests/test-idle-ttl.cjs's mkSkillDir()).
+function skillRunDir() {
+  const override = process.env.AGMSG_SKILL_DIR;
+  return path.join(override ? path.resolve(override) : repoRoot(), "run");
 }
 
 function projectHash(project) {
@@ -339,12 +362,31 @@ class Supervisor {
     fs.writeFileSync(this.p.lockFile, JSON.stringify({ pid: process.pid, port, project: this.p.project }));
     this.timer = setInterval(() => this.tick(), this.pollMs);
     if (this.timer.unref) this.timer.unref();
+    // Manifest wiring: this supervisor's own pid is a native-pid process
+    // (process.pid, same reporting shape as codex-bridge.js — see
+    // manifest.sh's PID SPACE DECISION). Record it AND the port/lock/mailbox/
+    // state/events/adapter.log set this start() just wrote, so a hard kill
+    // (no stop() call) still leaves a trail gc.sh's reap-on-startup pass can
+    // find and `delivery.sh set off` can tear down.
+    manifest.recordProcessCreate(skillRunDir(), {
+      pid: process.pid,
+      cmdline: `delivery-supervisor.js start --project ${this.p.project}`,
+      createdBy: `poc-delivery-supervisor:${this.p.key}`,
+      disposeHint: "delivery-supervisor.js stop (or gc if dead)",
+    });
+    manifest.recordStateFileCreate(skillRunDir(), {
+      path: this.p.portFile,
+      createdBy: `poc-delivery-supervisor:${this.p.key}`,
+      disposeHint: "delivery-supervisor.js stop (port/lock/mailbox/state/events/adapter-log set)",
+    });
     console.log(`status=started port=${port} pid=${process.pid}`);
   }
 
   stop() {
     appendEvent(this.p, "stop", { pid: process.pid });
     if (this.timer) clearInterval(this.timer);
+    manifest.recordProcessDispose(skillRunDir(), { pid: process.pid, disposedBy: "delivery-supervisor.js stop" });
+    manifest.recordStateFileDispose(skillRunDir(), { path: this.p.portFile, disposedBy: "delivery-supervisor.js stop" });
     try { fs.unlinkSync(this.p.portFile); } catch (_) {}
     try { fs.unlinkSync(this.p.lockFile); } catch (_) {}
     if (this.server) this.server.close(() => process.exit(0));

@@ -85,9 +85,40 @@ function recordProcessDispose(runDir, { pid, disposedBy }) {
   });
 }
 
+// Record a kind=state-file create event (see manifest.sh's manifest_record_create
+// / manifest_state_file_id bash counterparts — spawn.sh's SPAWN_REC boot
+// script uses the same kind). `path` is a single representative file for a
+// set of state files a caller writes together (e.g. the codex-app-server
+// owner's pid/port/endpoint/log quartet); this mirrors gc.sh's own
+// one-pidfile-names-a-set convention rather than inventing a new
+// multi-path id shape.
+function recordStateFileCreate(runDir, { path: filePath, createdBy, disposeHint }) {
+  appendLine(runDir, {
+    ts: nowIso(),
+    event: "create",
+    kind: "state-file",
+    id: { path: filePath || "" },
+    createdBy: createdBy || "",
+    disposeHint: disposeHint || "",
+  });
+}
+
+// Record a kind=state-file dispose event.
+function recordStateFileDispose(runDir, { path: filePath, disposedBy }) {
+  appendLine(runDir, {
+    ts: nowIso(),
+    event: "dispose",
+    kind: "state-file",
+    id: { path: filePath || "" },
+    disposedBy: disposedBy || "",
+  });
+}
+
 module.exports = {
   manifestPath,
   jsonEscape,
   recordProcessCreate,
   recordProcessDispose,
+  recordStateFileCreate,
+  recordStateFileDispose,
 };
