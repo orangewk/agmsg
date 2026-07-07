@@ -227,27 +227,49 @@ fi
 #     /proc/<pid>/cmdline for that pid is the full script text — which is what
 #     lets the reaper_alive check below positively identify "this pid IS our
 #     idle-ttl loop for THIS project" instead of trusting a bare pid alone.
-existing_reaper_pid="$(cat "$IDLE_TTL_PID_FILE" 2>/dev/null || true)"
-reaper_alive=0
-if [ -n "$existing_reaper_pid" ] && kill -0 "$existing_reaper_pid" 2>/dev/null; then
-  reaper_cmd="$(compat_get_cmdline "$existing_reaper_pid" 2>/dev/null || true)"
-  case "$reaper_cmd" in
-    *"idle_ttl_run_loop $PORT "*) reaper_alive=1 ;;
-  esac
-fi
-if [ "$reaper_alive" != 1 ]; then
-  rm -f "$IDLE_TTL_PID_FILE"
-  server_bg_for_ttl="$(cat "$SERVER_PID" 2>/dev/null || true)"
-  if [ -n "$server_bg_for_ttl" ]; then
-    idle_ttl_script="source $(printf '%q' "$SCRIPT_DIR/../../../lib/manifest.sh"); \
+# Windows/MSYS-only for now: idle_ttl_established_count (idle-ttl.sh) reads
+# liveness via Get-NetTCPConnection, a Windows-only cmdlet, and returns
+# "unknown" (empty, fail-closed) on every other platform — see that function's
+# own MSYSTEM guard and header comment. Starting the reaper loop unconditionally
+# on macOS/Linux therefore launches a loop that can NEVER observe a non-zero
+# idle streak (every tick is "count unknown" -> reset, forever): not a no-op,
+# but a background process that never exits on its own until the app-server
+# itself dies, which is exactly the kind of dangling long-lived process this
+# WP2-fix was asked to stop shipping (confirmed root cause of the macOS/Ubuntu
+# bats CI failures — residual background processes/fds after the suite exits).
+# Gate the whole reaper-launch block on the same MSYSTEM check idle-ttl.sh
+# itself uses, so a Unix codex-monitor.sh run logs plainly that idle-TTL
+# reaping is unavailable there (loud, not silent) instead of spinning up a
+# loop doomed to run forever. Unix `ss`/`lsof` liveness support is tracked as
+# follow-up, not added here — out of scope for this reaper-lifecycle-safety fix.
+case "${MSYSTEM:-}" in
+  MINGW*|MSYS*|CLANGARM*)
+    existing_reaper_pid="$(cat "$IDLE_TTL_PID_FILE" 2>/dev/null || true)"
+    reaper_alive=0
+    if [ -n "$existing_reaper_pid" ] && kill -0 "$existing_reaper_pid" 2>/dev/null; then
+      reaper_cmd="$(compat_get_cmdline "$existing_reaper_pid" 2>/dev/null || true)"
+      case "$reaper_cmd" in
+        *"idle_ttl_run_loop $PORT "*) reaper_alive=1 ;;
+      esac
+    fi
+    if [ "$reaper_alive" != 1 ]; then
+      rm -f "$IDLE_TTL_PID_FILE"
+      server_bg_for_ttl="$(cat "$SERVER_PID" 2>/dev/null || true)"
+      if [ -n "$server_bg_for_ttl" ]; then
+        idle_ttl_script="source $(printf '%q' "$SCRIPT_DIR/../../../lib/manifest.sh"); \
 source $(printf '%q' "$SCRIPT_DIR/../../../lib/idle-ttl.sh"); \
 idle_ttl_run_loop $(printf '%q' "$PORT") $(printf '%q' "$server_bg_for_ttl") \
 $(printf '%q' "$SERVER_PID") $(printf '%q' "$IDLE_TTL_SECONDS") $(printf '%q' "$IDLE_TTL_POLL_SECONDS")"
-    SKILL_DIR="$SKILL_DIR" bash -c "$idle_ttl_script" >>"$IDLE_TTL_LOG" 2>&1 &
-    idle_ttl_bg="$!"
-    echo "$idle_ttl_bg" > "$IDLE_TTL_PID_FILE"
-  fi
-fi
+        SKILL_DIR="$SKILL_DIR" bash -c "$idle_ttl_script" </dev/null >>"$IDLE_TTL_LOG" 2>&1 &
+        idle_ttl_bg="$!"
+        echo "$idle_ttl_bg" > "$IDLE_TTL_PID_FILE"
+      fi
+    fi
+    ;;
+  *)
+    echo "codex-monitor: idle-TTL reaping is Windows/MSYS-only (idle_ttl_established_count has no Unix liveness backend yet) - this app-server will NOT be auto-reaped for inactivity on this platform" >&2
+    ;;
+esac
 
 if ! port_alive "$PORT"; then
   echo "codex-monitor: app-server not reachable on ws://127.0.0.1:$PORT; starting codex without the agmsg bridge" >&2

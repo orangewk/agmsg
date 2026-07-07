@@ -45,7 +45,20 @@ const path = require("path");
 
 const repo = path.resolve(__dirname, "..");
 const bash = findBash();
-
+// Every child-process env below is BASH_ENV, not process.env directly (see
+// bashEnv() just below `findBash`): a bare `node tests/test-idle-ttl.cjs` run
+// from a shell whose PATH never picked up Git for Windows' `usr/bin` (the
+// MSYS2 coreutils dir — rm/dirname/uname/etc) — e.g. a plain PowerShell/cmd.exe
+// prompt, as opposed to a Git Bash prompt where that shell's own startup
+// already prepended it — spawns a bash.exe that IS the right MSYS runtime
+// (found by absolute path below) but then can't find `rm`, `dirname`, or
+// `uname` on PATH once it's running, because PATH is inherited from the
+// parent process, not derived from the bash.exe binary's own location.
+// Confirmed by direct repro: identical script, green under a Git-Bash-launched
+// shell, failing with "rm: command not found" / "dirname: command not found"
+// under PowerShell. Every script this file sources (compat.sh's `uname`,
+// gc.sh's `rm`, codex-monitor.sh's `dirname`) needs those binaries, so this
+// must be fixed once, for every spawn site in this file, not per call site.
 function findBash() {
   const candidates = [
     "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
@@ -61,6 +74,50 @@ function findBash() {
     }
   }
   throw new Error("no usable bash found for test harness");
+}
+
+// Env to pass to every spawned bash.exe / bash -c child process in this file:
+// process.env with (a) the MSYS coreutils dir prepended to PATH and (b)
+// MSYSTEM set, when missing, to match the MSYS runtime `bash` above actually
+// resolved to.
+//
+// (a) When `bash` resolved to an absolute path (the normal case — see
+// findBash()'s candidate list), that path's own directory (Git for Windows'
+// usr/bin) is exactly the directory bash.exe's own MSYS runtime expects on
+// PATH; prepending it makes `rm`, `dirname`, `uname`, etc. resolve regardless
+// of what shell launched this test.
+//
+// (b) MSYSTEM is how idle-ttl.sh's idle_ttl_established_count and
+// instance-id.sh's _agmsg_pid_alive detect "am I really running under the
+// MINGW/MSYS bash whose Get-NetTCPConnection / tasklist codepath applies" —
+// see both functions' own `case "${MSYSTEM:-}" in MINGW*|MSYS*|CLANGARM*)`
+// guards. bash.exe itself always sets MSYSTEM once it starts (confirmed:
+// `bash.exe -c 'echo $MSYSTEM'` prints MINGW64 even under `env -i`), but
+// child_process.execFileSync/spawn pass the PARENT's env, not a freshly
+// bash-initialized one — env is applied before bash.exe's own startup can set
+// it, so an explicit parent-side MSYSTEM (e.g. a Git Bash terminal) IS seen by
+// the child, but no MSYSTEM in the parent (e.g. a plain PowerShell/cmd.exe
+// prompt spawning this test with `node tests/test-idle-ttl.cjs`) means the
+// child never gets one either — confirmed by direct repro: identical script,
+// MSYSTEM=MINGW64 printed under a Git-Bash-launched shell, MSYSTEM=[] under
+// PowerShell, which cascades into idle_ttl_established_count and
+// _agmsg_pid_alive both silently taking their non-Windows fallback path (fail-
+// closed "unknown" / plain `kill -0`) even though the bash.exe actually
+// running IS the MINGW64 build. Only ever fills in a MISSING MSYSTEM — never
+// overrides one the parent shell already set — and only on win32 (a
+// Linux/macOS CI runner's `bash` fallback should never see a Windows-only
+// value forced onto it).
+function bashEnv() {
+  const env = { ...process.env };
+  if (process.platform === "win32" && !env.MSYSTEM) {
+    env.MSYSTEM = "MINGW64";
+  }
+  if (!path.isAbsolute(bash)) return env;
+  const bashDir = path.dirname(bash);
+  const currentPath = env.PATH || env.Path || "";
+  if (currentPath.split(path.delimiter).includes(bashDir)) return env;
+  env.PATH = `${bashDir}${path.delimiter}${currentPath}`;
+  return env;
 }
 
 function mkSkillDir() {
@@ -87,7 +144,7 @@ source "$SKILL_DIR/scripts/lib/gc.sh"
 source "$SKILL_DIR/scripts/lib/idle-ttl.sh"
 ${script}
 `;
-  return execFileSync(bash, ["-c", wrapped], { encoding: "utf8", timeout: timeoutMs || 20000 });
+  return execFileSync(bash, ["-c", wrapped], { encoding: "utf8", timeout: timeoutMs || 20000, env: bashEnv() });
 }
 
 function bashQuote(s) {
@@ -148,14 +205,14 @@ function spawnMsysDummyServer(skillDir) {
   const pidStr = execFileSync(
     bash,
     ["-c", "sleep 9999 </dev/null >/dev/null 2>&1 & disown; echo $!"],
-    { encoding: "utf8", cwd: skillDir },
+    { encoding: "utf8", cwd: skillDir, env: bashEnv() },
   ).trim();
   return Number(pidStr);
 }
 
 function msysPidAlive(pid) {
   try {
-    execFileSync(bash, ["-c", `kill -0 ${pid} 2>/dev/null`], { encoding: "utf8" });
+    execFileSync(bash, ["-c", `kill -0 ${pid} 2>/dev/null`], { encoding: "utf8", env: bashEnv() });
     return true;
   } catch (_) {
     return false;
@@ -164,7 +221,7 @@ function msysPidAlive(pid) {
 
 function killMsysPid(pid) {
   try {
-    execFileSync(bash, ["-c", `kill ${pid} 2>/dev/null || true`], { encoding: "utf8" });
+    execFileSync(bash, ["-c", `kill ${pid} 2>/dev/null || true`], { encoding: "utf8", env: bashEnv() });
   } catch (_) {
     // best-effort
   }
@@ -371,7 +428,7 @@ source "$SKILL_DIR/scripts/lib/gc.sh"
 source "$SKILL_DIR/scripts/lib/idle-ttl.sh"
 idle_ttl_run_loop ${port} ${serverPid} "$SKILL_DIR/run/codex-app-server.fakehash.pid" 2 1`,
         ],
-        { stdio: "ignore" },
+        { stdio: "ignore", env: bashEnv() },
       );
 
       await new Promise((resolve) => setTimeout(resolve, 3500));
@@ -432,7 +489,7 @@ idle_ttl_run_loop ${port} ${serverPid} "$SKILL_DIR/run/codex-app-server.fakehash
       const liveReaperPidStr = execFileSync(
         bash,
         ["-c", "(idle_ttl_run_loop_MARKER=1; while :; do sleep 5; done) </dev/null >/dev/null 2>&1 & disown; echo $!"],
-        { encoding: "utf8" },
+        { encoding: "utf8", env: bashEnv() },
       ).trim();
       liveReaperPid = Number(liveReaperPidStr);
       sleepMs(400);
@@ -549,6 +606,46 @@ idle_ttl_run_loop ${port} ${serverPid} "$SKILL_DIR/run/codex-app-server.fakehash
       copyDirSync(path.join(repo, "scripts"), path.join(skillDir, "scripts"));
 
       const fakeCodex = path.join(testDir, "real-codex");
+      // The app-server listener is a SEPARATE .py file invoked via `exec python3
+      // <file>`, not a `python3 - <<'PY' ... PY` heredoc run as a plain (non-exec)
+      // child, and deliberately does NOT poll its ppid to self-exit (contrast with
+      // this same fixture elsewhere in this file / test_codex_monitor.bats's fake
+      // codex, both of which use the heredoc+ppid-poll shape). Both differences
+      // are load-bearing, confirmed by direct repro while chasing this WP2-fix's
+      // Blocking-3 (residual e2e processes):
+      //   - Piping a heredoc into `python3 -` makes MSYS bash fork() a SECOND,
+      //     independent bash.exe Windows process to feed it (confirmed via
+      //     Get-CimInstance: two "bash.exe ... real-codex app-server ..." entries,
+      //     parent+child, ~20ms apart) — this script's own `$!`/SERVER_PID only
+      //     ever names ONE of the two, so `kill $SERVER_PID` leaves the other
+      //     Windows process (and its python3 grandchild) as an orphan no cleanup
+      //     path in this file ever targets. `exec python3 <file>` REPLACES the
+      //     bash process (no fork, one Windows process total), which is exactly
+      //     codex-monitor.sh's own real-`codex`-CLI assumption: `$REAL_CODEX`
+      //     execs straight through to a single process, never forks a sibling.
+      //   - A ppid-poll self-exit is redundant with (and, empirically, LESS
+      //     reliable than) this test's own kill-by-pid teardown once exec is used:
+      //     with exec, `kill $SERVER_PID` (this file's own cleanup, and the SAME
+      //     msys pid production's idle-ttl reaper / stop_codex_bridge kill) reaps
+      //     the whole thing in one shot, so the extra self-exit polling loop is
+      //     one less thing that can itself leave a listener spinning if a test
+      //     assertion throws between launch and teardown.
+      const listenerScript = path.join(testDir, "fake-app-server-listener.py");
+      fs.writeFileSync(
+        listenerScript,
+        `import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0)); s.listen(16); s.settimeout(0.2)
+print("codex app-server (WebSockets)")
+print("  listening on: ws://127.0.0.1:%d" % s.getsockname()[1]); sys.stdout.flush()
+while True:
+    try:
+        c, _ = s.accept(); c.close()
+    except Exception:
+        pass
+`,
+      );
       fs.writeFileSync(
         fakeCodex,
         `#!/usr/bin/env bash
@@ -558,22 +655,7 @@ case "\${1:-}" in
     exit 0
     ;;
   app-server)
-    python3 - <<'PY'
-import socket, sys, os
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 0)); s.listen(16); s.settimeout(0.2)
-print("codex app-server (WebSockets)")
-print("  listening on: ws://127.0.0.1:%d" % s.getsockname()[1]); sys.stdout.flush()
-ppid = os.getppid()
-while True:
-    if os.getppid() != ppid:
-        break
-    try:
-        c, _ = s.accept(); c.close()
-    except Exception:
-        pass
-PY
+    exec python3 ${bashQuote(listenerScript)}
     ;;
   *)
     printf 'plain-codex' >> "$CALL_LOG"
@@ -595,7 +677,7 @@ esac
           encoding: "utf8",
           timeout: 15000,
           env: {
-            ...process.env,
+            ...bashEnv(),
             AGMSG_REAL_CODEX: fakeCodex,
             AGMSG_CODEX_BRIDGE_LAUNCHER_CMD: "/bin/true",
             CALL_LOG: callLog,
@@ -617,7 +699,7 @@ esac
       assert.ok(msysPidAlive(Number(serverPid)), "the fake app-server process must actually be running");
       assert.ok(msysPidAlive(Number(reaperPid)), "the idle-ttl reaper process must actually be running");
 
-      const reaperCmd = execFileSync(bash, ["-c", `cat /proc/${reaperPid}/cmdline 2>/dev/null | tr '\\0' ' '`], { encoding: "utf8" });
+      const reaperCmd = execFileSync(bash, ["-c", `cat /proc/${reaperPid}/cmdline 2>/dev/null | tr '\\0' ' '`], { encoding: "utf8", env: bashEnv() });
       assert.match(reaperCmd, /idle_ttl_run_loop/, "reaper cmdline must contain the idle_ttl_run_loop call");
       // Compare basename only, not the full path: bash's own /proc/<pid>/cmdline
       // reports the POSIX (forward-slash) form of the pidfile path it was
@@ -629,6 +711,27 @@ esac
     } finally {
       if (reaperPid) killMsysPid(Number(reaperPid));
       if (serverPid) killMsysPid(Number(serverPid));
+      // Belt-and-suspenders beyond the two msys-pid kills above: sweep any
+      // Windows process whose command line still names THIS test's own
+      // testDir (a fresh mkdtempSync path, unique to this run — never matches
+      // an unrelated process). Covers the same process-tree-split hazard the
+      // fakeCodex script's `exec python3 <file>` fix above addresses (a
+      // forked sibling Windows process from a heredoc-fed child would carry
+      // this testDir in its own command line too), so a regression in that
+      // fix — or any other unanticipated child this fixture spawns — still
+      // gets reaped here rather than leaking, instead of relying solely on
+      // the exec fix never regressing. Windows-only (this file's whole
+      // premise is a Windows Git Bash repro); a non-Windows CI runner reaping
+      // via msysPidAlive/killMsysPid above is enough there.
+      if (process.platform === "win32") {
+        try {
+          const testDirBasename = path.basename(testDir);
+          const psScript = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${testDirBasename}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+          execFileSync("powershell.exe", ["-NoProfile", "-Command", psScript], { stdio: "ignore", timeout: 10000 });
+        } catch (_) {
+          // best-effort — the msys-pid kills above are the primary teardown path
+        }
+      }
       fs.rmSync(testDir, { recursive: true, force: true });
     }
   });
@@ -644,7 +747,57 @@ function copyDirSync(src, dest) {
   }
 }
 
+// Self-check: after every test's own try/finally teardown has run, confirm
+// NONE of this file's disposable test dirs (agmsg-idle-ttl-test-* from
+// mkSkillDir, agmsg-codex-monitor-e2e-* from the end-to-end test) still has a
+// live Windows process naming it on the command line. This is the leak this
+// WP2-fix was asked to close (residual fake app-server / reaper processes
+// surviving a `node tests/test-idle-ttl.cjs` run) — asserting it here, once,
+// after the full suite, catches a regression in ANY individual test's
+// teardown (not just the e2e test's own belt-and-suspenders sweep above),
+// without hardcoding assumptions about which test leaked. Windows-only: the
+// whole premise of this residual-process check is Windows Git Bash process
+// tree behavior (see the exec-vs-heredoc fork finding documented at the fake
+// codex fixture above); a non-Windows CI runner relies on its own
+// msysPidAlive/killMsysPid-equivalent teardown per test instead.
+function residualTestProcesses() {
+  if (process.platform !== "win32") return [];
+  try {
+    // Excludes ITSELF: this powershell.exe's own CommandLine necessarily
+    // contains the same 'agmsg-idle-ttl-test-|agmsg-codex-monitor-e2e-'
+    // literal (it is the -match pattern below), which would otherwise always
+    // self-match and false-positive on every run. Filtering by Name != both
+    // powershell.exe AND pwsh.exe (PowerShell 7, which is what actually runs
+    // this on this dev box) excludes the query process itself without
+    // excluding a genuinely leaked bash.exe/python3.exe/python3.13.exe fixture
+    // process — none of which are ever named powershell.exe or pwsh.exe.
+    const psScript =
+      "Get-CimInstance Win32_Process | " +
+      "Where-Object { $_.CommandLine -match 'agmsg-idle-ttl-test-|agmsg-codex-monitor-e2e-' -and $_.Name -ne 'powershell.exe' -and $_.Name -ne 'pwsh.exe' } | " +
+      "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-Command", psScript], { encoding: "utf8", timeout: 10000 }).trim();
+    if (!out) return [];
+    const parsed = JSON.parse(out);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch (_) {
+    // best-effort — a failure to query must not itself fail the suite (this
+    // check is a regression guard, not the tests' own correctness assertions)
+    return [];
+  }
+}
+
 runAll().then(() => {
+  const residual = residualTestProcesses();
+  if (residual.length > 0) {
+    failures++;
+    console.log("not ok - self-check: zero residual test processes after the suite completes");
+    for (const p of residual) {
+      console.log(`  leaked pid=${p.ProcessId} cmdline=${p.CommandLine}`);
+    }
+  } else {
+    console.log("ok - self-check: zero residual test processes after the suite completes");
+  }
+
   if (failures > 0) {
     console.log(JSON.stringify({ ok: false, failures }));
     process.exit(1);
