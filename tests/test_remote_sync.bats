@@ -19,6 +19,11 @@ setup() {
   # Environment B: a second message store sharing the same scripts/teams.
   export ENV_B="$TEST_SKILL_DIR/db-b"
   mkdir -p "$ENV_B"
+
+  # Push synchronously: send.sh's default background push races teardown's
+  # rm -rf of the store (observed as "Directory not empty" on CI). The one
+  # test exercising the background path opts back out explicitly.
+  export AGMSG_REMOTE_PUSH_SYNC=1
 }
 
 teardown() {
@@ -170,7 +175,7 @@ sqlite_mem_db() {
 
 @test "send: background push reaches the bus" {
   connect_both
-  bash "$SCRIPTS/send.sh" testteam alice bob "async push" >/dev/null
+  AGMSG_REMOTE_PUSH_SYNC= bash "$SCRIPTS/send.sh" testteam alice bob "async push" >/dev/null
   # send.sh pushes in the background; poll the bare repo until the event
   # lands (bounded — ~10s worst case on a local filesystem is generous).
   found=1
@@ -182,4 +187,10 @@ sqlite_mem_db() {
     sleep 0.5
   done
   [ "$found" -eq 0 ]
+  # Let the background pusher finish (it releases the sync lock as it exits)
+  # so teardown's rm -rf doesn't race its last writes.
+  for _ in $(seq 1 20); do
+    [ ! -d "$TEST_SKILL_DIR/db/bus.lock" ] && break
+    sleep 0.5
+  done
 }

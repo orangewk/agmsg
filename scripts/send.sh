@@ -38,8 +38,15 @@ fi
 # Remote transport (ADR 0005): export + push in the background so send
 # returns at local speed. A failed or skipped push is caught up by the next
 # push/pull cycle; the message is already durable in the local store.
+# AGMSG_REMOTE_PUSH_SYNC=1 pushes in the foreground instead — for callers
+# that must not leave a writer racing behind them (tests tearing down the
+# store, scripts that exit immediately after send).
 if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
-  (bash "$SCRIPT_DIR/remote.sh" push --quiet >/dev/null 2>&1 || true) &
+  if [ "${AGMSG_REMOTE_PUSH_SYNC:-}" = "1" ]; then
+    bash "$SCRIPT_DIR/remote.sh" push --quiet >/dev/null 2>&1 || true
+  else
+    (bash "$SCRIPT_DIR/remote.sh" push --quiet >/dev/null 2>&1 || true) &
+  fi
 fi
 
 echo "Sent to $TO in team $TEAM"
