@@ -113,6 +113,16 @@ fi
 mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
+# Remote transport (ADR 0005): pull bus events into the local store before
+# reading the inbox, so messages sent from other environments are delivered
+# by the same unread query below. Best-effort — offline or an unconfigured
+# remote must never break the hook. The cooldown above already bounds how
+# often this hits the network. The pull may CREATE the DB (a receive-only
+# environment never sent anything), so it runs before the -f check.
+if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
+  bash "$SCRIPT_DIR/remote.sh" pull --quiet >/dev/null 2>&1 || true
+fi
+
 # Check for unread messages and mark as read
 DB="$(agmsg_db_path)"
 if [ ! -f "$DB" ]; then exit 0; fi

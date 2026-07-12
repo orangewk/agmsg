@@ -146,6 +146,15 @@ Do NOT manually edit config files. Always use join.sh.
 #   --force              tear down from the recorded placement, no message
 #   --timeout N          seconds to wait for graceful teardown (default 30)
 ~/.agents/skills/agmsg/scripts/despawn.sh <team> <from> <name> [--force] [--timeout N]
+
+# Remote transport — message agents in OTHER environments (another machine,
+# a cloud sandbox) through a private git "bus" repository. After `add`,
+# send/inbox/check-inbox sync with the bus automatically; `sync` forces a
+# round trip by hand. See docs/remote.md.
+~/.agents/skills/agmsg/scripts/remote.sh add <git-url>
+~/.agents/skills/agmsg/scripts/remote.sh status
+~/.agents/skills/agmsg/scripts/remote.sh sync
+~/.agents/skills/agmsg/scripts/remote.sh remove
 ```
 
 ## Sandbox compatibility (Claude Code)

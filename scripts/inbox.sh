@@ -14,6 +14,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
+
+# Remote transport (ADR 0005): a manual inbox check should see what other
+# environments sent, so pull first. Best-effort — offline must not break the
+# inbox — and the pull may CREATE the DB in a receive-only environment, so it
+# runs before the -f check.
+if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
+  bash "$SCRIPT_DIR/remote.sh" pull --quiet >/dev/null 2>&1 || true
+fi
+
 DB="$(agmsg_db_path)"
 
 if [ ! -f "$DB" ]; then

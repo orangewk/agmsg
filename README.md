@@ -165,6 +165,8 @@ The agent picks the right subcommand and runs it for you. You don't need to memo
 
 For renaming a team, leaving, joining the same team from a second project, or clearing a project's registrations, see [docs/teams.md](docs/teams.md).
 
+To message agents in *other environments* — another machine, Claude Code on the web, a cloud sandbox — through a private git "bus" repository, see [docs/remote.md](docs/remote.md).
+
 ### Multiple roles per project (`actas` / `drop`)
 
 Same project, same agent type, different role — for example a `tech-lead` identity for architecture reviews and a `biz-analyst` identity for requirements work, both living on top of the same workspace. Toolset and assets are shared; only the role differs.
