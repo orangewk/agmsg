@@ -35,4 +35,11 @@ if ! printf '%s
 ' "$INSERT" | agmsg_sqlite "$DB"
 fi
 
+# Remote transport (ADR 0005): export + push in the background so send
+# returns at local speed. A failed or skipped push is caught up by the next
+# push/pull cycle; the message is already durable in the local store.
+if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
+  (bash "$SCRIPT_DIR/remote.sh" push --quiet >/dev/null 2>&1 || true) &
+fi
+
 echo "Sent to $TO in team $TEAM"
