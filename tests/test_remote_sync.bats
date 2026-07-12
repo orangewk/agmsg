@@ -147,7 +147,52 @@ sqlite_mem_db() {
   in_b "$SCRIPTS/remote.sh" sync   # B imports, then exports its own (none)
   # B's writer files must not contain A's event.
   env_b_id=$(sed -n 's/^env_id=//p' "$ENV_B/remote.conf")
-  run grep -l "no echo" "$ENV_B"/bus/events/"$env_b_id".*.jsonl
+  run grep -l "no echo" "$ENV_B"/bus/events/testteam/"$env_b_id".*.jsonl
+  [ "$status" -ne 0 ]
+}
+
+@test "sync: writer files use the per-team ADR 0005 namespace" {
+  connect_both
+  bash "$SCRIPTS/send.sh" testteam alice bob "namespaced" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  env_a_id=$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")
+  run grep -l "namespaced" "$TEST_SKILL_DIR"/db/bus/events/testteam/"$env_a_id".*.jsonl
+  [ "$status" -eq 0 ]
+}
+
+@test "sync: legacy flat writer files on the bus still import" {
+  connect_both
+  # A v0 exporter left a flat events/<env>.jsonl on the bus; hand-plant one.
+  flat="$TEST_SKILL_DIR/db/bus/events/legacy-env.202607.jsonl"
+  mkdir -p "$(dirname "$flat")"
+  printf '%s\n' '{"id":"legacy-0001","env":"legacy-env","team":"testteam","from":"alice","to":"bob","body":"from the flat past","created_at":"2026-07-01T00:00:00Z"}' > "$flat"
+  git -C "$TEST_SKILL_DIR/db/bus" add -A events
+  git -C "$TEST_SKILL_DIR/db/bus" commit -qm "legacy event"
+  git -C "$TEST_SKILL_DIR/db/bus" push -q origin HEAD
+  in_b "$SCRIPTS/remote.sh" sync
+  run in_b "$SCRIPTS/inbox.sh" testteam bob
+  [[ "$output" =~ "from the flat past" ]]
+}
+
+@test "push: a failing remote surfaces a non-zero exit (not a false 'pushed')" {
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  git -C "$TEST_SKILL_DIR/db/bus" remote set-url origin "$TEST_SKILL_DIR/nonexistent.git"
+  bash "$SCRIPTS/send.sh" testteam alice bob "stranded" >/dev/null 2>&1 || true
+  run bash "$SCRIPTS/remote.sh" push
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "could not push" ]]
+  # The message survived locally and pushes once the remote heals.
+  git -C "$TEST_SKILL_DIR/db/bus" remote set-url origin "$TEST_SKILL_DIR/bus.git"
+  run bash "$SCRIPTS/remote.sh" push
+  [ "$status" -eq 0 ]
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "stranded" HEAD --
+  [ "$status" -eq 0 ]
+}
+
+@test "sync: a failing remote surfaces a non-zero exit" {
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  git -C "$TEST_SKILL_DIR/db/bus" remote set-url origin "$TEST_SKILL_DIR/nonexistent.git"
+  run bash "$SCRIPTS/remote.sh" sync
   [ "$status" -ne 0 ]
 }
 
@@ -171,6 +216,30 @@ sqlite_mem_db() {
   [ "$status" -eq 0 ]
   [[ "$output" =~ "decision" ]]
   [[ "$output" =~ "remote ping" ]]
+}
+
+@test "watch: monitor-mode watcher pulls remote messages into its stream" {
+  skip_on_windows "watcher process semantics (#134)"
+  connect_both
+  out="$TEST_SKILL_DIR/watch.out"
+  AGMSG_WATCH_INTERVAL=1 AGMSG_REMOTE_PULL_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" watchsess /tmp/project-a claude-code > "$out" 2>/dev/null &
+  WPID=$!
+  # Message originates in the OTHER environment after the watcher started;
+  # only the watcher's own remote pull can deliver it (no hook runs here).
+  in_b "$SCRIPTS/send.sh" testteam bob alice "monitor pull" >/dev/null
+  in_b "$SCRIPTS/remote.sh" sync
+  found=1
+  for _ in $(seq 1 40); do
+    if grep -q "monitor pull" "$out" 2>/dev/null; then
+      found=0
+      break
+    fi
+    sleep 0.5
+  done
+  kill "$WPID" 2>/dev/null || true
+  wait "$WPID" 2>/dev/null || true
+  [ "$found" -eq 0 ]
 }
 
 @test "send: background push reaches the bus" {

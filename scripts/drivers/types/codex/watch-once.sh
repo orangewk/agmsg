@@ -54,9 +54,22 @@ source "$SCRIPT_DIR/../../../lib/actas-lock.sh"
 source "$SCRIPT_DIR/../../../lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../../../lib/subscription.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../../lib/compat.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../../lib/sync.sh"
 
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 DB="$(agmsg_db_path)"
+
+# Remote transport (ADR 0005): this oracle reads only the local DB, so pull
+# bus events in (throttled, shared store-level marker) or a Codex monitor
+# session would never notice remote messages (PR #14 review P1). 0 disables.
+REMOTE_PULL_INTERVAL=0
+if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
+  REMOTE_PULL_INTERVAL="${AGMSG_REMOTE_PULL_INTERVAL:-60}"
+  case "$REMOTE_PULL_INTERVAL" in ''|*[!0-9]*) REMOTE_PULL_INTERVAL=60 ;; esac
+fi
 
 PAIRS="$(agmsg_subscription_pairs "$PROJECT_PATH" "$AGENT_TYPE" "" "$ACTIVE_NAME")" || exit 1
 if [ -n "$TEAM_FILTER" ]; then
@@ -72,6 +85,9 @@ WHERE_PAIRS="$(agmsg_subscription_where "$PAIRS")"
 deadline=$(( $(date +%s) + TIMEOUT ))
 
 while true; do
+  if [ "$REMOTE_PULL_INTERVAL" -gt 0 ]; then
+    sync_pull_throttled "$REMOTE_PULL_INTERVAL"
+  fi
   if [ -f "$DB" ]; then
     row="$(agmsg_sqlite -separator $'\t' "$DB" "
       SELECT COUNT(*), COALESCE(MAX(id), 0)

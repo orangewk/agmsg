@@ -105,24 +105,39 @@ case "$ACTION" in
     require_configured
     require_git
     trap sync_unlock EXIT
-    sync_op_pull
-    say "Pulled remote events into the local store"
+    if sync_op_pull; then
+      say "Pulled remote events into the local store"
+    else
+      echo "Error: could not fetch from the remote bus (offline? credentials?)." >&2
+      echo "Already-fetched events were imported; the rest arrive on the next successful pull." >&2
+      exit 1
+    fi
     ;;
 
   push)
     require_configured
     require_git
     trap sync_unlock EXIT
-    sync_op_push
-    say "Exported and pushed local messages"
+    if sync_op_push; then
+      say "Exported and pushed local messages"
+    else
+      echo "Error: could not push to the remote bus (offline? credentials? protected branch?)." >&2
+      echo "Messages are committed locally and will be pushed by the next successful push/sync." >&2
+      exit 1
+    fi
     ;;
 
   sync)
     require_configured
     require_git
     trap sync_unlock EXIT
-    sync_op_sync
-    say "Synced with remote bus"
+    if sync_op_sync; then
+      say "Synced with remote bus"
+    else
+      echo "Error: sync with the remote bus failed (offline? credentials?)." >&2
+      echo "Local state is consistent; the next successful sync catches up." >&2
+      exit 1
+    fi
     ;;
 
   remove)

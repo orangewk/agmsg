@@ -49,6 +49,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/sync.sh"
 
 # Resolve a session id when the launcher could not bake one in (empty first arg).
 # Grok Build's `monitor` tool runs the watcher with $GROK_SESSION_ID unset, so
@@ -102,6 +104,20 @@ if [ -z "$INTERVAL" ]; then
   INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.poll_interval 5 2>/dev/null || echo 5)"
 fi
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+
+# Remote transport (ADR 0005): how often this watcher pulls bus events into
+# the local store. Monitor-mode delivery reads only the local DB, so without
+# this a monitor-mode session never sees remote messages (PR #14 review P1).
+# Slower than the DB poll on purpose — it hits the network. Only resolved
+# when a remote is actually configured; 0 disables.
+REMOTE_PULL_INTERVAL=0
+if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
+  REMOTE_PULL_INTERVAL="${AGMSG_REMOTE_PULL_INTERVAL:-}"
+  if [ -z "$REMOTE_PULL_INTERVAL" ]; then
+    REMOTE_PULL_INTERVAL="$("$SCRIPT_DIR/config.sh" get delivery.monitor.remote_pull_interval 60 2>/dev/null || echo 60)"
+  fi
+  case "$REMOTE_PULL_INTERVAL" in ''|*[!0-9]*) REMOTE_PULL_INTERVAL=60 ;; esac
+fi
 
 mkdir -p "$RUN_DIR" 2>/dev/null || true
 
@@ -321,6 +337,12 @@ while true; do
   # resolved agent pid) keeps the prior behavior and is not liveness-gated.
   if agmsg_instance_is_composite "$SESSION_ID" && ! agmsg_instance_alive "$SESSION_ID"; then
     exit 0
+  fi
+  # Pull remote bus events into the store (throttled; store-level marker
+  # shares the cadence across parallel watchers). Best-effort by contract —
+  # a dead network never stalls local delivery below.
+  if [ "$REMOTE_PULL_INTERVAL" -gt 0 ]; then
+    sync_pull_throttled "$REMOTE_PULL_INTERVAL"
   fi
   if [ -f "$DB" ]; then
     ROWS="$(agmsg_sqlite -separator $'\x1f' "$DB" "

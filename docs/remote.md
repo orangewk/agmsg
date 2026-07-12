@@ -49,9 +49,9 @@ hooks call `pull`/`push` automatically.
 
 - Each environment gets an **env id** (`<hostname>-<random>`) at `add` time
   and appends events only to its own writer files on the bus:
-  `events/<env-id>.<YYYYMM>.jsonl`. Per-writer files mean two environments
-  can never produce a git content conflict; pushes race only on the ref and
-  are resolved by an automatic rebase-and-retry.
+  `events/<team>/<env-id>.<YYYYMM>.jsonl`. Per-writer files mean two
+  environments can never produce a git content conflict; pushes race only on
+  the ref and are resolved by an automatic rebase-and-retry.
 - Events carry a globally unique id, and import is `INSERT OR IGNORE`
   against a unique index — replaying any file any number of times cannot
   duplicate a message, and offline environments simply catch up on their
@@ -61,11 +61,29 @@ hooks call `pull`/`push` automatically.
 
 ## Latency and limits
 
-Delivery latency is the receiver's hook cooldown
-(`delivery.turn.check_interval`, default 60s) plus one git round trip. Git
+Delivery latency is the receiver's pull cadence plus one git round trip: in
+turn mode the Stop-hook cooldown (`delivery.turn.check_interval`, default
+60s); in monitor mode the watcher's remote pull interval
+(`delivery.monitor.remote_pull_interval`, default 60s — the watcher's fast
+local poll stays local). Git
 fetch/push traffic is not metered against the GitHub REST API rate limit;
 at agent-team message rates you are orders of magnitude below any abuse
 threshold. See the ADR for the full analysis.
+
+## Trust model: one bus = one trust domain
+
+Everything on a bus replicates to **every** environment bound to it: import
+reads all teams' writer files, and anyone with push access to the repo can
+write events under any `from` name. Repo access *is* the authentication.
+Concretely:
+
+- Bind a store to a bus only if every environment on that bus may see every
+  team's messages in that store.
+- To keep two groups of agents isolated from each other, give them
+  **separate bus repos** (and separate stores via `AGMSG_STORAGE_PATH` if
+  they share a machine) — not two teams on one bus.
+- The per-team directories on the bus are a namespace for tidiness and
+  future filtering, not a security boundary.
 
 ## Known limitations (MVP)
 
