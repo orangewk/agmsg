@@ -84,7 +84,22 @@ case "$ACTION" in
     mkdir -p "$STORE_DIR"
     BUS="$(sync_bus_dir)"
     rm -rf "$BUS"
-    git clone -q "$URL" "$BUS" 2>/dev/null || { echo "Error: cannot clone $URL" >&2; exit 1; }
+    # The clone happens before the local bus config exists, so the transport
+    # bounds below cannot protect this first network operation. Apply them to
+    # clone itself as well; otherwise bootstrap can still hang on a dead bus.
+    clone_remote() {
+      local ssh_command="${GIT_SSH_COMMAND:-ssh} -o ConnectTimeout=10 -o BatchMode=yes"
+      if command -v timeout >/dev/null 2>&1; then
+        GIT_SSH_COMMAND="$ssh_command" timeout "${AGMSG_SYNC_NET_TIMEOUT:-60}" \
+          git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 \
+          clone -q "$URL" "$BUS"
+      else
+        GIT_SSH_COMMAND="$ssh_command" \
+          git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 \
+          clone -q "$URL" "$BUS"
+      fi
+    }
+    clone_remote 2>/dev/null || { echo "Error: cannot clone $URL" >&2; exit 1; }
     # Commits are made by the sync machinery, not the user; give the clone a
     # self-contained identity and keep bytes exact across platforms.
     git -C "$BUS" config user.name "agmsg"
