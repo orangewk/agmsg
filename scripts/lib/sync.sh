@@ -48,6 +48,19 @@ sync_remote_url() { sync_conf_get url; }
 
 _sync_git() { git -C "$(sync_bus_dir)" "$@"; }
 
+# Network-touching git ops get a hard wall-clock bound where `timeout` exists
+# (Linux, CI, cloud sandboxes): an unroutable host would otherwise hang for
+# git's TCP connect timeout, freezing whatever called us — worst on the Stop
+# hook. Best-effort: without a timeout binary the ssh ConnectTimeout/BatchMode
+# set at `remote add` still bounds the ssh transport.
+_sync_net_git() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${AGMSG_SYNC_NET_TIMEOUT:-60}" git -C "$(sync_bus_dir)" "$@"
+  else
+    git -C "$(sync_bus_dir)" "$@"
+  fi
+}
+
 _sync_branch() { _sync_git rev-parse --abbrev-ref HEAD 2>/dev/null; }
 
 # scripts/ dir, resolved from this file (lib/..). SKILL_DIR fallback mirrors
@@ -106,6 +119,27 @@ sync_migrate() {
   agmsg_sqlite "$db" "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_uuid ON messages(uuid) WHERE uuid IS NOT NULL;"
 }
 
+# Throttled best-effort pull for polling loops (monitor-mode watchers). A
+# store-level marker shares the cadence across all watchers on this store, so
+# N parallel sessions do not each hit the network. Never fails the caller.
+#
+# The pull runs in a DETACHED background process: a foreground pull against an
+# unreachable remote would block the watcher's loop for git's connect timeout
+# and stall local delivery with it (PR #18 review P1). The marker (touched
+# synchronously, before spawning) throttles spawn rate; the sync lock inside
+# sync_op_pull serializes any overlap with other pulls/pushes.
+sync_pull_throttled() {
+  local interval="${1:-60}" marker now last
+  [ -f "$(sync_conf_path)" ] || return 0
+  marker="$(agmsg_storage_dir)/.lastpull"
+  now=$(date +%s)
+  last=$(compat_file_mtime "$marker" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( now - last )) -lt "$interval" ] && return 0
+  touch "$marker" 2>/dev/null || true
+  (bash "$(_sync_scripts_dir)/remote.sh" pull --quiet >/dev/null 2>&1 || true) &
+}
+
 # --- export / push -----------------------------------------------------------
 
 # Commit any leftover working-tree state from a sync that died between append
@@ -117,55 +151,97 @@ _sync_commit_dirty() {
   fi
 }
 
-# Append never-exported local rows to this environment's writer file and
+# A team name is safe to use as a bus directory name iff it cannot escape
+# events/ or smuggle git options. Mirrors lib/validate.sh's
+# agmsg_validate_team_name deny-list EXACTLY (empty, '.', '..', path
+# separators, leading '-', control chars) — anything join.sh accepts (UTF-8,
+# dotted names like '.foo') must replicate, or its messages would silently
+# never leave the machine (PR #18 review). Defense in depth against rows
+# written by older versions or by hand; join-validated rows always pass.
+_sync_team_pathsafe() {
+  case "$1" in
+    ''|.|..|*/*|*\\*|-*|*[[:cntrl:]]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Append never-exported local rows to their team's writer file for this
+# environment (events/<team>/<env-id>.<YYYYMM>.jsonl, ADR 0005 layout) and
 # commit. Does not touch the network.
 sync_export() {
-  local db bus env writer tmp_own new_events count
+  local db bus env month team team_sql writer tmp_own new_events count total fail
   db="$(agmsg_db_path)"
   [ -f "$db" ] || return 0
   bus="$(sync_bus_dir)"
   env="$(sync_env_id)"
-  sync_migrate "$db"
+  month=$(date +%Y%m)
+  sync_migrate "$db" || return 1
 
   # Assign ids to never-exported local rows. randomblob() re-evaluates per
   # row; second-precision timestamp + 8 random bytes is collision-safe at
-  # this scale and keeps the bus files roughly time-sorted.
+  # this scale and keeps the bus files roughly time-sorted. NOT an export
+  # cursor: the writer files are (a uuid-bearing row missing from them is
+  # still a candidate), so nothing is stranded if a later step fails.
   agmsg_sqlite "$db" "UPDATE messages
     SET uuid = strftime('%Y%m%dT%H%M%SZ','now') || '-' || lower(hex(randomblob(8)))
-    WHERE uuid IS NULL AND origin IS NULL;"
+    WHERE uuid IS NULL AND origin IS NULL;" || return 1
 
-  mkdir -p "$bus/events"
-  writer="$bus/events/$env.$(date +%Y%m).jsonl"
+  total=0
+  fail=0
+  while IFS= read -r team; do
+    [ -n "$team" ] || continue
+    if ! _sync_team_pathsafe "$team"; then
+      echo "agmsg sync: skipping export for path-unsafe team name: $team" >&2
+      continue
+    fi
+    team_sql=$(printf %s "$team" | sed "s/'/''/g")
+    mkdir -p "$bus/events/$team"
+    writer="$bus/events/$team/$env.$month.jsonl"
 
-  # Everything already in our own writer files (any month) is exported;
-  # collapse their lines into one JSON array for the NOT IN below.
-  tmp_own=$(mktemp)
-  # `|| true` inside the group: on first export there are no own files, the
-  # glob stays literal and cat fails — that must not kill the pipeline under
-  # a caller's pipefail; awk still emits the empty array.
-  { cat "$bus/events/$env."*.jsonl 2>/dev/null || true; } \
-    | awk 'BEGIN{printf "["} NF{if(n++)printf ","; printf "%s",$0} END{print "]"}' \
-    > "$tmp_own"
+    # Everything already in our own writer files for this team (any month)
+    # is exported; collapse their lines into one JSON array for the NOT IN.
+    tmp_own=$(mktemp)
+    # `|| true` inside the group: on first export there are no own files, the
+    # glob stays literal and cat fails — that must not kill the pipeline under
+    # a caller's pipefail; awk still emits the empty array.
+    { cat "$bus/events/$team/$env."*.jsonl 2>/dev/null || true; } \
+      | awk 'BEGIN{printf "["} NF{if(n++)printf ","; printf "%s",$0} END{print "]"}' \
+      > "$tmp_own"
 
-  new_events=$(agmsg_sqlite "$db" "
-    SELECT json_object(
-      'id', uuid, 'env', '$env', 'team', team,
-      'from', from_agent, 'to', to_agent,
-      'body', body, 'created_at', created_at)
-    FROM messages
-    WHERE origin IS NULL AND uuid IS NOT NULL
-      AND uuid NOT IN (
-        SELECT json_extract(value, '\$.id')
-        FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp_own")')))
-    ORDER BY id ASC;")
-  rm -f "$tmp_own"
+    # Capture the query's own exit status: callers run us inside an `if`
+    # (errexit suppressed), so a sqlite failure here must be aggregated by
+    # hand or the op would report success on a store it couldn't read.
+    if ! new_events=$(agmsg_sqlite "$db" "
+      SELECT json_object(
+        'id', uuid, 'env', '$env', 'team', team,
+        'from', from_agent, 'to', to_agent,
+        'body', body, 'created_at', created_at)
+      FROM messages
+      WHERE origin IS NULL AND uuid IS NOT NULL AND team = '$team_sql'
+        AND uuid NOT IN (
+          SELECT json_extract(value, '\$.id')
+          FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp_own")')))
+      ORDER BY id ASC;"); then
+      fail=1
+      rm -f "$tmp_own"
+      continue
+    fi
+    rm -f "$tmp_own"
 
-  if [ -n "$new_events" ]; then
-    printf '%s\n' "$new_events" >> "$writer"
-    count=$(printf '%s\n' "$new_events" | wc -l | tr -d ' ')
+    if [ -n "$new_events" ]; then
+      printf '%s\n' "$new_events" >> "$writer"
+      count=$(printf '%s\n' "$new_events" | wc -l | tr -d ' ')
+      total=$(( total + count ))
+    fi
+  done <<EOF
+$(agmsg_sqlite "$db" "SELECT DISTINCT team FROM messages WHERE origin IS NULL AND uuid IS NOT NULL;")
+EOF
+
+  if [ "$total" -gt 0 ]; then
     _sync_git add -A events >/dev/null 2>&1
-    _sync_git commit -q -m "sync: $env $count event(s)" >/dev/null 2>&1 || true
+    _sync_git commit -q -m "sync: $env $total event(s)" >/dev/null 2>&1 || true
   fi
+  return "$fail"
 }
 
 # Push local bus commits. On a ref race, rebase onto the remote and retry —
@@ -174,8 +250,8 @@ sync_push_remote() {
   local branch attempt
   branch="$(_sync_branch)" || return 1
   for attempt in 1 2 3 4; do
-    _sync_git push -q -u origin "$branch" >/dev/null 2>&1 && return 0
-    _sync_git pull --rebase -q origin "$branch" >/dev/null 2>&1 || true
+    _sync_net_git push -q -u origin "$branch" >/dev/null 2>&1 && return 0
+    _sync_net_git pull --rebase -q origin "$branch" >/dev/null 2>&1 || true
     [ "$attempt" -lt 4 ] && sleep "$attempt"
   done
   return 1
@@ -186,26 +262,38 @@ sync_push_remote() {
 sync_pull_remote() {
   local branch
   branch="$(_sync_branch)" || return 1
-  _sync_git pull --rebase -q origin "$branch" >/dev/null 2>&1
+  _sync_net_git pull --rebase -q origin "$branch" >/dev/null 2>&1
 }
 
 # Load every other environment's writer files into the local store. Purely
 # local; call sync_pull_remote first to fetch fresh events.
+#
+# Reads both the ADR 0005 per-team layout (events/<team>/<env>.jsonl) and the
+# flat pre-team layout (events/<env>.jsonl) a v0 exporter may have left on the
+# bus. The event's team field is authoritative either way — the path is only
+# a namespace.
 sync_import() {
-  local db bus env f tmp
+  local db bus env f tmp fail
   db="$(agmsg_db_path)"
   [ -f "$db" ] || bash "$(_sync_scripts_dir)/internal/init-db.sh" >/dev/null
-  sync_migrate "$db"
+  sync_migrate "$db" || return 1
   bus="$(sync_bus_dir)"
   env="$(sync_env_id)"
+  fail=0
 
-  for f in "$bus/events/"*.jsonl; do
-    [ -e "$f" ] || break
+  # The dot-prefixed globs pick up dotted team dirs like events/.foo/ (a
+  # valid join.sh team name) that plain `*` skips; `.[!.]*` and `..?*`
+  # together match every dot-name except the `.`/`..` entries themselves.
+  for f in "$bus/events/"*.jsonl "$bus/events/"*/*.jsonl \
+           "$bus/events/".[!.]*/*.jsonl "$bus/events/"..?*/*.jsonl; do
+    [ -e "$f" ] || continue
     case "$(basename "$f")" in "$env".*) continue ;; esac
     tmp=$(mktemp)
     awk 'BEGIN{printf "["} NF{if(n++)printf ","; printf "%s",$0} END{print "]"}' "$f" > "$tmp"
     # OR IGNORE + the unique uuid index: rows already imported (or duplicate
-    # lines left by a crashed exporter) are skipped, not duplicated.
+    # lines left by a crashed exporter) are skipped, not duplicated. A failed
+    # insert (corrupt store, malformed file) is aggregated, not swallowed —
+    # callers run inside `if` where errexit cannot see it.
     agmsg_sqlite "$db" "
       INSERT OR IGNORE INTO messages (uuid, origin, team, from_agent, to_agent, body, created_at)
       SELECT json_extract(value, '\$.id'),
@@ -215,42 +303,53 @@ sync_import() {
              json_extract(value, '\$.to'),
              json_extract(value, '\$.body'),
              json_extract(value, '\$.created_at')
-      FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp")'));"
+      FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp")'));" || fail=1
     rm -f "$tmp"
   done
+  return "$fail"
 }
 
 # --- top-level operations ----------------------------------------------------
 # pull = fetch remote events into the local store (what the Stop hook runs).
 # push = export local rows and push them out (what send.sh backgrounds).
-# Both are best-effort on the network: offline leaves everything consistent
-# and the next sync catches up.
+#
+# Network failures are REPORTED, not swallowed: each op returns non-zero when
+# its fetch/push failed, so an explicit `remote.sh push` can tell the user the
+# message did not leave the machine (PR #14 review). The state itself is
+# always left consistent — events are already committed locally, and the next
+# sync catches up. Hook call sites stay best-effort by `|| true`-ing the call.
 
 sync_op_pull() {
   sync_configured || return 0
   sync_lock || return 1
+  local rc=0
   _sync_commit_dirty
-  sync_pull_remote || true
-  sync_import
+  sync_pull_remote || rc=1
+  sync_import || rc=1
   sync_unlock
+  return "$rc"
 }
 
 sync_op_push() {
   sync_configured || return 0
   sync_lock || return 1
+  local rc=0
   _sync_commit_dirty
-  sync_export
-  sync_push_remote || true
+  sync_export || rc=1
+  sync_push_remote || rc=1
   sync_unlock
+  return "$rc"
 }
 
 sync_op_sync() {
   sync_configured || return 0
   sync_lock || return 1
+  local rc=0
   _sync_commit_dirty
-  sync_pull_remote || true
-  sync_import
-  sync_export
-  sync_push_remote || true
+  sync_pull_remote || rc=1
+  sync_import || rc=1
+  sync_export || rc=1
+  sync_push_remote || rc=1
   sync_unlock
+  return "$rc"
 }

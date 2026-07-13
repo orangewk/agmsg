@@ -65,6 +65,13 @@ case "$ACTION" in
     git -C "$BUS" config user.name "agmsg"
     git -C "$BUS" config user.email "agmsg@localhost"
     git -C "$BUS" config core.autocrlf false
+    # Bound how long a dead network can stall a hook: a stalled HTTP transfer
+    # aborts after 20s, and ssh gives up connecting after 10s instead of
+    # hanging. BatchMode stops ssh from freezing a hook on an interactive
+    # prompt; key/host settings from ~/.ssh/config still apply.
+    git -C "$BUS" config http.lowSpeedLimit 1
+    git -C "$BUS" config http.lowSpeedTime 20
+    git -C "$BUS" config core.sshCommand "ssh -o ConnectTimeout=10 -o BatchMode=yes"
 
     # Environment id: names this machine's writer files on the bus. Hostname
     # for readability, random suffix for uniqueness (two laptops named
@@ -76,11 +83,18 @@ case "$ACTION" in
     printf 'url=%s\nenv_id=%s\n' "$URL" "$ENV_ID" > "$STORE_DIR/remote.conf"
 
     # A brand-new bus repo has an unborn HEAD; give it a root commit so every
-    # later pull/push has a branch to talk about.
+    # later pull/push has a branch to talk about. If that first push is
+    # rejected (no write access, protected branch), the binding would never
+    # work — roll it back and fail loudly instead of reporting "configured"
+    # for a bus this environment cannot write to (PR #18 review).
     if ! git -C "$BUS" rev-parse -q --verify HEAD >/dev/null 2>&1; then
       git -C "$BUS" commit -q --allow-empty -m "init bus"
-      git -C "$BUS" push -q -u origin "$(git -C "$BUS" rev-parse --abbrev-ref HEAD)" 2>/dev/null \
-        || echo "Warning: initial push failed; will retry on next sync" >&2
+      if ! git -C "$BUS" push -q -u origin "$(git -C "$BUS" rev-parse --abbrev-ref HEAD)" 2>/dev/null; then
+        rm -f "$STORE_DIR/remote.conf"
+        rm -rf "$BUS"
+        echo "Error: cannot push to $URL (no write access? protected branch?); remote NOT configured" >&2
+        exit 1
+      fi
     fi
     echo "Remote bus configured: $URL"
     echo "This environment's id: $ENV_ID"
@@ -105,24 +119,39 @@ case "$ACTION" in
     require_configured
     require_git
     trap sync_unlock EXIT
-    sync_op_pull
-    say "Pulled remote events into the local store"
+    if sync_op_pull; then
+      say "Pulled remote events into the local store"
+    else
+      echo "Error: could not fetch from the remote bus (offline? credentials?)." >&2
+      echo "Already-fetched events were imported; the rest arrive on the next successful pull." >&2
+      exit 1
+    fi
     ;;
 
   push)
     require_configured
     require_git
     trap sync_unlock EXIT
-    sync_op_push
-    say "Exported and pushed local messages"
+    if sync_op_push; then
+      say "Exported and pushed local messages"
+    else
+      echo "Error: could not push to the remote bus (offline? credentials? protected branch?)." >&2
+      echo "Messages are committed locally and will be pushed by the next successful push/sync." >&2
+      exit 1
+    fi
     ;;
 
   sync)
     require_configured
     require_git
     trap sync_unlock EXIT
-    sync_op_sync
-    say "Synced with remote bus"
+    if sync_op_sync; then
+      say "Synced with remote bus"
+    else
+      echo "Error: sync with the remote bus failed (offline? credentials?)." >&2
+      echo "Local state is consistent; the next successful sync catches up." >&2
+      exit 1
+    fi
     ;;
 
   remove)
