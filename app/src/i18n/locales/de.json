@@ -20,6 +20,8 @@
   },
   "sidebar": {
     "logoAlt": "agmsg",
+    "collapse": "Seitenleiste einklappen",
+    "expand": "Seitenleiste ausklappen",
     "newMenu": {
       "trigger": "＋ Neu ▾",
       "team": "Team…",
@@ -60,6 +62,10 @@
     "swapTitle": "Klicken, dann auf ein anderes Panel in diesem Tab klicken, um die Positionen zu tauschen"
   },
   "chat": {
+    "title": "Chat",
+    "minimize": "Minimieren",
+    "maximize": "Maximieren",
+    "restore": "Wiederherstellen",
     "peer": {
       "to": "→ {{to}}",
       "from": "{{from}} →"
@@ -71,7 +77,7 @@
     }
   },
   "composer": {
-    "asPrefix": "als",
+    "asLabel": "als {{appUser}}",
     "targetPlaceholder": "an…",
     "messagePlaceholder": "Nachricht",
     "sendButton": "senden",
@@ -148,6 +154,12 @@
       "layoutVertical": "Vertikal",
       "layoutHorizontal": "Horizontal",
       "layoutTile": "Kacheln"
+    },
+    "room": {
+      "hide": "Team-Raum ausblenden"
+    },
+    "chat": {
+      "hide": "Meinen Chat ausblenden"
     }
   },
   "terminal": {
@@ -175,6 +187,7 @@
     "paste": "Einsetzen",
     "selectAll": "Alles auswählen",
     "viewMenu": "Darstellung",
+    "showTeamRoom": "Team-Raum anzeigen",
     "showUserChat": "Meinen Chat anzeigen",
     "paneLayout": "Bereichslayout",
     "paneLayoutVertical": "Vertikal",
@@ -196,5 +209,8 @@
     "updateFailed": "Aktualisierung fehlgeschlagen: {{error}}",
     "upToDate": "Sie verwenden die neueste Version.",
     "noUpdatesTitle": "Keine Updates"
+  },
+  "stage": {
+    "emptyHint": "Klicke links auf ein Mitglied, um einen Agenten zu starten."
   }
 }

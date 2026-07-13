@@ -3,6 +3,15 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  Maximize2,
+  Minimize2,
+  Minus,
+  PanelLeftClose,
+  RectangleHorizontal,
+  Settings,
+  Users,
+} from "lucide-react";
 import { TerminalPane } from "./TerminalPane";
 import {
   AgentModal,
@@ -147,8 +156,30 @@ export default function App() {
   const [spawnTypes, setSpawnTypes] = useState<AgentType[]>([]);
   const [sidebarWidth, setSidebarWidth] = useState(200);
   const [chatHeight, setChatHeight] = useState(160);
+  // Collapses the team sidebar to an icon-only rail so panes get more width.
+  // Session-only (no persistence needed) — spawning/messaging a member isn't
+  // offered from the collapsed rail; expand to get back to the full list.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Popup the collapsed rail's team-icon button opens — team switching, the
+  // one thing the full sidebar's team <select> offers that needs a menu
+  // instead of a direct icon action at rail width. Settings is a direct
+  // button in the rail (same as the full view's gear icon), no popup needed.
+  const [railTeamMenu, setRailTeamMenu] = useState(false);
+  // Toggled from the native "View > Show Team Room" menu item — when off,
+  // the room tab itself disappears from the tab bar (not just its
+  // content), matching Show User Chat's own toggle just below it.
+  const [showTeamRoom, setShowTeamRoom] = useState(true);
   // Toggled from the native "View > Show User Chat" menu item.
   const [showUserChat, setShowUserChat] = useState(true);
+  // The app-user chat pane's 3 states (session-only, like sidebarCollapsed):
+  // "normal" (today's layout), "minimized" (collapses the history away,
+  // leaving just the composer row — the team room becomes the only log,
+  // fixing the double-log fatigue real users reported), "maximized" (the
+  // chat pane fills the whole content area, hiding the team room/agent
+  // panes — a focused 1:1 view). Windows-style min/max header buttons
+  // toggle these; clicking maximize while minimized (or vice versa) jumps
+  // straight to the other state, same as real OS window controls.
+  const [chatPaneState, setChatPaneState] = useState<"normal" | "minimized" | "maximized">("normal");
   // Team-room member filter: names the user has UN-checked (default: all shown).
   const [deselected, setDeselected] = useState<Set<string>>(new Set());
   // Team-room history paging: whether an older page exists, and whether one
@@ -170,6 +201,46 @@ export default function App() {
   const [windowMenu, setWindowMenu] = useState<{ windowId: string; x: number; y: number } | null>(
     null,
   );
+  // Right-click context menu over the Team Room tab itself: { x, y }. Just
+  // one action (Hide Team Room) — no per-window data needed, unlike windowMenu.
+  const [roomMenu, setRoomMenu] = useState<{ x: number; y: number } | null>(null);
+  // Same idea, over the app-user chat pane's own header: { x, y }.
+  const [chatMenu, setChatMenu] = useState<{ x: number; y: number } | null>(null);
+
+  // Closes every context/dropdown menu (koit: opening a second one while a
+  // first is still open used to stack both — right-clicking a different
+  // target, or clicking a different trigger button, never went through the
+  // background click-away handler that normally closes these, since it's
+  // a completely separate element being interacted with). Every
+  // menu-opening handler below calls this first.
+  const closeAllMenus = useCallback(() => {
+    setNewMenu(false);
+    setMemberMenu(null);
+    setPaneMenu(null);
+    setWindowMenu(null);
+    setRoomMenu(null);
+    setChatMenu(null);
+    setRailTeamMenu(false);
+  }, []);
+  // The two menus opened by clicking a trigger button (rather than
+  // right-clicking somewhere) toggle themselves off on a second click of
+  // their OWN button — closeAllMenus alone would fight that (it'd close
+  // then the plain !v toggle would immediately reopen it), so these check
+  // "is it already open" first and only close-all-others when opening fresh.
+  const toggleNewMenu = useCallback(() => {
+    if (newMenu) setNewMenu(false);
+    else {
+      closeAllMenus();
+      setNewMenu(true);
+    }
+  }, [newMenu, closeAllMenus]);
+  const toggleRailTeamMenu = useCallback(() => {
+    if (railTeamMenu) setRailTeamMenu(false);
+    else {
+      closeAllMenus();
+      setRailTeamMenu(true);
+    }
+  }, [railTeamMenu, closeAllMenus]);
   // Swap two panes' positions by name: click one pane's name to "pick it
   // up" (its id goes here), then click another pane's name in the same
   // window to swap. Click the same name again to cancel. Also doubles as
@@ -282,6 +353,27 @@ export default function App() {
   // The agmsg slash-command name, for the `/<cmd> actas <name>` boot prompt.
   useEffect(() => {
     invoke<string>("agmsg_command_name").then(setCmdName).catch(() => {});
+  }, []);
+
+  // Rust holds the only durable copy of these two flags (see view_visibility
+  // in lib.rs) — seed our state from there on mount rather than guessing
+  // `true`. Without this, a webview remount that doesn't restart the Rust
+  // process (Vite HMR during `tauri dev`, or any future webview reload)
+  // would reset these back to `true` while the native menu checkbox and
+  // Rust's own state kept whatever was last set, silently disagreeing.
+  useEffect(() => {
+    invoke<{ team_room: boolean; user_chat: boolean }>("view_visibility")
+      .then((v) => {
+        setShowTeamRoom(v.team_room);
+        setShowUserChat(v.user_chat);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Native "View > Show Team Room" menu checkbox toggles the room tab itself.
+  useEffect(() => {
+    const p = listen<boolean>("toggle-team-room", (e) => setShowTeamRoom(e.payload));
+    return () => void p.then((u) => u());
   }, []);
 
   // Native "View > Show User Chat" menu checkbox toggles the chat/composer panel.
@@ -689,6 +781,17 @@ export default function App() {
   // here or offered as spawn/move targets.
   const teamWindows = useMemo(() => windows.filter((w) => w.team === team), [windows, team]);
 
+  // If Show Team Room gets switched off while it's the active tab, land on
+  // whichever pane tab exists instead — the room tab itself is about to
+  // disappear from the bar, so "active" can't keep pointing at it. If there
+  // are no pane tabs either, there's genuinely nothing to switch to yet;
+  // the stage below shows a hint in that case rather than a blank area.
+  useEffect(() => {
+    if (!showTeamRoom && active === "room" && teamWindows.length > 0) {
+      setActive(teamWindows[0].id);
+    }
+  }, [showTeamRoom, active, teamWindows]);
+
   // Every window's leaf rects, computed once per render rather than per-pane
   // (computeRects walks the whole tree) — looked up by window id, then pane
   // id, in the panes.map below and again for each window's dividers.
@@ -809,8 +912,12 @@ export default function App() {
       e.preventDefault();
       const startX = e.clientX;
       const startW = sidebarWidth;
+      // 180, not 140 — narrower than that wraps the brand-row's + New
+      // button and the sidebar-title row's All/None filter links onto a
+      // second line (koit). Full collapse (the rail toggle) is the way to
+      // go narrower than a usable full sidebar now anyway.
       const onMove = (ev: MouseEvent) =>
-        setSidebarWidth(Math.max(140, Math.min(520, startW + ev.clientX - startX)));
+        setSidebarWidth(Math.max(180, Math.min(520, startW + ev.clientX - startX)));
       const onUp = () => {
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
@@ -843,6 +950,16 @@ export default function App() {
     },
     [chatHeight],
   );
+
+  // Chat pane min/max: clicking one while the OTHER state is active jumps
+  // straight there (minimize while maximized goes directly to minimized,
+  // not back through normal first) — same as real OS window controls.
+  const toggleChatMinimized = useCallback(() => {
+    setChatPaneState((s) => (s === "minimized" ? "normal" : "minimized"));
+  }, []);
+  const toggleChatMaximized = useCallback(() => {
+    setChatPaneState((s) => (s === "maximized" ? "normal" : "maximized"));
+  }, []);
 
   // Draggable pane dividers (issue #317). Same document-level drag-tracking
   // pattern as startSidebarDrag/startChatDrag above, but the ratio being
@@ -910,12 +1027,7 @@ export default function App() {
   return (
     <div
       className="app"
-      onClick={() => {
-        setNewMenu(false);
-        setMemberMenu(null);
-        setPaneMenu(null);
-        setWindowMenu(null);
-      }}
+      onClick={closeAllMenus}
       onDragOverCapture={(e) => {
         // WebKit doesn't reliably show a "no-drop" cursor just from
         // dropEffect = "none" — it only trusts that value once something in
@@ -986,134 +1098,263 @@ export default function App() {
         </div>
       )}
       <div className="body">
-        <aside className="sidebar" style={{ width: sidebarWidth }}>
-          <div className="sidebar-head" data-tauri-drag-region>
-            <div className="brand-row">
-              <img className="logo" src="/agmsg-logo.png" alt={t("sidebar.logoAlt")} />
-              <div className="new-wrap" onClick={(e) => e.stopPropagation()}>
-              <button className="new-btn" onClick={() => setNewMenu((v) => !v)}>
-                {t("sidebar.newMenu.trigger")}
+        <aside
+          className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"}
+          style={{ width: sidebarCollapsed ? undefined : sidebarWidth }}
+        >
+          {/* Collapse toggle — level with the traffic lights, expanded state
+              only (koit: it looked fine there, "closing is perfect"). At
+              44px wide the collapsed sidebar sits entirely under the
+              traffic-light cluster, so ANY button in this same slim strip
+              would overlap them there — collapsed state expands via the
+              agmsg mark itself instead (below), not a dedicated button. */}
+          {!sidebarCollapsed && (
+            <div className="sidebar-toggle-row" data-tauri-drag-region>
+              <button
+                className="sidebar-collapse-toggle"
+                title={t("sidebar.collapse")}
+                onClick={() => setSidebarCollapsed(true)}
+              >
+                <PanelLeftClose size={16} />
               </button>
-              {newMenu && (
-                <div className="new-menu">
-                  <button
-                    onClick={() => {
-                      setNewMenu(false);
-                      setModal({ kind: "team", firstRun: false });
-                    }}
-                  >
-                    {t("sidebar.newMenu.team")}
+            </div>
+          )}
+          {sidebarCollapsed ? (
+            // Icon-only rail (koit design): the agmsg mark (click to
+            // expand) → + (new team/agent, same menu as full view) → team
+            // icon (click opens a team-switch popup, replacing the
+            // <select>) → spacer → the app-user avatar + a settings button
+            // at the bottom. No running-dot / member list — spawning/
+            // messaging isn't offered from here at all. Icons are lucide
+            // (koit: prefer a real icon set over ad-hoc unicode
+            // glyphs/hand-drawn SVGs).
+            <div className="sidebar-collapsed-rail">
+              <button
+                className="rail-logo-mark-btn"
+                title={t("sidebar.expand")}
+                onClick={() => setSidebarCollapsed(false)}
+              >
+                <img className="rail-logo-mark" src="/agmsg-mark.png" alt={t("sidebar.logoAlt")} />
+              </button>
+
+              <div className="new-wrap" onClick={(e) => e.stopPropagation()}>
+                <button className="rail-icon-btn" title={t("sidebar.newMenu.trigger")} onClick={toggleNewMenu}>
+                  +
+                </button>
+                {newMenu && (
+                  <div className="new-menu rail-popup">
+                    <button
+                      onClick={() => {
+                        setNewMenu(false);
+                        setModal({ kind: "team", firstRun: false });
+                      }}
+                    >
+                      {t("sidebar.newMenu.team")}
+                    </button>
+                    <button
+                      disabled={!team}
+                      onClick={() => {
+                        setNewMenu(false);
+                        setModal({ kind: "agent" });
+                        invoke<AgentType[]>("agmsg_spawnable_types")
+                          .then(setSpawnTypes)
+                          .catch(() => {});
+                      }}
+                    >
+                      {t("sidebar.newMenu.agent")}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {team && (
+                <div className="rail-menu-wrap" onClick={(e) => e.stopPropagation()}>
+                  <button className="rail-icon-btn" title={team} onClick={toggleRailTeamMenu}>
+                    <Users size={16} />
                   </button>
-                  <button
-                    disabled={!team}
-                    onClick={() => {
-                      setNewMenu(false);
-                      setModal({ kind: "agent" });
-                      // Refresh in case spawn-options.yaml or a new type
-                      // manifest showed up since app start.
-                      invoke<AgentType[]>("agmsg_spawnable_types")
-                        .then(setSpawnTypes)
-                        .catch(() => {});
-                    }}
-                  >
-                    {t("sidebar.newMenu.agent")}
-                  </button>
+                  {railTeamMenu && (
+                    <div className="ctx-menu rail-popup">
+                      {teams.map((teamName) => (
+                        <button
+                          key={teamName}
+                          className={teamName === team ? "active" : undefined}
+                          onClick={() => {
+                            setTeam(teamName);
+                            setRailTeamMenu(false);
+                          }}
+                        >
+                          {teamName}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
-              </div>
-            </div>
-            <select value={team} onChange={(e) => setTeam(e.target.value)}>
-              {teams.map((teamName) => (
-                <option key={teamName} value={teamName}>
-                  {teamName}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="sidebar-title">
-            <span>{t("sidebar.title")}</span>
-            {active === "room" && others.length > 0 && (
-              <span className="filter-actions">
-                <button onClick={selectAllMembers}>{t("sidebar.filter.all")}</button>
-                <span>·</span>
-                <button onClick={selectNoMembers}>{t("sidebar.filter.none")}</button>
-              </span>
-            )}
-          </div>
-          <ul className="members">
-            {others.map((m) => (
-              <li
-                key={m.name}
-                className="member-row"
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setMemberMenu({ member: m, x: e.clientX, y: e.clientY });
-                }}
-              >
-                {active === "room" && (
-                  <input
-                    type="checkbox"
-                    className="member-check"
-                    title={t("sidebar.member.checkboxTitle")}
-                    checked={!deselected.has(m.name)}
-                    onChange={() => toggleMember(m.name)}
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                )}
+
+              <div className="rail-spacer" />
+
+              {appUser && (
                 <button
-                  className="member"
-                  onClick={() => spawnMember(m)}
-                  title={
-                    panes.some((p) => p.label === m.name)
-                      ? t("sidebar.member.titleRunning")
-                      : t("sidebar.member.titleSpawn")
-                  }
+                  className="rail-avatar-btn"
+                  title={t("sidebar.expand")}
+                  onClick={() => setSidebarCollapsed(false)}
                 >
-                  <span className="member-name">
-                    {m.name}
-                    {panes.some((p) => p.label === m.name) && <span className="running-dot" />}
-                  </span>
-                  <span className="member-types">
-                    {m.types.join(", ") || t("sidebar.member.noTypes")}
-                  </span>
+                  <span className="avatar" title={t("sidebar.user.title", { team })} />
                 </button>
-              </li>
-            ))}
-            {others.length === 0 && (
-              <li className="empty">{t("sidebar.member.emptyState")}</li>
-            )}
-          </ul>
-          {appUser && (
-            <div className="sidebar-user" title={t("sidebar.user.title", { team })}>
-              <span className="avatar" />
-              <div className="su-meta">
-                <span className="su-name">{appUser}</span>
-                <span className="su-team">{team}</span>
-              </div>
+              )}
               <button
-                className="settings-btn"
+                className="rail-icon-btn"
                 title={t("settings.title")}
                 onClick={(e) => {
                   e.stopPropagation();
                   setModal({ kind: "settings" });
                 }}
               >
-                ⚙
+                <Settings size={16} />
               </button>
             </div>
+          ) : (
+            <>
+              <div className="sidebar-head" data-tauri-drag-region>
+                <div className="brand-row">
+                  <img className="logo" src="/agmsg-logo.png" alt={t("sidebar.logoAlt")} />
+                  <div className="new-wrap" onClick={(e) => e.stopPropagation()}>
+                  <button className="new-btn" onClick={toggleNewMenu}>
+                    {t("sidebar.newMenu.trigger")}
+                  </button>
+                  {newMenu && (
+                    <div className="new-menu">
+                      <button
+                        onClick={() => {
+                          setNewMenu(false);
+                          setModal({ kind: "team", firstRun: false });
+                        }}
+                      >
+                        {t("sidebar.newMenu.team")}
+                      </button>
+                      <button
+                        disabled={!team}
+                        onClick={() => {
+                          setNewMenu(false);
+                          setModal({ kind: "agent" });
+                          // Refresh in case spawn-options.yaml or a new type
+                          // manifest showed up since app start.
+                          invoke<AgentType[]>("agmsg_spawnable_types")
+                            .then(setSpawnTypes)
+                            .catch(() => {});
+                        }}
+                      >
+                        {t("sidebar.newMenu.agent")}
+                      </button>
+                    </div>
+                  )}
+                  </div>
+                </div>
+                <select value={team} onChange={(e) => setTeam(e.target.value)}>
+                  {teams.map((teamName) => (
+                    <option key={teamName} value={teamName}>
+                      {teamName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="sidebar-title">
+                <span>{t("sidebar.title")}</span>
+                {active === "room" && others.length > 0 && (
+                  <span className="filter-actions">
+                    <button onClick={selectAllMembers}>{t("sidebar.filter.all")}</button>
+                    <span>·</span>
+                    <button onClick={selectNoMembers}>{t("sidebar.filter.none")}</button>
+                  </span>
+                )}
+              </div>
+              <ul className="members">
+                {others.map((m) => (
+                  <li
+                    key={m.name}
+                    className="member-row"
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      closeAllMenus();
+                      setMemberMenu({ member: m, x: e.clientX, y: e.clientY });
+                    }}
+                  >
+                    {active === "room" && (
+                      <input
+                        type="checkbox"
+                        className="member-check"
+                        title={t("sidebar.member.checkboxTitle")}
+                        checked={!deselected.has(m.name)}
+                        onChange={() => toggleMember(m.name)}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    )}
+                    <button
+                      className="member"
+                      onClick={() => spawnMember(m)}
+                      title={
+                        panes.some((p) => p.label === m.name)
+                          ? t("sidebar.member.titleRunning")
+                          : t("sidebar.member.titleSpawn")
+                      }
+                    >
+                      <span className="member-name">
+                        {m.name}
+                        {panes.some((p) => p.label === m.name) && <span className="running-dot" />}
+                      </span>
+                      <span className="member-types">
+                        {m.types.join(", ") || t("sidebar.member.noTypes")}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+                {others.length === 0 && (
+                  <li className="empty">{t("sidebar.member.emptyState")}</li>
+                )}
+              </ul>
+              {appUser && (
+                <div className="sidebar-user" title={t("sidebar.user.title", { team })}>
+                  <span className="avatar" />
+                  <div className="su-meta">
+                    <span className="su-name">{appUser}</span>
+                    <span className="su-team">{team}</span>
+                  </div>
+                  <button
+                    className="settings-btn"
+                    title={t("settings.title")}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setModal({ kind: "settings" });
+                    }}
+                  >
+                    <Settings size={15} />
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </aside>
 
-        <div className="divider-v" onMouseDown={startSidebarDrag} />
+        {!sidebarCollapsed && <div className="divider-v" onMouseDown={startSidebarDrag} />}
 
         <main className="main">
-          <nav className="tabs" data-tauri-drag-region>
-            <span className={active === "room" ? "tab active" : "tab"}>
-              <button className="tab-label" onClick={() => setActive("room")}>
-                {t("tabs.roomLabel")}
-              </button>
-            </span>
+          <nav className="tabs" data-tauri-drag-region hidden={showUserChat && chatPaneState === "maximized"}>
+            {showTeamRoom && (
+              <span
+                className={active === "room" ? "tab active" : "tab"}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeAllMenus();
+                  setRoomMenu({ x: e.clientX, y: e.clientY });
+                }}
+              >
+                <button className="tab-label" onClick={() => setActive("room")}>
+                  {t("tabs.roomLabel")}
+                </button>
+              </span>
+            )}
             {teamWindows.map((w) => (
               <span
                 key={w.id}
@@ -1126,6 +1367,7 @@ export default function App() {
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  closeAllMenus();
                   setWindowMenu({ windowId: w.id, x: e.clientX, y: e.clientY });
                 }}
                 onDragOver={(e) => {
@@ -1204,10 +1446,10 @@ export default function App() {
             />
           </nav>
 
-          <section className="stage">
+          <section className="stage" hidden={showUserChat && chatPaneState === "maximized"}>
             <div
               className="room"
-              hidden={active !== "room"}
+              hidden={active !== "room" || !showTeamRoom}
               ref={feedRef}
               onScroll={(e) => {
                 if (e.currentTarget.scrollTop < 60) void loadOlderMessages();
@@ -1231,6 +1473,13 @@ export default function App() {
               ))}
               {messages.length === 0 && <div className="empty">{t("room.emptyState")}</div>}
             </div>
+
+            {/* Show Team Room is off AND no pane tabs exist yet — the stage
+                would otherwise be entirely blank (no room, nothing else to
+                switch "active" to). */}
+            {!showTeamRoom && teamWindows.length === 0 && (
+              <div className="stage-empty-hint">{t("stage.emptyHint")}</div>
+            )}
 
             {/* Every pane is a permanent, flat child of .stage — its window only
                 decides WHERE it's positioned (computeRects, from its split
@@ -1316,6 +1565,7 @@ export default function App() {
                     onContextMenu={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
+                      closeAllMenus();
                       setPaneMenu({ paneId: p.id, windowId: win.id, x: e.clientX, y: e.clientY });
                     }}
                   >
@@ -1405,75 +1655,127 @@ export default function App() {
               ))}
           </section>
 
-          {showUserChat && <div className="divider-h" onMouseDown={startChatDrag} />}
+          {showUserChat && chatPaneState === "normal" && (
+            <div className="divider-h" onMouseDown={startChatDrag} />
+          )}
 
           {/* App-user chat: the human's own send/receive thread + composer.
-              Hidden via View > Show User Chat (native menu checkbox). Clicking
-              the history jumps focus to the composer input below — the
-              history itself has nothing to focus (nothing to type into), so
-              without this the border-on-focus feedback here was invisible in
-              normal use. */}
+              Hidden via View > Show User Chat (native menu checkbox).
+              min/max header buttons toggle chatPaneState between normal,
+              minimized (history collapsed away — just the composer row,
+              fixing the "my own messages show twice" fatigue real users
+              reported once the room already shows everything), and
+              maximized (fills the whole content area, hiding the team
+              room/agent panes — a focused 1:1 view). Clicking the history
+              jumps focus to the composer input below — the history itself
+              has nothing to focus (nothing to type into), so without this
+              the border-on-focus feedback here was invisible in normal use. */}
           <div
-            className="appuser-chat"
-            ref={chatRef}
-            style={{ height: chatHeight }}
+            className={`appuser-chat-wrap state-${chatPaneState}`}
+            style={chatPaneState === "normal" ? { height: chatHeight } : undefined}
             hidden={!showUserChat}
-            onClick={() => composerInputRef.current?.focus()}
           >
-            {myThread.map((m) => (
-              <div className={m.from === appUser ? "chat-line out" : "chat-line in"} key={m.id}>
-                <span className="chat-time">{m.created_at.slice(11, 19)}</span>
-                <span className="chat-peer">
-                  {m.from === appUser
-                    ? t("chat.peer.to", { to: m.to })
-                    : t("chat.peer.from", { from: m.from })}
-                </span>
-                <span className="chat-body">{m.body}</span>
-              </div>
-            ))}
-            {appUser && myThread.length === 0 && (
-              <div className="empty">{t("chat.emptyState.withUser", { appUser })}</div>
-            )}
-            {!appUser && team && (
-              <div className="empty">
-                {t("chat.emptyState.noUser")}
-                <button className="link" onClick={() => setModal({ kind: "appuser" })}>
-                  {t("chat.emptyState.addOne")}
+            <div
+              className="appuser-chat-header"
+              data-tauri-drag-region
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                closeAllMenus();
+                setChatMenu({ x: e.clientX, y: e.clientY });
+              }}
+            >
+              <span className="appuser-chat-title">{t("chat.title")}</span>
+              <div className="appuser-chat-controls">
+                <button
+                  className="chat-ctrl-btn"
+                  title={chatPaneState === "minimized" ? t("chat.restore") : t("chat.minimize")}
+                  onClick={toggleChatMinimized}
+                >
+                  {chatPaneState === "minimized" ? <RectangleHorizontal size={14} /> : <Minus size={14} />}
+                </button>
+                <button
+                  className="chat-ctrl-btn"
+                  title={chatPaneState === "maximized" ? t("chat.restore") : t("chat.maximize")}
+                  onClick={toggleChatMaximized}
+                >
+                  {chatPaneState === "maximized" ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                 </button>
               </div>
-            )}
-          </div>
+            </div>
 
-          <footer className="composer" hidden={!showUserChat}>
-            {appUser ? (
-              <>
-                <span className="as">
-                  {t("composer.asPrefix")} <b>{appUser}</b>
-                </span>
-                <select value={target} onChange={(e) => setTarget(e.target.value)}>
-                  <option value="">{t("composer.targetPlaceholder")}</option>
-                  {others.map((m) => (
-                    <option key={m.name} value={m.name}>
-                      {m.name}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  ref={composerInputRef}
-                  value={draft}
-                  placeholder={t("composer.messagePlaceholder")}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => isSubmitEnter(e) && send()}
-                  {...imeCompositionProps}
-                />
-                <button onClick={send} disabled={!draft.trim() || !target}>
-                  {t("composer.sendButton")}
-                </button>
-              </>
-            ) : (
-              <span className="as">{t("composer.noAppUser")}</span>
+            {chatPaneState !== "minimized" && (
+              <div className="appuser-chat" ref={chatRef} onClick={() => composerInputRef.current?.focus()}>
+                {myThread.map((m) => (
+                  <div className={m.from === appUser ? "chat-line out" : "chat-line in"} key={m.id}>
+                    <span className="chat-time">{m.created_at.slice(11, 19)}</span>
+                    <span className="chat-peer">
+                      {m.from === appUser
+                        ? t("chat.peer.to", { to: m.to })
+                        : t("chat.peer.from", { from: m.from })}
+                    </span>
+                    <span className="chat-body">{m.body}</span>
+                  </div>
+                ))}
+                {appUser && myThread.length === 0 && (
+                  <div className="empty">{t("chat.emptyState.withUser", { appUser })}</div>
+                )}
+                {!appUser && team && (
+                  <div className="empty">
+                    {t("chat.emptyState.noUser")}
+                    <button className="link" onClick={() => setModal({ kind: "appuser" })}>
+                      {t("chat.emptyState.addOne")}
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
-          </footer>
+
+            <footer className="composer">
+              {appUser ? (
+                <>
+                  <span className="as">
+                    {/* Word order around the name varies by language (English
+                        "as X" puts it after; Japanese "X として" puts it
+                        before) — asLabel is the whole template with a literal
+                        "{{appUser}}" placeholder, split here so only the name
+                        itself renders bold, wherever the translation puts it. */}
+                    {(() => {
+                      const [before, after] = t("composer.asLabel").split("{{appUser}}");
+                      return (
+                        <>
+                          {before}
+                          <b>{appUser}</b>
+                          {after}
+                        </>
+                      );
+                    })()}
+                  </span>
+                  <select value={target} onChange={(e) => setTarget(e.target.value)}>
+                    <option value="">{t("composer.targetPlaceholder")}</option>
+                    {others.map((m) => (
+                      <option key={m.name} value={m.name}>
+                        {m.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    ref={composerInputRef}
+                    value={draft}
+                    placeholder={t("composer.messagePlaceholder")}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => isSubmitEnter(e) && send()}
+                    {...imeCompositionProps}
+                  />
+                  <button onClick={send} disabled={!draft.trim() || !target}>
+                    {t("composer.sendButton")}
+                  </button>
+                </>
+              ) : (
+                <span className="as">{t("composer.noAppUser")}</span>
+              )}
+            </footer>
+          </div>
         </main>
       </div>
 
@@ -1696,6 +1998,40 @@ export default function App() {
             </div>
           );
         })()}
+
+      {roomMenu && (
+        <div className="ctx-menu" style={{ left: roomMenu.x, top: roomMenu.y }} onClick={(e) => e.stopPropagation()}>
+          <button
+            onClick={() => {
+              setShowTeamRoom(false);
+              setRoomMenu(null);
+              // Keeps the native View > Show Team Room checkbox in sync —
+              // it's not the surface that changed this, so Rust's own copy
+              // of the toggle state would otherwise go stale.
+              void invoke("set_team_room_visible", { visible: false });
+            }}
+          >
+            {t("ctxMenu.room.hide")}
+          </button>
+        </div>
+      )}
+
+      {chatMenu && (
+        <div className="ctx-menu" style={{ left: chatMenu.x, top: chatMenu.y }} onClick={(e) => e.stopPropagation()}>
+          <button
+            onClick={() => {
+              setShowUserChat(false);
+              setChatMenu(null);
+              // Keeps the native View > Show User Chat checkbox in sync —
+              // it's not the surface that changed this, so Rust's own copy
+              // of the toggle state would otherwise go stale.
+              void invoke("set_user_chat_visible", { visible: false });
+            }}
+          >
+            {t("ctxMenu.chat.hide")}
+          </button>
+        </div>
+      )}
 
       {windowMenu &&
         (() => {
