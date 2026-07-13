@@ -259,6 +259,35 @@ sqlite_mem_db() {
   grep -q "second life" "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl
 }
 
+@test "bootstrap: one shot sets up store, identity, and bus; re-run is a no-op (#17)" {
+  run bash "$SCRIPTS/remote.sh" bootstrap "$TEST_SKILL_DIR/bus.git" \
+    --team busteam --agent reborn-agent --type claude-code --project /tmp/project-x --env-id boot-1
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Bootstrap complete" ]]
+  [ "$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")" = "boot-1" ]
+  # Identity resolved.
+  run bash "$SCRIPTS/whoami.sh" /tmp/project-x claude-code
+  [[ "$output" =~ "reborn-agent" ]]
+  # Second boot of the "same" environment: silently idempotent.
+  run bash "$SCRIPTS/remote.sh" bootstrap "$TEST_SKILL_DIR/bus.git" \
+    --team busteam --agent reborn-agent --type claude-code --project /tmp/project-x --env-id boot-1
+  [ "$status" -eq 0 ]
+}
+
+@test "bootstrap: delivers messages that arrived while the environment was dead (#17)" {
+  connect_both
+  bash "$SCRIPTS/send.sh" testteam alice bob "sent while B was down" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  # Environment C is born fresh and bootstraps as bob's new home.
+  ENV_C="$TEST_SKILL_DIR/db-c"
+  mkdir -p "$ENV_C"
+  AGMSG_STORAGE_PATH="$ENV_C" run bash "$SCRIPTS/remote.sh" bootstrap "$TEST_SKILL_DIR/bus.git" \
+    --team testteam --agent bob --type claude-code --project /tmp/project-b --env-id env-c
+  [ "$status" -eq 0 ]
+  AGMSG_STORAGE_PATH="$ENV_C" run bash "$SCRIPTS/inbox.sh" testteam bob
+  [[ "$output" =~ "sent while B was down" ]]
+}
+
 @test "add: pre-existing history stays local by default (#19)" {
   bash "$SCRIPTS/send.sh" testteam alice bob "old secret one" >/dev/null
   bash "$SCRIPTS/send.sh" testteam alice bob "old secret two" >/dev/null

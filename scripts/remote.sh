@@ -6,7 +6,12 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 # Manage the git-backed remote transport (ADR 0005): replicate messages
 # between environments through a private "bus" git repository.
 #
-# Usage: remote.sh add <git-url>     configure this store's bus and clone it
+# Usage: remote.sh add <git-url> [--include-history] [--env-id <id>]
+#                                    configure this store's bus and clone it
+#        remote.sh bootstrap <git-url> --team <team> --agent <name> \
+#                  [--type <type>] [--project <path>] [--env-id <id>] [--include-history]
+#                                    one-shot idempotent setup for ephemeral
+#                                    environments: init store, join, add, pull
 #        remote.sh status            show bus url, env id, pending counts
 #        remote.sh sync              pull + import, then export + push
 #        remote.sh pull              fetch remote events into the local store
@@ -15,7 +20,7 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 #
 # pull/push/sync accept --quiet (suppress the one-line summary).
 
-ACTION="${1:?Usage: remote.sh add|status|sync|pull|push|remove ...}"
+ACTION="${1:?Usage: remote.sh add|bootstrap|status|sync|pull|push|remove ...}"
 shift || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -155,6 +160,43 @@ case "$ACTION" in
     fi
     ;;
 
+  bootstrap)
+    # One line in an ephemeral environment's setup script (SessionStart hook,
+    # container boot) replaces the manual join + add + pull dance (#17).
+    # Every step is idempotent, so running it on every boot is safe.
+    B_URL="${1:?Usage: remote.sh bootstrap <git-url> --team <team> --agent <name> [--type <type>] [--project <path>] [--env-id <id>] [--include-history]}"
+    shift || true
+    B_TEAM="" B_AGENT="" B_TYPE="claude-code" B_PROJECT="$PWD" B_ENV_ID="${AGMSG_ENV_ID:-}" B_HISTORY=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --team) B_TEAM="${2:?--team needs a value}"; shift 2 ;;
+        --agent) B_AGENT="${2:?--agent needs a value}"; shift 2 ;;
+        --type) B_TYPE="${2:?--type needs a value}"; shift 2 ;;
+        --project) B_PROJECT="${2:?--project needs a value}"; shift 2 ;;
+        --env-id) B_ENV_ID="${2:?--env-id needs a value}"; shift 2 ;;
+        --include-history) B_HISTORY="--include-history"; shift ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$B_TEAM" ] || { echo "Error: bootstrap requires --team" >&2; exit 1; }
+    [ -n "$B_AGENT" ] || { echo "Error: bootstrap requires --agent" >&2; exit 1; }
+    require_git
+
+    bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
+    # join.sh tolerates re-joins (same name adds a registration, not a dup).
+    bash "$SCRIPT_DIR/join.sh" "$B_TEAM" "$B_AGENT" "$B_TYPE" "$B_PROJECT"
+    # shellcheck disable=SC2086  # B_HISTORY is deliberately word-split ('' or one flag)
+    if [ -n "$B_ENV_ID" ]; then
+      bash "$SCRIPT_DIR/remote.sh" add "$B_URL" --env-id "$B_ENV_ID" $B_HISTORY
+    else
+      bash "$SCRIPT_DIR/remote.sh" add "$B_URL" $B_HISTORY
+    fi
+    # First pull so anything sent while this environment was dead is already
+    # in the store before the first inbox check.
+    bash "$SCRIPT_DIR/remote.sh" pull --quiet || echo "Warning: initial pull failed; the next sync catches up" >&2
+    echo "Bootstrap complete: $B_AGENT @ $B_TEAM on $B_URL"
+    ;;
+
   status)
     require_configured
     DB="$(agmsg_db_path)"
@@ -219,7 +261,7 @@ case "$ACTION" in
     ;;
 
   *)
-    echo "Unknown action: $ACTION (use add|status|sync|pull|push|remove)" >&2
+    echo "Unknown action: $ACTION (use add|bootstrap|status|sync|pull|push|remove)" >&2
     exit 1
     ;;
 esac

@@ -52,6 +52,24 @@ remote.sh remove          # forget the bus; local messages are kept
 `sync` is what you run by hand when you want to force a round trip; the
 hooks call `pull`/`push` automatically.
 
+## Ephemeral environments (cloud sandboxes)
+
+A recycled container forgets its store, identity, and bus binding. Put one
+idempotent line in the environment's setup script (or SessionStart hook)
+and every fresh container comes back as the same agent:
+
+```bash
+~/.agents/skills/agmsg/scripts/remote.sh bootstrap git@github.com:you/agmsg-bus.git \
+  --team myteam --agent cloudy --env-id cloud-main
+```
+
+It initializes the store, joins the team, binds the bus, and pulls anything
+that arrived while the environment was dead. The pinned `--env-id` (or
+`AGMSG_ENV_ID`) makes the reborn environment resume its own writer files
+instead of littering the bus with one-shot ids — run at most ONE live
+instance per pinned id, or two writers would share a file and break the
+no-conflict guarantee.
+
 ## How it works
 
 - Each environment gets an **env id** (`<hostname>-<random>`) at `add` time

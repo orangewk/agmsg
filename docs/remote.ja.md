@@ -35,6 +35,17 @@ remote.sh remove          # バスへの紐付けを解除(ローカルのメッ
 
 `sync` は手動で往復同期を強制したいときに使う。フックは自動で `pull`/`push` を呼ぶ。
 
+## 使い捨て環境(クラウドサンドボックス)
+
+回収されたコンテナはストアもアイデンティティもバス設定も忘れる。環境のセットアップスクリプト(または SessionStart フック)に冪等な1行を置いておけば、新しいコンテナは毎回同じエージェントとして帰ってくる:
+
+```bash
+~/.agents/skills/agmsg/scripts/remote.sh bootstrap git@github.com:you/agmsg-bus.git \
+  --team myteam --agent cloudy --env-id cloud-main
+```
+
+ストアの初期化、チームへの join、バスへの紐付け、そして死んでいた間に届いたメッセージの pull までを行う。`--env-id`(または `AGMSG_ENV_ID`)で固定した id により、再生成された環境は自分の writer ファイルに追記を再開し、使い捨て id でバスを散らかさない。**固定 id につき同時に生かすインスタンスは1つまで** — 2つ同時に動かすと writer ファイルを共有してしまい、無コンフリクト保証が崩れる。
+
 ## 仕組み
 
 - 各環境は `add` 時に **env id**(`<ホスト名>-<ランダム>`)を得て、バス上では自分専用の writer ファイル `events/<team>/<env-id>.<YYYYMM>.jsonl` にのみ追記する。writer ファイルが分離されているため、2つの環境が git の内容コンフリクトを起こすことは構造的にありえない。push は ref の競合しか起きず、自動の rebase + リトライで解決される。

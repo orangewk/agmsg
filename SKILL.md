@@ -151,10 +151,14 @@ Do NOT manually edit config files. Always use join.sh.
 # a cloud sandbox) through a private git "bus" repository. After `add`,
 # send/inbox/check-inbox sync with the bus automatically; `sync` forces a
 # round trip by hand. See docs/remote.md.
-~/.agents/skills/agmsg/scripts/remote.sh add <git-url>
+~/.agents/skills/agmsg/scripts/remote.sh add <git-url> [--include-history] [--env-id <id>]
 ~/.agents/skills/agmsg/scripts/remote.sh status
 ~/.agents/skills/agmsg/scripts/remote.sh sync
 ~/.agents/skills/agmsg/scripts/remote.sh remove
+
+# One idempotent line for ephemeral environments (cloud sandboxes): init
+# store + join + bind bus + first pull. Safe to run on every boot.
+~/.agents/skills/agmsg/scripts/remote.sh bootstrap <git-url> --team <team> --agent <name> [--env-id <id>]
 ```
 
 ## Sandbox compatibility (Claude Code)
