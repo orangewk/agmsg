@@ -48,15 +48,30 @@ require_configured() {
 
 case "$ACTION" in
   add)
-    URL="${1:?Usage: remote.sh add <git-url> [--include-history]}"
+    URL="${1:?Usage: remote.sh add <git-url> [--include-history] [--env-id <id>]}"
     shift || true
     INCLUDE_HISTORY=0
-    for opt in "$@"; do
-      [ "$opt" = "--include-history" ] && INCLUDE_HISTORY=1
+    ENV_ID_OVERRIDE="${AGMSG_ENV_ID:-}"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --include-history) INCLUDE_HISTORY=1; shift ;;
+        --env-id) ENV_ID_OVERRIDE="${2:?--env-id needs a value}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+      esac
     done
     require_git
     if sync_configured; then
-      echo "Remote already configured: $(sync_remote_url)" >&2
+      # Idempotent re-add: same url (+ same pinned env id, when one is
+      # given) is a no-op, so an ephemeral environment's bootstrap script
+      # can run add unconditionally on every boot (#15, #17). A different
+      # url or env id still requires an explicit remove first.
+      if [ "$(sync_remote_url)" = "$URL" ] \
+         && { [ -z "$ENV_ID_OVERRIDE" ] || [ "$(sync_env_id)" = "$ENV_ID_OVERRIDE" ]; }; then
+        echo "Remote bus already configured: $URL"
+        echo "This environment's id: $(sync_env_id)"
+        exit 0
+      fi
+      echo "Remote already configured: $(sync_remote_url) (env_id: $(sync_env_id))" >&2
       echo "Run 'remote.sh remove' first to rebind." >&2
       exit 1
     fi
@@ -81,9 +96,24 @@ case "$ACTION" in
     # Environment id: names this machine's writer files on the bus. Hostname
     # for readability, random suffix for uniqueness (two laptops named
     # "mac.local" must not share a writer file).
-    HOST=$( (hostname 2>/dev/null || uname -n) | tr -cd 'A-Za-z0-9_-' | cut -c1-24)
-    [ -n "$HOST" ] || HOST="env"
-    ENV_ID="$HOST-$(agmsg_sqlite_mem "SELECT lower(hex(randomblob(3)));")"
+    #
+    # A pinned id (--env-id / AGMSG_ENV_ID) lets a regenerated ephemeral
+    # environment resume its own writer files instead of littering the bus
+    # with one-shot ids (#15). Constraint: at most ONE live instance per
+    # pinned id — two concurrent writers on one file would break the
+    # per-writer no-conflict guarantee. Sanitized the same way as hostnames.
+    if [ -n "$ENV_ID_OVERRIDE" ]; then
+      ENV_ID=$(printf '%s' "$ENV_ID_OVERRIDE" | tr -cd 'A-Za-z0-9_-' | cut -c1-48)
+      if [ -z "$ENV_ID" ]; then
+        echo "Error: --env-id/AGMSG_ENV_ID contains no filename-safe characters" >&2
+        rm -rf "$BUS"
+        exit 1
+      fi
+    else
+      HOST=$( (hostname 2>/dev/null || uname -n) | tr -cd 'A-Za-z0-9_-' | cut -c1-24)
+      [ -n "$HOST" ] || HOST="env"
+      ENV_ID="$HOST-$(agmsg_sqlite_mem "SELECT lower(hex(randomblob(3)));")"
+    fi
 
     # Everything already in the store stays local by default: connecting a
     # bus means "share from now on", not "publish my backlog into a permanent

@@ -49,11 +49,16 @@ connect_both() {
   grep -q '^env_id=' "$TEST_SKILL_DIR/db/remote.conf"
 }
 
-@test "remote add: refuses to rebind without remove" {
+@test "remote add: same url re-add is a no-op; rebinding elsewhere refuses" {
   bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  # Idempotent since #15 so bootstrap scripts can run add on every boot.
   run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
-  [ "$status" -ne 0 ]
+  [ "$status" -eq 0 ]
   [[ "$output" =~ "already configured" ]]
+  git init -q --bare "$TEST_SKILL_DIR/elsewhere.git"
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/elsewhere.git"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "remove" ]]
 }
 
 @test "remote status: reports url and pending counts" {
@@ -216,6 +221,42 @@ sqlite_mem_db() {
   [[ "$output" =~ "NOT configured" ]]
   [ ! -f "$TEST_SKILL_DIR/db/remote.conf" ]
   [ ! -d "$TEST_SKILL_DIR/db/bus" ]
+}
+
+@test "add: --env-id / AGMSG_ENV_ID pins the environment id (#15)" {
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id cloud-main
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "cloud-main" ]]
+  [ "$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")" = "cloud-main" ]
+  bash "$SCRIPTS/remote.sh" remove
+  AGMSG_ENV_ID=cloud-env2 run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  [ "$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")" = "cloud-env2" ]
+}
+
+@test "add: idempotent re-add for the same url; different url still refuses (#15)" {
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id pin
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id pin
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "already configured" ]]
+  git init -q --bare "$TEST_SKILL_DIR/other.git"
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/other.git"
+  [ "$status" -ne 0 ]
+}
+
+@test "add: a re-created environment with a pinned id resumes its writer file (#15)" {
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id reborn
+  bash "$SCRIPTS/send.sh" testteam alice bob "first life" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  # Container recycled: conf and clone are gone, the bus remembers.
+  bash "$SCRIPTS/remote.sh" remove
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id reborn
+  bash "$SCRIPTS/send.sh" testteam alice bob "second life" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  # One writer file for the pinned id, holding both lives' events.
+  files=$(ls "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl | wc -l | tr -d ' ')
+  [ "$files" = "1" ]
+  grep -q "first life" "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl
+  grep -q "second life" "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl
 }
 
 @test "add: pre-existing history stays local by default (#19)" {
