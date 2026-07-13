@@ -26,6 +26,11 @@ connections, but they can all clone and push a private repo.
 ~/.agents/skills/agmsg/scripts/remote.sh add git@github.com:yourname/agmsg-bus.git
 ```
 
+Messages that already exist in the store at `add` time stay local: binding a
+bus means "share from now on", not "publish my backlog into a permanent git
+history". Pass `--include-history` to also export the pre-existing backlog
+(machine migration, backup).
+
 That's it. `send.sh` now pushes new messages to the bus in the background,
 and the Stop-hook inbox check (and `inbox.sh`) pulls remote messages before
 reading, so cross-environment messages arrive through the exact same
@@ -34,7 +39,9 @@ delivery path as local ones.
 ## Commands
 
 ```bash
-remote.sh add <git-url>   # bind this store to a bus repo (clones it)
+remote.sh add <git-url> [--include-history]
+                          # bind this store to a bus repo (clones it);
+                          # pre-existing messages stay local unless the flag is given
 remote.sh status          # url, env id, unexported/unpushed counts
 remote.sh sync            # pull + import, then export + push
 remote.sh pull            # fetch remote events into the local store

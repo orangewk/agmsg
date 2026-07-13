@@ -46,6 +46,16 @@ sync_conf_get() {
 sync_env_id() { sync_conf_get env_id; }
 sync_remote_url() { sync_conf_get url; }
 
+# Rows with id <= cutoff existed before this store was bound to the bus and
+# stay local (issue #19). Missing/garbled key (a pre-#19 remote.conf) reads
+# as 0 = export everything, the old behavior.
+sync_export_cutoff() {
+  local c
+  c="$(sync_conf_get export_cutoff)"
+  case "$c" in ''|*[!0-9]*) c=0 ;; esac
+  printf '%s\n' "$c"
+}
+
 _sync_git() { git -C "$(sync_bus_dir)" "$@"; }
 
 # Network-touching git ops get a hard wall-clock bound where `timeout` exists
@@ -169,7 +179,7 @@ _sync_team_pathsafe() {
 # environment (events/<team>/<env-id>.<YYYYMM>.jsonl, ADR 0005 layout) and
 # commit. Does not touch the network.
 sync_export() {
-  local db bus env month team team_sql writer tmp_own new_events count total fail
+  local db bus env month team team_sql writer tmp_own new_events count total fail cutoff
   db="$(agmsg_db_path)"
   [ -f "$db" ] || return 0
   bus="$(sync_bus_dir)"
@@ -177,14 +187,17 @@ sync_export() {
   month=$(date +%Y%m)
   sync_migrate "$db" || return 1
 
+  cutoff="$(sync_export_cutoff)"
+
   # Assign ids to never-exported local rows. randomblob() re-evaluates per
   # row; second-precision timestamp + 8 random bytes is collision-safe at
   # this scale and keeps the bus files roughly time-sorted. NOT an export
   # cursor: the writer files are (a uuid-bearing row missing from them is
   # still a candidate), so nothing is stranded if a later step fails.
+  # Pre-bind history (id <= cutoff) is left untouched — never exported.
   agmsg_sqlite "$db" "UPDATE messages
     SET uuid = strftime('%Y%m%dT%H%M%SZ','now') || '-' || lower(hex(randomblob(8)))
-    WHERE uuid IS NULL AND origin IS NULL;" || return 1
+    WHERE uuid IS NULL AND origin IS NULL AND id > $cutoff;" || return 1
 
   total=0
   fail=0
@@ -218,6 +231,7 @@ sync_export() {
         'body', body, 'created_at', created_at)
       FROM messages
       WHERE origin IS NULL AND uuid IS NOT NULL AND team = '$team_sql'
+        AND id > $cutoff
         AND uuid NOT IN (
           SELECT json_extract(value, '\$.id')
           FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp_own")')))

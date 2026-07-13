@@ -48,7 +48,12 @@ require_configured() {
 
 case "$ACTION" in
   add)
-    URL="${1:?Usage: remote.sh add <git-url>}"
+    URL="${1:?Usage: remote.sh add <git-url> [--include-history]}"
+    shift || true
+    INCLUDE_HISTORY=0
+    for opt in "$@"; do
+      [ "$opt" = "--include-history" ] && INCLUDE_HISTORY=1
+    done
     require_git
     if sync_configured; then
       echo "Remote already configured: $(sync_remote_url)" >&2
@@ -80,7 +85,22 @@ case "$ACTION" in
     [ -n "$HOST" ] || HOST="env"
     ENV_ID="$HOST-$(agmsg_sqlite_mem "SELECT lower(hex(randomblob(3)));")"
 
-    printf 'url=%s\nenv_id=%s\n' "$URL" "$ENV_ID" > "$STORE_DIR/remote.conf"
+    # Everything already in the store stays local by default: connecting a
+    # bus means "share from now on", not "publish my backlog into a permanent
+    # git history" (issue #19 — learned the hard way when a first sync pushed
+    # 205 unrelated old messages). The cutoff is the highest local row id at
+    # bind time; export only takes rows above it. --include-history opts into
+    # the old behavior (machine migration, backup).
+    CUTOFF=0
+    HISTORY_COUNT=0
+    DB="$(agmsg_db_path)"
+    if [ "$INCLUDE_HISTORY" -ne 1 ] && [ -f "$DB" ]; then
+      CUTOFF=$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages;" 2>/dev/null || echo 0)
+      case "$CUTOFF" in ''|*[!0-9]*) CUTOFF=0 ;; esac
+      HISTORY_COUNT=$(agmsg_sqlite "$DB" "SELECT count(*) FROM messages;" 2>/dev/null || echo 0)
+    fi
+
+    printf 'url=%s\nenv_id=%s\nexport_cutoff=%s\n' "$URL" "$ENV_ID" "$CUTOFF" > "$STORE_DIR/remote.conf"
 
     # A brand-new bus repo has an unborn HEAD; give it a root commit so every
     # later pull/push has a branch to talk about. If that first push is
@@ -98,6 +118,11 @@ case "$ACTION" in
     fi
     echo "Remote bus configured: $URL"
     echo "This environment's id: $ENV_ID"
+    if [ "$INCLUDE_HISTORY" -eq 1 ]; then
+      echo "Existing local messages WILL be shared (--include-history)"
+    elif [ "${HISTORY_COUNT:-0}" -gt 0 ]; then
+      echo "$HISTORY_COUNT existing local message(s) will NOT be shared (re-add with --include-history to share them)"
+    fi
     ;;
 
   status)
@@ -106,7 +131,9 @@ case "$ACTION" in
     PENDING=0
     if [ -f "$DB" ]; then
       sync_migrate "$DB"
-      PENDING=$(agmsg_sqlite "$DB" "SELECT count(*) FROM messages WHERE uuid IS NULL AND origin IS NULL;")
+      # Pre-bind history (id <= export_cutoff) never exports, so it is not
+      # "pending" — counting it would show a forever-stuck backlog (#19).
+      PENDING=$(agmsg_sqlite "$DB" "SELECT count(*) FROM messages WHERE uuid IS NULL AND origin IS NULL AND id > $(sync_export_cutoff);")
     fi
     AHEAD=$(git -C "$(sync_bus_dir)" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
     echo "url: $(sync_remote_url)"

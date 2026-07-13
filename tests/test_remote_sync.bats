@@ -218,6 +218,34 @@ sqlite_mem_db() {
   [ ! -d "$TEST_SKILL_DIR/db/bus" ]
 }
 
+@test "add: pre-existing history stays local by default (#19)" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "old secret one" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam alice bob "old secret two" >/dev/null
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "2 existing local message(s) will NOT be shared" ]]
+  bash "$SCRIPTS/send.sh" testteam alice bob "new after bind" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  bash "$SCRIPTS/remote.sh" sync   # a second sync must not leak it either
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "new after bind" HEAD --
+  [ "$status" -eq 0 ]
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "old secret" HEAD --
+  [ "$status" -ne 0 ]
+  # The held-back history is not reported as a stuck backlog.
+  run bash "$SCRIPTS/remote.sh" status
+  [[ "$output" =~ "unexported messages: 0" ]]
+}
+
+@test "add: --include-history exports the backlog (#19)" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "shared backlog" >/dev/null
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --include-history
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "WILL be shared" ]]
+  bash "$SCRIPTS/remote.sh" sync
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "shared backlog" HEAD --
+  [ "$status" -eq 0 ]
+}
+
 @test "sync: a dotted team name join.sh accepts ('.foo') replicates" {
   bash "$SCRIPTS/join.sh" .foo alice claude-code /tmp/project-a
   bash "$SCRIPTS/join.sh" .foo bob claude-code /tmp/project-b
