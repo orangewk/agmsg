@@ -13,7 +13,11 @@ if [ "${3:-}" = "--quiet" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/compat.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/sync.sh"
 
 # Remote transport (ADR 0005): a manual inbox check should see what other
 # environments sent, so pull first. Best-effort — offline must not break the
@@ -58,4 +62,10 @@ done <<< "$UNREAD"
 echo ""
 
 # Mark as read (non-fatal — may fail in sandboxed environments)
-agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM_SQL' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+if sync_configured; then
+  sync_mark_read "$DB" "$TEAM_SQL" "$AGENT_SQL" 2>/dev/null \
+    || agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM_SQL' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+  sync_push_best_effort
+else
+  agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM_SQL' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+fi
