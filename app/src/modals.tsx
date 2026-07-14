@@ -364,10 +364,17 @@ export function ConfirmModal(props: {
   );
 }
 
-// The only setting today is language, so this is a single dropdown rather
-// than a full preferences panel — expand into sections here as more
-// settings show up instead of adding separate modals per setting.
-export function SettingsModal(props: { onClose: () => void }) {
+// Exported so App.tsx can validate a localStorage-restored value against the
+// same range this modal's <input> enforces (see terminalFontSize's lazy
+// useState initializer).
+export const MIN_TERMINAL_FONT_SIZE = 8;
+export const MAX_TERMINAL_FONT_SIZE = 24;
+
+export function SettingsModal(props: {
+  onClose: () => void;
+  terminalFontSize: number;
+  onTerminalFontSizeChange: (size: number) => void;
+}) {
   const { t, i18n } = useTranslation();
   return (
     <Modal title={t("modal.settings.title")} onClose={props.onClose}>
@@ -383,6 +390,21 @@ export function SettingsModal(props: { onClose: () => void }) {
             </option>
           ))}
         </select>
+      </label>
+      <label>
+        {t("settings.terminalFontSize.label")}
+        <input
+          type="number"
+          min={MIN_TERMINAL_FONT_SIZE}
+          max={MAX_TERMINAL_FONT_SIZE}
+          value={props.terminalFontSize}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (n >= MIN_TERMINAL_FONT_SIZE && n <= MAX_TERMINAL_FONT_SIZE) {
+              props.onTerminalFontSizeChange(n);
+            }
+          }}
+        />
       </label>
       <div className="modal-actions">
         <button type="button" className="primary" onClick={props.onClose}>
