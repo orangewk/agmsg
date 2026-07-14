@@ -30,6 +30,15 @@
 # Read state is replicated as message_read events. Existing writer lines
 # without a type remain message_sent for backwards compatibility.
 #
+# Event classes (ADR 0006): every event type is either a DELIVERABLE (worth
+# waking its recipient for) or STATE GOSSIP (converges on the next sync,
+# wakes no one). The router on the bus keys its behavior off this table:
+#
+#   deliverable   message_sent  (and legacy lines with no type)
+#   state gossip  message_read
+#
+# A new event type must declare its class here and in the router.
+#
 # Callers must source lib/storage.sh and lib/compat.sh first.
 
 sync_conf_path() { printf '%s/remote.conf\n' "$(agmsg_storage_dir)"; }
@@ -186,6 +195,46 @@ sync_pull_throttled() {
   [ $(( now - last )) -lt "$interval" ] && return 0
   touch "$marker" 2>/dev/null || true
   (bash "$(_sync_scripts_dir)/remote.sh" pull --quiet >/dev/null 2>&1 || true) &
+}
+
+# --- subscriber registry (ADR 0006) -------------------------------------------
+# One JSON file per (team, agent) on the bus tells the router who to wake and
+# how. The registry lives on the bus because the bus is already the one shared
+# place every environment can read and write.
+
+sync_subscriber_path() { printf 'subscribers/%s/%s.json\n' "$1" "$2"; }
+
+# Write (or overwrite) this environment's registration and push it. Emits the
+# file's bus path on success. Idempotent: an identical registration is a no-op
+# that does not create a commit.
+sync_subscribe() {
+  local team="$1" agent="$2" pr="$3" bus rel dst body
+  bus="$(sync_bus_dir)"
+  rel="$(sync_subscriber_path "$team" "$agent")"
+  dst="$bus/$rel"
+  body=$(printf '{"env":"%s","filter":{"team":"%s","to":"%s"},"wake":{"kind":"pr-comment","pr":%s}}\n' \
+    "$(sync_env_id)" "$team" "$agent" "$pr")
+  if [ -f "$dst" ] && [ "$(cat "$dst")" = "$(printf '%s' "$body")" ]; then
+    printf '%s\n' "$rel"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dst")"
+  printf '%s' "$body" > "$dst"
+  _sync_git add "$rel" >/dev/null 2>&1
+  _sync_git commit -q -m "subscribe: $team/$agent via pr-comment #$pr" >/dev/null 2>&1 || true
+  sync_push_remote || return 1
+  printf '%s\n' "$rel"
+}
+
+# Remove this (team, agent)'s registration and push. Missing entry is a no-op.
+sync_unsubscribe() {
+  local team="$1" agent="$2" bus rel
+  bus="$(sync_bus_dir)"
+  rel="$(sync_subscriber_path "$team" "$agent")"
+  [ -f "$bus/$rel" ] || return 0
+  _sync_git rm -q "$rel" >/dev/null 2>&1
+  _sync_git commit -q -m "unsubscribe: $team/$agent" >/dev/null 2>&1 || true
+  sync_push_remote
 }
 
 # --- export / push -----------------------------------------------------------

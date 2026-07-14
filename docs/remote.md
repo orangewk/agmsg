@@ -95,6 +95,59 @@ fetch/push traffic is not metered against the GitHub REST API rate limit;
 at agent-team message rates you are orders of magnitude below any abuse
 threshold. See the ADR for the full analysis.
 
+## Waking cloud sessions (notification layer, ADR 0006)
+
+Polling covers agents that are already running, but a turn-based cloud
+session (e.g. Claude Code on the web) only notices bus messages when
+something gives it a turn. The notification layer closes that gap: a
+**router** on the bus wakes exactly the subscriber a new message is
+addressed to — never anyone else, never for read receipts, and never the
+environment that wrote the event.
+
+Every event type has a declared class, and the router keys off it:
+
+| Class | Event types | Wakes someone |
+|---|---|---|
+| deliverable | `message_sent` (and legacy lines with no `type`) | the recipient only |
+| state gossip | `message_read` | no one — it converges on the next sync |
+
+Setup, per bus (GitHub-hosted):
+
+1. Commit [`docs/examples/agmsg-router.yml`](examples/agmsg-router.yml) to
+   the bus branch as `.github/workflows/agmsg-router.yml`.
+2. Each session that wants waking opens (or reuses) an **open PR it
+   watches** — a perpetual draft PR from a trivially-diffed branch works;
+   never merge or close it. Claude Code sessions: ask the agent to "watch"
+   the PR.
+3. Register the recipient on the bus:
+
+```
+remote.sh subscribe <team> <agent> --pr <number>
+remote.sh unsubscribe <team> <agent>
+```
+
+This writes `subscribers/<team>/<agent>.json` to the bus —
+`{"env": ..., "filter": {"team", "to"}, "wake": {"kind": "pr-comment", "pr": N}}` —
+which is the router's whole routing table. When a deliverable for that
+team/agent lands (written by a *different* environment), the router posts a
+metadata-only comment on the registered PR (a count and the team/agent name,
+never message bodies), deleting its previous comment so the PR stays at one.
+The webhook wakes the watching session, which pulls the bus and reads its
+inbox as usual.
+
+One registry entry per (team, agent): the same agent identity replicated
+across environments shares one wake target, matching how it already shares
+read state. `wake.kind` is the replaceable part — when a host-level wake API
+exists, migrating is editing the registry entry.
+
+Security notes: the router never checks out or executes bus content, uses no
+third-party actions, and emits only metadata. Anyone with push access to the
+bus branch can edit it — consistent with the trust model below, where push
+access already means full bus access. If you previously disabled Actions on
+a dedicated bus repo (recommended), allowing exactly this one workflow is
+the tradeoff for wake support. On a public repo, remember that subscriber
+names and wake comments (like the bus itself) are public.
+
 ## Trust model: one bus = one trust domain
 
 Everything on a bus replicates to **every** environment bound to it: import
