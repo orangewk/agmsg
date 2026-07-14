@@ -119,6 +119,40 @@ sqlite_mem_db() {
   sqlite3 "$1" "SELECT count(*) FROM messages WHERE body='once only';" | tr -d '\r'
 }
 
+@test "sync: read receipts cross environments and remain idempotent (#16)" {
+  connect_both
+  bash "$SCRIPTS/send.sh" testteam alice bob "read me" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  in_b "$SCRIPTS/remote.sh" sync
+
+  run in_b "$SCRIPTS/inbox.sh" testteam bob
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "read me" ]]
+
+  env_b_id=$(sed -n 's/^env_id=//p' "$ENV_B/remote.conf")
+  read_event_count() {
+    grep -h '"type":"message_read"' "$ENV_B"/bus/events/testteam/"$env_b_id".*.jsonl \
+      | wc -l | tr -d ' '
+  }
+  [ "$(read_event_count)" = "1" ]
+
+  # The receipt has already been exported by inbox.sh; a second push must not
+  # append another event for the same uuid.
+  in_b "$SCRIPTS/remote.sh" push
+  [ "$(read_event_count)" = "1" ]
+
+  bash "$SCRIPTS/remote.sh" pull
+  read_at=$(sqlite3 "$TEST_SKILL_DIR/db/messages.db" \
+    "SELECT read_at FROM messages WHERE body='read me';" | tr -d '\r')
+  [ -n "$read_at" ]
+
+  # Importing a receipt on the sender must not create a receipt echo.
+  bash "$SCRIPTS/remote.sh" push
+  env_a_id=$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")
+  run grep -h '"type":"message_read"' "$TEST_SKILL_DIR"/db/bus/events/testteam/"$env_a_id".*.jsonl
+  [ "$status" -ne 0 ]
+}
+
 @test "sync: concurrent writers converge after a push race" {
   connect_both
   # Both environments write before either pushes: B's push lands second and

@@ -112,10 +112,12 @@ Concretely:
 
 ## Known limitations (MVP)
 
-- **Read state is per-environment.** `read_at` is not replicated, so an
-  agent joined in two environments sees the same message in both. This is
-  usually what you want (the message reaches you wherever you're active);
-  read-receipt replication is future work.
+- **Read state is replicated best-effort.** When `inbox.sh` or `check-inbox.sh`
+  marks a message read, the reader's environment emits one `message_read`
+  event. Other environments apply that receipt only when their local
+  `read_at` is still unset, so a single-personality agent converges across
+  environments. The reader pushes in the background and other environments
+  pick it up on their next pull; a short duplicate-delivery window remains.
 - Team membership (`teams/` config) is not replicated — join the team in
   each environment with the same team/agent names.
 - The bus repo's history is a permanent record; truly deleting a message

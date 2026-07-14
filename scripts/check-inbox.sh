@@ -15,6 +15,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/sync.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"  # agmsg_agent_pid, for instance-id derivation
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
@@ -131,6 +133,7 @@ _agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 AGENT_SQL="$(_agmsg_sqlesc "$AGENT")"
 
 OUTPUT=""
+READ_CHANGED=0
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
   team_sql="$(_agmsg_sqlesc "$team")"
@@ -163,9 +166,19 @@ for team in "${TEAM_LIST[@]}"; do
     done <<< "$RESULT"
     OUTPUT+=$'\n'
     # Mark as read
-    agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+    if sync_configured; then
+      sync_mark_read "$DB" "$team_sql" "$AGENT_SQL" 2>/dev/null \
+        || agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+    else
+      agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+    fi
+    READ_CHANGED=1
   fi
 done
+
+if [ "$READ_CHANGED" -eq 1 ]; then
+  sync_push_best_effort
+fi
 
 # No new messages
 if [ -z "$OUTPUT" ]; then

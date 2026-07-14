@@ -27,9 +27,8 @@
 # the working tree, and a duplicate line is neutralized by import's
 # INSERT OR IGNORE on the other side).
 #
-# Read state (read_at) is deliberately NOT replicated in the MVP: each
-# environment keeps its own read cursor, so an agent joined in two
-# environments sees the message in both. See docs/remote.md.
+# Read state is replicated as message_read events. Existing writer lines
+# without a type remain message_sent for backwards compatibility.
 #
 # Callers must source lib/storage.sh and lib/compat.sh first.
 
@@ -127,6 +126,45 @@ sync_migrate() {
   printf '%s\n' "$cols" | grep -qx origin \
     || agmsg_sqlite "$db" "ALTER TABLE messages ADD COLUMN origin TEXT;"
   agmsg_sqlite "$db" "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_uuid ON messages(uuid) WHERE uuid IS NOT NULL;"
+  agmsg_sqlite "$db" "CREATE TABLE IF NOT EXISTS sync_reads_pending (uuid TEXT PRIMARY KEY, read_at TEXT NOT NULL);"
+  agmsg_sqlite "$db" "CREATE TABLE IF NOT EXISTS sync_reads_exported (uuid TEXT PRIMARY KEY, read_at TEXT NOT NULL);"
+}
+
+# Mark the currently unread rows for one recipient as read. When the store is
+# bound to a remote bus, keep the local read timestamp in a pending table so
+# sync_export can emit exactly one message_read event for each local read.
+# The pending insert precedes the UPDATE in one transaction; a crash cannot
+# leave a read row without its receipt candidate.
+sync_mark_read() {
+  local db="$1" team_sql="$2" agent_sql="$3"
+  sync_migrate "$db" || return 1
+  agmsg_sqlite "$db" "
+    BEGIN IMMEDIATE;
+    INSERT OR IGNORE INTO sync_reads_pending (uuid, read_at)
+    SELECT uuid, strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    FROM messages
+    WHERE team='$team_sql' AND to_agent='$agent_sql'
+      AND read_at IS NULL AND uuid IS NOT NULL;
+    UPDATE messages
+    SET read_at = COALESCE(
+      (SELECT read_at FROM sync_reads_pending
+       WHERE sync_reads_pending.uuid = messages.uuid),
+      strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    WHERE team='$team_sql' AND to_agent='$agent_sql' AND read_at IS NULL;
+    COMMIT;"
+}
+
+# A read is local UX state, but it must reach the bus without requiring the
+# caller to remember a separate remote.sh push. Match send.sh's best-effort
+# behavior; tests and callers that need deterministic completion can set
+# AGMSG_REMOTE_PUSH_SYNC=1.
+sync_push_best_effort() {
+  sync_configured || return 0
+  if [ "${AGMSG_REMOTE_PUSH_SYNC:-}" = "1" ]; then
+    bash "$(_sync_scripts_dir)/remote.sh" push --quiet >/dev/null 2>&1 || true
+  else
+    (bash "$(_sync_scripts_dir)/remote.sh" push --quiet >/dev/null 2>&1 || true) &
+  fi
 }
 
 # Throttled best-effort pull for polling loops (monitor-mode watchers). A
@@ -179,7 +217,7 @@ _sync_team_pathsafe() {
 # environment (events/<team>/<env-id>.<YYYYMM>.jsonl, ADR 0005 layout) and
 # commit. Does not touch the network.
 sync_export() {
-  local db bus env month team team_sql writer tmp_own new_events count total fail cutoff
+  local db bus env month team team_sql writer tmp_own new_events read_events count total fail cutoff
   db="$(agmsg_db_path)"
   [ -f "$db" ] || return 0
   bus="$(sync_bus_dir)"
@@ -198,6 +236,17 @@ sync_export() {
   agmsg_sqlite "$db" "UPDATE messages
     SET uuid = strftime('%Y%m%dT%H%M%SZ','now') || '-' || lower(hex(randomblob(8)))
     WHERE uuid IS NULL AND origin IS NULL AND id > $cutoff;" || return 1
+
+  # Cover rows that were marked read before their first export (for example,
+  # a store bound with --include-history). Imported rows have origin set, so
+  # this fallback cannot turn a received receipt into an echo.
+  agmsg_sqlite "$db" "
+    INSERT OR IGNORE INTO sync_reads_pending (uuid, read_at)
+    SELECT uuid, read_at FROM messages
+    WHERE uuid IS NOT NULL AND read_at IS NOT NULL
+      AND origin IS NULL AND id > $cutoff
+      AND NOT EXISTS (
+        SELECT 1 FROM sync_reads_exported WHERE uuid = messages.uuid);" || return 1
 
   total=0
   fail=0
@@ -226,7 +275,7 @@ sync_export() {
     # hand or the op would report success on a store it couldn't read.
     if ! new_events=$(agmsg_sqlite "$db" "
       SELECT json_object(
-        'id', uuid, 'env', '$env', 'team', team,
+        'type', 'message_sent', 'id', uuid, 'env', '$env', 'team', team,
         'from', from_agent, 'to', to_agent,
         'body', body, 'created_at', created_at)
       FROM messages
@@ -240,6 +289,35 @@ sync_export() {
       rm -f "$tmp_own"
       continue
     fi
+    # A read event already present in our writer file is exported even if the
+    # process died before the bookkeeping row was inserted. This keeps the
+    # append-only writer file as the crash-recovery source of truth.
+    if ! agmsg_sqlite "$db" "
+      INSERT OR IGNORE INTO sync_reads_exported (uuid, read_at)
+      SELECT json_extract(value, '\$.ref'), json_extract(value, '\$.at')
+      FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp_own")'))
+      WHERE json_extract(value, '\$.type') = 'message_read'
+        AND json_extract(value, '\$.ref') IS NOT NULL
+        AND json_extract(value, '\$.at') IS NOT NULL;"; then
+      fail=1
+      rm -f "$tmp_own"
+      continue
+    fi
+    if ! read_events=$(agmsg_sqlite "$db" "
+      SELECT json_object(
+        'type', 'message_read', 'ref', messages.uuid,
+        'at', sync_reads_pending.read_at, 'env', '$env')
+      FROM sync_reads_pending
+      JOIN messages ON messages.uuid = sync_reads_pending.uuid
+      WHERE messages.team = '$team_sql'
+        AND NOT EXISTS (
+          SELECT 1 FROM sync_reads_exported
+          WHERE sync_reads_exported.uuid = sync_reads_pending.uuid)
+      ORDER BY messages.id ASC;"); then
+      fail=1
+      rm -f "$tmp_own"
+      continue
+    fi
     rm -f "$tmp_own"
 
     if [ -n "$new_events" ]; then
@@ -247,8 +325,28 @@ sync_export() {
       count=$(printf '%s\n' "$new_events" | wc -l | tr -d ' ')
       total=$(( total + count ))
     fi
+    if [ -n "$read_events" ]; then
+      if ! printf '%s\n' "$read_events" >> "$writer"; then
+        fail=1
+        rm -f "$tmp_own"
+        continue
+      fi
+      count=$(printf '%s\n' "$read_events" | wc -l | tr -d ' ')
+      total=$(( total + count ))
+    fi
   done <<EOF
-$(agmsg_sqlite "$db" "SELECT DISTINCT team FROM messages WHERE origin IS NULL AND uuid IS NOT NULL;")
+$(agmsg_sqlite "$db" "
+  SELECT DISTINCT team FROM messages
+  WHERE uuid IS NOT NULL
+    AND (
+      (origin IS NULL AND id > $cutoff)
+      OR EXISTS (
+        SELECT 1 FROM sync_reads_pending
+        WHERE sync_reads_pending.uuid = messages.uuid
+          AND NOT EXISTS (
+            SELECT 1 FROM sync_reads_exported
+            WHERE sync_reads_exported.uuid = messages.uuid))
+    );")
 EOF
 
   if [ "$total" -gt 0 ]; then
@@ -287,7 +385,7 @@ sync_pull_remote() {
 # bus. The event's team field is authoritative either way — the path is only
 # a namespace.
 sync_import() {
-  local db bus env f tmp fail
+  local db bus env f tmp read_file fail
   db="$(agmsg_db_path)"
   [ -f "$db" ] || bash "$(_sync_scripts_dir)/internal/init-db.sh" >/dev/null
   sync_migrate "$db" || return 1
@@ -317,7 +415,47 @@ sync_import() {
              json_extract(value, '\$.to'),
              json_extract(value, '\$.body'),
              json_extract(value, '\$.created_at')
-      FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp")'));" || fail=1
+      FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp")'))
+      WHERE COALESCE(json_extract(value, '\$.type'), 'message_sent') = 'message_sent';" || fail=1
+    rm -f "$tmp"
+  done
+
+  # Read events are applied in a second pass so a receipt is not lost when
+  # its message event lives in another writer file that the first pass visits
+  # later. The first receipt wins; replaying an older one is harmless.
+  for f in "$bus/events/"*.jsonl "$bus/events/"*/*.jsonl \
+           "$bus/events/".[!.]*/*.jsonl "$bus/events/"..?*/*.jsonl; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in "$env".*) continue ;; esac
+    tmp=$(mktemp)
+    awk 'BEGIN{printf "["} NF{if(n++)printf ","; printf "%s",$0} END{print "]"}' "$f" > "$tmp"
+    read_file=$(agmsg_sql_readfile_path "$tmp")
+    if ! agmsg_sqlite "$db" "
+      BEGIN;
+      INSERT OR IGNORE INTO sync_reads_exported (uuid, read_at)
+      SELECT json_extract(value, '\$.ref'), json_extract(value, '\$.at')
+      FROM json_each(readfile('$read_file'))
+      WHERE json_extract(value, '\$.type') = 'message_read'
+        AND json_extract(value, '\$.ref') IS NOT NULL
+        AND json_extract(value, '\$.at') IS NOT NULL;
+      UPDATE messages
+      SET read_at = (
+        SELECT min(json_extract(value, '\$.at'))
+        FROM json_each(readfile('$read_file'))
+        WHERE json_extract(value, '\$.type') = 'message_read'
+          AND json_extract(value, '\$.ref') = messages.uuid
+          AND json_extract(value, '\$.at') IS NOT NULL)
+      WHERE messages.read_at IS NULL
+        AND messages.uuid IN (
+        SELECT json_extract(value, '\$.ref')
+        FROM json_each(readfile('$read_file'))
+        WHERE json_extract(value, '\$.type') = 'message_read'
+          AND json_extract(value, '\$.ref') IS NOT NULL
+          AND json_extract(value, '\$.at') IS NOT NULL
+      );
+      COMMIT;"; then
+      fail=1
+    fi
     rm -f "$tmp"
   done
   return "$fail"
