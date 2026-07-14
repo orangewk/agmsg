@@ -6,7 +6,12 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 # Manage the git-backed remote transport (ADR 0005): replicate messages
 # between environments through a private "bus" git repository.
 #
-# Usage: remote.sh add <git-url>     configure this store's bus and clone it
+# Usage: remote.sh add <git-url> [--include-history] [--env-id <id>]
+#                                    configure this store's bus and clone it
+#        remote.sh bootstrap <git-url> --team <team> --agent <name> \
+#                  [--type <type>] [--project <path>] [--env-id <id>] [--include-history]
+#                                    one-shot idempotent setup for ephemeral
+#                                    environments: init store, join, add, pull
 #        remote.sh status            show bus url, env id, pending counts
 #        remote.sh sync              pull + import, then export + push
 #        remote.sh pull              fetch remote events into the local store
@@ -15,7 +20,7 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 #
 # pull/push/sync accept --quiet (suppress the one-line summary).
 
-ACTION="${1:?Usage: remote.sh add|status|sync|pull|push|remove ...}"
+ACTION="${1:?Usage: remote.sh add|bootstrap|status|sync|pull|push|remove ...}"
 shift || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -48,10 +53,30 @@ require_configured() {
 
 case "$ACTION" in
   add)
-    URL="${1:?Usage: remote.sh add <git-url>}"
+    URL="${1:?Usage: remote.sh add <git-url> [--include-history] [--env-id <id>]}"
+    shift || true
+    INCLUDE_HISTORY=0
+    ENV_ID_OVERRIDE="${AGMSG_ENV_ID:-}"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --include-history) INCLUDE_HISTORY=1; shift ;;
+        --env-id) ENV_ID_OVERRIDE="${2:?--env-id needs a value}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+      esac
+    done
     require_git
     if sync_configured; then
-      echo "Remote already configured: $(sync_remote_url)" >&2
+      # Idempotent re-add: same url (+ same pinned env id, when one is
+      # given) is a no-op, so an ephemeral environment's bootstrap script
+      # can run add unconditionally on every boot (#15, #17). A different
+      # url or env id still requires an explicit remove first.
+      if [ "$(sync_remote_url)" = "$URL" ] \
+         && { [ -z "$ENV_ID_OVERRIDE" ] || [ "$(sync_env_id)" = "$ENV_ID_OVERRIDE" ]; }; then
+        echo "Remote bus already configured: $URL"
+        echo "This environment's id: $(sync_env_id)"
+        exit 0
+      fi
+      echo "Remote already configured: $(sync_remote_url) (env_id: $(sync_env_id))" >&2
       echo "Run 'remote.sh remove' first to rebind." >&2
       exit 1
     fi
@@ -59,7 +84,22 @@ case "$ACTION" in
     mkdir -p "$STORE_DIR"
     BUS="$(sync_bus_dir)"
     rm -rf "$BUS"
-    git clone -q "$URL" "$BUS" 2>/dev/null || { echo "Error: cannot clone $URL" >&2; exit 1; }
+    # The clone happens before the local bus config exists, so the transport
+    # bounds below cannot protect this first network operation. Apply them to
+    # clone itself as well; otherwise bootstrap can still hang on a dead bus.
+    clone_remote() {
+      local ssh_command="${GIT_SSH_COMMAND:-ssh} -o ConnectTimeout=10 -o BatchMode=yes"
+      if command -v timeout >/dev/null 2>&1; then
+        GIT_SSH_COMMAND="$ssh_command" timeout "${AGMSG_SYNC_NET_TIMEOUT:-60}" \
+          git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 \
+          clone -q "$URL" "$BUS"
+      else
+        GIT_SSH_COMMAND="$ssh_command" \
+          git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 \
+          clone -q "$URL" "$BUS"
+      fi
+    }
+    clone_remote 2>/dev/null || { echo "Error: cannot clone $URL" >&2; exit 1; }
     # Commits are made by the sync machinery, not the user; give the clone a
     # self-contained identity and keep bytes exact across platforms.
     git -C "$BUS" config user.name "agmsg"
@@ -76,11 +116,41 @@ case "$ACTION" in
     # Environment id: names this machine's writer files on the bus. Hostname
     # for readability, random suffix for uniqueness (two laptops named
     # "mac.local" must not share a writer file).
-    HOST=$( (hostname 2>/dev/null || uname -n) | tr -cd 'A-Za-z0-9_-' | cut -c1-24)
-    [ -n "$HOST" ] || HOST="env"
-    ENV_ID="$HOST-$(agmsg_sqlite_mem "SELECT lower(hex(randomblob(3)));")"
+    #
+    # A pinned id (--env-id / AGMSG_ENV_ID) lets a regenerated ephemeral
+    # environment resume its own writer files instead of littering the bus
+    # with one-shot ids (#15). Constraint: at most ONE live instance per
+    # pinned id — two concurrent writers on one file would break the
+    # per-writer no-conflict guarantee. Sanitized the same way as hostnames.
+    if [ -n "$ENV_ID_OVERRIDE" ]; then
+      ENV_ID=$(printf '%s' "$ENV_ID_OVERRIDE" | tr -cd 'A-Za-z0-9_-' | cut -c1-48)
+      if [ -z "$ENV_ID" ]; then
+        echo "Error: --env-id/AGMSG_ENV_ID contains no filename-safe characters" >&2
+        rm -rf "$BUS"
+        exit 1
+      fi
+    else
+      HOST=$( (hostname 2>/dev/null || uname -n) | tr -cd 'A-Za-z0-9_-' | cut -c1-24)
+      [ -n "$HOST" ] || HOST="env"
+      ENV_ID="$HOST-$(agmsg_sqlite_mem "SELECT lower(hex(randomblob(3)));")"
+    fi
 
-    printf 'url=%s\nenv_id=%s\n' "$URL" "$ENV_ID" > "$STORE_DIR/remote.conf"
+    # Everything already in the store stays local by default: connecting a
+    # bus means "share from now on", not "publish my backlog into a permanent
+    # git history" (issue #19 — learned the hard way when a first sync pushed
+    # 205 unrelated old messages). The cutoff is the highest local row id at
+    # bind time; export only takes rows above it. --include-history opts into
+    # the old behavior (machine migration, backup).
+    CUTOFF=0
+    HISTORY_COUNT=0
+    DB="$(agmsg_db_path)"
+    if [ "$INCLUDE_HISTORY" -ne 1 ] && [ -f "$DB" ]; then
+      CUTOFF=$(agmsg_sqlite "$DB" "SELECT COALESCE(MAX(id), 0) FROM messages;" 2>/dev/null || echo 0)
+      case "$CUTOFF" in ''|*[!0-9]*) CUTOFF=0 ;; esac
+      HISTORY_COUNT=$(agmsg_sqlite "$DB" "SELECT count(*) FROM messages;" 2>/dev/null || echo 0)
+    fi
+
+    printf 'url=%s\nenv_id=%s\nexport_cutoff=%s\n' "$URL" "$ENV_ID" "$CUTOFF" > "$STORE_DIR/remote.conf"
 
     # A brand-new bus repo has an unborn HEAD; give it a root commit so every
     # later pull/push has a branch to talk about. If that first push is
@@ -98,6 +168,48 @@ case "$ACTION" in
     fi
     echo "Remote bus configured: $URL"
     echo "This environment's id: $ENV_ID"
+    if [ "$INCLUDE_HISTORY" -eq 1 ]; then
+      echo "Existing local messages WILL be shared (--include-history)"
+    elif [ "${HISTORY_COUNT:-0}" -gt 0 ]; then
+      echo "$HISTORY_COUNT existing local message(s) will NOT be shared (re-add with --include-history to share them)"
+    fi
+    ;;
+
+  bootstrap)
+    # One line in an ephemeral environment's setup script (SessionStart hook,
+    # container boot) replaces the manual join + add + pull dance (#17).
+    # Every step is idempotent, so running it on every boot is safe.
+    B_URL="${1:?Usage: remote.sh bootstrap <git-url> --team <team> --agent <name> [--type <type>] [--project <path>] [--env-id <id>] [--include-history]}"
+    shift || true
+    B_TEAM="" B_AGENT="" B_TYPE="claude-code" B_PROJECT="$PWD" B_ENV_ID="${AGMSG_ENV_ID:-}" B_HISTORY=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --team) B_TEAM="${2:?--team needs a value}"; shift 2 ;;
+        --agent) B_AGENT="${2:?--agent needs a value}"; shift 2 ;;
+        --type) B_TYPE="${2:?--type needs a value}"; shift 2 ;;
+        --project) B_PROJECT="${2:?--project needs a value}"; shift 2 ;;
+        --env-id) B_ENV_ID="${2:?--env-id needs a value}"; shift 2 ;;
+        --include-history) B_HISTORY="--include-history"; shift ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$B_TEAM" ] || { echo "Error: bootstrap requires --team" >&2; exit 1; }
+    [ -n "$B_AGENT" ] || { echo "Error: bootstrap requires --agent" >&2; exit 1; }
+    require_git
+
+    bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
+    # join.sh tolerates re-joins (same name adds a registration, not a dup).
+    bash "$SCRIPT_DIR/join.sh" "$B_TEAM" "$B_AGENT" "$B_TYPE" "$B_PROJECT"
+    # shellcheck disable=SC2086  # B_HISTORY is deliberately word-split ('' or one flag)
+    if [ -n "$B_ENV_ID" ]; then
+      bash "$SCRIPT_DIR/remote.sh" add "$B_URL" --env-id "$B_ENV_ID" $B_HISTORY
+    else
+      bash "$SCRIPT_DIR/remote.sh" add "$B_URL" $B_HISTORY
+    fi
+    # First pull so anything sent while this environment was dead is already
+    # in the store before the first inbox check.
+    bash "$SCRIPT_DIR/remote.sh" pull --quiet || echo "Warning: initial pull failed; the next sync catches up" >&2
+    echo "Bootstrap complete: $B_AGENT @ $B_TEAM on $B_URL"
     ;;
 
   status)
@@ -106,7 +218,9 @@ case "$ACTION" in
     PENDING=0
     if [ -f "$DB" ]; then
       sync_migrate "$DB"
-      PENDING=$(agmsg_sqlite "$DB" "SELECT count(*) FROM messages WHERE uuid IS NULL AND origin IS NULL;")
+      # Pre-bind history (id <= export_cutoff) never exports, so it is not
+      # "pending" — counting it would show a forever-stuck backlog (#19).
+      PENDING=$(agmsg_sqlite "$DB" "SELECT count(*) FROM messages WHERE uuid IS NULL AND origin IS NULL AND id > $(sync_export_cutoff);")
     fi
     AHEAD=$(git -C "$(sync_bus_dir)" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
     echo "url: $(sync_remote_url)"
@@ -162,7 +276,7 @@ case "$ACTION" in
     ;;
 
   *)
-    echo "Unknown action: $ACTION (use add|status|sync|pull|push|remove)" >&2
+    echo "Unknown action: $ACTION (use add|bootstrap|status|sync|pull|push|remove)" >&2
     exit 1
     ;;
 esac

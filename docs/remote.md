@@ -26,6 +26,11 @@ connections, but they can all clone and push a private repo.
 ~/.agents/skills/agmsg/scripts/remote.sh add git@github.com:yourname/agmsg-bus.git
 ```
 
+Messages that already exist in the store at `add` time stay local: binding a
+bus means "share from now on", not "publish my backlog into a permanent git
+history". Pass `--include-history` to also export the pre-existing backlog
+(machine migration, backup).
+
 That's it. `send.sh` now pushes new messages to the bus in the background,
 and the Stop-hook inbox check (and `inbox.sh`) pulls remote messages before
 reading, so cross-environment messages arrive through the exact same
@@ -34,7 +39,9 @@ delivery path as local ones.
 ## Commands
 
 ```bash
-remote.sh add <git-url>   # bind this store to a bus repo (clones it)
+remote.sh add <git-url> [--include-history]
+                          # bind this store to a bus repo (clones it);
+                          # pre-existing messages stay local unless the flag is given
 remote.sh status          # url, env id, unexported/unpushed counts
 remote.sh sync            # pull + import, then export + push
 remote.sh pull            # fetch remote events into the local store
@@ -44,6 +51,24 @@ remote.sh remove          # forget the bus; local messages are kept
 
 `sync` is what you run by hand when you want to force a round trip; the
 hooks call `pull`/`push` automatically.
+
+## Ephemeral environments (cloud sandboxes)
+
+A recycled container forgets its store, identity, and bus binding. Put one
+idempotent line in the environment's setup script (or SessionStart hook)
+and every fresh container comes back as the same agent:
+
+```bash
+~/.agents/skills/agmsg/scripts/remote.sh bootstrap git@github.com:you/agmsg-bus.git \
+  --team myteam --agent cloudy --env-id cloud-main
+```
+
+It initializes the store, joins the team, binds the bus, and pulls anything
+that arrived while the environment was dead. The pinned `--env-id` (or
+`AGMSG_ENV_ID`) makes the reborn environment resume its own writer files
+instead of littering the bus with one-shot ids — run at most ONE live
+instance per pinned id, or two writers would share a file and break the
+no-conflict guarantee.
 
 ## How it works
 

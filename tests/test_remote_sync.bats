@@ -49,11 +49,16 @@ connect_both() {
   grep -q '^env_id=' "$TEST_SKILL_DIR/db/remote.conf"
 }
 
-@test "remote add: refuses to rebind without remove" {
+@test "remote add: same url re-add is a no-op; rebinding elsewhere refuses" {
   bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  # Idempotent since #15 so bootstrap scripts can run add on every boot.
   run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
-  [ "$status" -ne 0 ]
+  [ "$status" -eq 0 ]
   [[ "$output" =~ "already configured" ]]
+  git init -q --bare "$TEST_SKILL_DIR/elsewhere.git"
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/elsewhere.git"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "remove" ]]
 }
 
 @test "remote status: reports url and pending counts" {
@@ -216,6 +221,99 @@ sqlite_mem_db() {
   [[ "$output" =~ "NOT configured" ]]
   [ ! -f "$TEST_SKILL_DIR/db/remote.conf" ]
   [ ! -d "$TEST_SKILL_DIR/db/bus" ]
+}
+
+@test "add: --env-id / AGMSG_ENV_ID pins the environment id (#15)" {
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id cloud-main
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "cloud-main" ]]
+  [ "$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")" = "cloud-main" ]
+  bash "$SCRIPTS/remote.sh" remove
+  AGMSG_ENV_ID=cloud-env2 run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  [ "$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")" = "cloud-env2" ]
+}
+
+@test "add: idempotent re-add for the same url; different url still refuses (#15)" {
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id pin
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id pin
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "already configured" ]]
+  git init -q --bare "$TEST_SKILL_DIR/other.git"
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/other.git"
+  [ "$status" -ne 0 ]
+}
+
+@test "add: a re-created environment with a pinned id resumes its writer file (#15)" {
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id reborn
+  bash "$SCRIPTS/send.sh" testteam alice bob "first life" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  # Container recycled: conf and clone are gone, the bus remembers.
+  bash "$SCRIPTS/remote.sh" remove
+  bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --env-id reborn
+  bash "$SCRIPTS/send.sh" testteam alice bob "second life" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  # One writer file for the pinned id, holding both lives' events.
+  files=$(ls "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl | wc -l | tr -d ' ')
+  [ "$files" = "1" ]
+  grep -q "first life" "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl
+  grep -q "second life" "$TEST_SKILL_DIR"/db/bus/events/testteam/reborn.*.jsonl
+}
+
+@test "bootstrap: one shot sets up store, identity, and bus; re-run is a no-op (#17)" {
+  run bash "$SCRIPTS/remote.sh" bootstrap "$TEST_SKILL_DIR/bus.git" \
+    --team busteam --agent reborn-agent --type claude-code --project /tmp/project-x --env-id boot-1
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Bootstrap complete" ]]
+  [ "$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")" = "boot-1" ]
+  # Identity resolved.
+  run bash "$SCRIPTS/whoami.sh" /tmp/project-x claude-code
+  [[ "$output" =~ "reborn-agent" ]]
+  # Second boot of the "same" environment: silently idempotent.
+  run bash "$SCRIPTS/remote.sh" bootstrap "$TEST_SKILL_DIR/bus.git" \
+    --team busteam --agent reborn-agent --type claude-code --project /tmp/project-x --env-id boot-1
+  [ "$status" -eq 0 ]
+}
+
+@test "bootstrap: delivers messages that arrived while the environment was dead (#17)" {
+  connect_both
+  bash "$SCRIPTS/send.sh" testteam alice bob "sent while B was down" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  # Environment C is born fresh and bootstraps as bob's new home.
+  ENV_C="$TEST_SKILL_DIR/db-c"
+  mkdir -p "$ENV_C"
+  AGMSG_STORAGE_PATH="$ENV_C" run bash "$SCRIPTS/remote.sh" bootstrap "$TEST_SKILL_DIR/bus.git" \
+    --team testteam --agent bob --type claude-code --project /tmp/project-b --env-id env-c
+  [ "$status" -eq 0 ]
+  AGMSG_STORAGE_PATH="$ENV_C" run bash "$SCRIPTS/inbox.sh" testteam bob
+  [[ "$output" =~ "sent while B was down" ]]
+}
+
+@test "add: pre-existing history stays local by default (#19)" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "old secret one" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam alice bob "old secret two" >/dev/null
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "2 existing local message(s) will NOT be shared" ]]
+  bash "$SCRIPTS/send.sh" testteam alice bob "new after bind" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  bash "$SCRIPTS/remote.sh" sync   # a second sync must not leak it either
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "new after bind" HEAD --
+  [ "$status" -eq 0 ]
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "old secret" HEAD --
+  [ "$status" -ne 0 ]
+  # The held-back history is not reported as a stuck backlog.
+  run bash "$SCRIPTS/remote.sh" status
+  [[ "$output" =~ "unexported messages: 0" ]]
+}
+
+@test "add: --include-history exports the backlog (#19)" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "shared backlog" >/dev/null
+  run bash "$SCRIPTS/remote.sh" add "$TEST_SKILL_DIR/bus.git" --include-history
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "WILL be shared" ]]
+  bash "$SCRIPTS/remote.sh" sync
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "shared backlog" HEAD --
+  [ "$status" -eq 0 ]
 }
 
 @test "sync: a dotted team name join.sh accepts ('.foo') replicates" {
