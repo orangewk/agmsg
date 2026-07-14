@@ -283,7 +283,8 @@ sync_export() {
         AND id > $cutoff
         AND uuid NOT IN (
           SELECT json_extract(value, '\$.id')
-          FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp_own")')))
+          FROM json_each(readfile('$(agmsg_sql_readfile_path "$tmp_own")'))
+          WHERE json_extract(value, '\$.id') IS NOT NULL)
       ORDER BY id ASC;"); then
       fail=1
       rm -f "$tmp_own"

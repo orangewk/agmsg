@@ -153,6 +153,22 @@ sqlite_mem_db() {
   [ "$status" -ne 0 ]
 }
 
+@test "sync: a read receipt does not block later messages from the same env (#16)" {
+  connect_both
+  bash "$SCRIPTS/send.sh" testteam alice bob "first message" >/dev/null
+  bash "$SCRIPTS/remote.sh" sync
+  in_b "$SCRIPTS/remote.sh" sync
+  in_b "$SCRIPTS/inbox.sh" testteam bob >/dev/null
+
+  # B's writer now contains a message_read line without an id. A later sent
+  # event from the same environment must still pass the writer-file filter.
+  in_b "$SCRIPTS/send.sh" testteam bob alice "message after read" >/dev/null
+  bash "$SCRIPTS/remote.sh" pull
+  run bash "$SCRIPTS/inbox.sh" testteam alice
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "message after read" ]]
+}
+
 @test "sync: concurrent writers converge after a push race" {
   connect_both
   # Both environments write before either pushes: B's push lands second and
