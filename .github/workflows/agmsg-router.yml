@@ -1,0 +1,133 @@
+# agmsg router (ADR 0006) — commit as .github/workflows/agmsg-router.yml on
+# the BUS branch of the bus repository.
+#
+# Contract, in one sentence: read the metadata of newly appended event lines,
+# and deliver only deliverables, to subscribers whose filter matches and who
+# are not the writer, via their registered wake kind.
+#
+# Event classes (must match scripts/lib/sync.sh):
+#   deliverable   message_sent (and legacy lines with no type)  -> wake recipient
+#   state gossip  message_read                                  -> wake no one
+#
+# Security posture: never checks out or executes bus content, uses no
+# third-party actions, and emits only metadata (team/agent names and counts —
+# never message bodies). Anyone with push access to the bus branch can edit
+# this file; that is unchanged from ADR 0005's trust model.
+name: agmsg router
+
+on:
+  push:
+    branches: [bus]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: agmsg-router
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route deliverable events to subscribers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+
+          # 1. Newly appended event lines. github.event.commits carries no
+          #    file lists in Actions push payloads, so ask the compare API
+          #    (fall back to the head commit on a branch-create push).
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            src="${api}/commits/${AFTER}"
+          else
+            src="${api}/compare/${BEFORE}...${AFTER}"
+          fi
+          resp=$(curl -sf "${auth[@]}" "$src")
+
+          # filename<TAB>added-line for every appended line in events/ files.
+          added=$(jq -r '
+            .files[]?
+            | select(.filename | startswith("events/"))
+            | .filename as $f
+            | (.patch // "") | split("\n")[]
+            | select(startswith("+") and (startswith("+++") | not))
+            | ltrimstr("+")
+            | select(length > 0)
+            | "\($f)\t\(.)"' <<<"$resp")
+          [ -n "$added" ] || { echo "No appended event lines; nothing to route."; exit 0; }
+
+          # 2. Classify. Keep deliverables as team<TAB>to<TAB>writer_env; drop
+          #    gossip. Only metadata fields are extracted; bodies never leave
+          #    this step.
+          deliverables=$(while IFS=$'\t' read -r fname line; do
+            case "$fname" in events/*/*) ;; *) continue ;; esac
+            team=${fname#events/}; team=${team%%/*}
+            base=${fname##*/}; wenv=${base%%.*}
+            meta=$(jq -r '
+              select((.type // "message_sent") == "message_sent")
+              | [.team // "", .to // ""] | @tsv' <<<"$line" 2>/dev/null) || continue
+            [ -n "$meta" ] || continue
+            to=${meta#*$'\t'}; evteam=${meta%%$'\t'*}
+            # The event's team field is authoritative (import works the same
+            # way); the path is only a namespace. Distrust mismatches.
+            [ "$evteam" = "$team" ] || continue
+            [ -n "$to" ] || continue
+            printf '%s\t%s\t%s\n' "$team" "$to" "$wenv"
+          done <<<"$added")
+          [ -n "$deliverables" ] || { echo "Only state gossip in this push; waking no one."; exit 0; }
+
+          # 3. Match against the subscriber registry at this push's tree and
+          #    aggregate a count per matched subscriber.
+          matches=""
+          for team in $(cut -f1 <<<"$deliverables" | sort -u); do
+            case "$team" in *[!A-Za-z0-9._-]*|''|-*) continue ;; esac
+            subs=$(curl -s "${auth[@]}" "${api}/contents/subscribers/${team}?ref=${AFTER}") || continue
+            jq -e 'type == "array"' >/dev/null 2>&1 <<<"$subs" || continue
+            for path in $(jq -r '.[] | select(.type == "file") | .path' <<<"$subs"); do
+              entry=$(curl -sf "${auth[@]}" "${api}/contents/${path}?ref=${AFTER}" \
+                | jq -r '.content' | base64 -d) || continue
+              read -r s_env s_to s_kind s_pr < <(jq -r \
+                '[.env // "", .filter.to // "", .wake.kind // "", (.wake.pr // "") | tostring] | join(" ")' \
+                <<<"$entry" 2>/dev/null) || continue
+              [ -n "$s_to" ] || continue
+              count=$(awk -F'\t' -v t="$team" -v to="$s_to" -v env="$s_env" \
+                '$1 == t && $2 == to && $3 != env' <<<"$deliverables" | wc -l | tr -d ' ')
+              [ "$count" -gt 0 ] || continue
+              matches+="${team}"$'\t'"${s_to}"$'\t'"${s_kind}"$'\t'"${s_pr}"$'\t'"${count}"$'\n'
+            done
+          done
+          [ -n "$matches" ] || { echo "Deliverables matched no subscriber; waking no one."; exit 0; }
+
+          # 4. Deliver. Failures are logged, not fatal: wake is best-effort
+          #    sugar on a transport that already works by polling.
+          while IFS=$'\t' read -r team agent kind pr count; do
+            [ -n "$team" ] || continue
+            if [ "$kind" != "pr-comment" ]; then
+              echo "warn: $team/$agent has unknown wake kind '$kind'; skipped"
+              continue
+            fi
+            case "$pr" in *[!0-9]*|'') echo "warn: $team/$agent has non-numeric wake pr '$pr'; skipped"; continue ;; esac
+            # Drop this router's earlier comment so the wake PR stays at one.
+            curl -s "${auth[@]}" "${api}/issues/${pr}/comments?per_page=100" \
+              | jq -r '.[] | select(.user.login == "github-actions[bot]")
+                           | select(.body | startswith("<!-- agmsg-wake -->"))
+                           | .id' \
+              | while read -r cid; do
+                  curl -s -X DELETE "${auth[@]}" "${api}/issues/comments/${cid}" >/dev/null || true
+                done
+            body=$(printf '<!-- agmsg-wake -->\n:alarm_clock: %s new message(s) for %s/%s on the agmsg bus — pull and check your inbox.' \
+                   "$count" "$team" "$agent")
+            if jq -n --arg body "$body" '{body: $body}' \
+              | curl -sf -X POST "${auth[@]}" "${api}/issues/${pr}/comments" -d @- >/dev/null; then
+              echo "Woke $team/$agent via PR #$pr ($count deliverable(s))."
+            else
+              echo "warn: could not comment on PR #$pr for $team/$agent (closed? missing?)"
+            fi
+          done <<<"$matches"
