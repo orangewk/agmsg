@@ -156,6 +156,12 @@ Do NOT manually edit config files. Always use join.sh.
 ~/.agents/skills/agmsg/scripts/remote.sh sync
 ~/.agents/skills/agmsg/scripts/remote.sh remove
 
+# Notification layer (ADR 0006) — have the bus's router wake this agent's
+# session (via a comment on an open PR the session watches) when a message
+# for them lands. Read receipts and the agent's own writes wake no one.
+~/.agents/skills/agmsg/scripts/remote.sh subscribe <team> <agent> --pr <number>
+~/.agents/skills/agmsg/scripts/remote.sh unsubscribe <team> <agent>
+
 # One idempotent line for ephemeral environments (cloud sandboxes): init
 # store + join + bind bus + first pull. Safe to run on every boot.
 ~/.agents/skills/agmsg/scripts/remote.sh bootstrap <git-url> --team <team> --agent <name> [--env-id <id>]

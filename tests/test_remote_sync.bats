@@ -484,3 +484,50 @@ sqlite_mem_db() {
     sleep 0.5
   done
 }
+
+# --- subscriber registry (ADR 0006) ---
+
+@test "subscribe: writes the registry entry to the bus and pushes it (#ADR-0006)" {
+  connect_both
+  run bash "$SCRIPTS/remote.sh" subscribe testteam bob --pr 23
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Subscribed" ]]
+  # The entry is on the bus itself, visible to any other environment.
+  entry=$(git -C "$TEST_SKILL_DIR/bus.git" show HEAD:subscribers/testteam/bob.json)
+  env_id=$(sed -n 's/^env_id=//p' "$TEST_SKILL_DIR/db/remote.conf")
+  [ "$(echo "$entry" | tr -d ' \n')" = "{\"env\":\"$env_id\",\"filter\":{\"team\":\"testteam\",\"to\":\"bob\"},\"wake\":{\"kind\":\"pr-comment\",\"pr\":23}}" ]
+}
+
+@test "subscribe: identical re-subscribe is a no-op; changed pr updates" {
+  connect_both
+  bash "$SCRIPTS/remote.sh" subscribe testteam bob --pr 23
+  before=$(git -C "$TEST_SKILL_DIR/bus.git" rev-parse HEAD)
+  run bash "$SCRIPTS/remote.sh" subscribe testteam bob --pr 23
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$TEST_SKILL_DIR/bus.git" rev-parse HEAD)" = "$before" ]
+  bash "$SCRIPTS/remote.sh" subscribe testteam bob --pr 42
+  entry=$(git -C "$TEST_SKILL_DIR/bus.git" show HEAD:subscribers/testteam/bob.json)
+  [[ "$entry" =~ '"pr":42' ]]
+}
+
+@test "unsubscribe: removes the registry entry; missing entry is a no-op" {
+  connect_both
+  bash "$SCRIPTS/remote.sh" subscribe testteam bob --pr 23
+  run bash "$SCRIPTS/remote.sh" unsubscribe testteam bob
+  [ "$status" -eq 0 ]
+  ! git -C "$TEST_SKILL_DIR/bus.git" cat-file -e HEAD:subscribers/testteam/bob.json 2>/dev/null
+  run bash "$SCRIPTS/remote.sh" unsubscribe testteam bob
+  [ "$status" -eq 0 ]
+}
+
+@test "subscribe: rejects path-unsafe names and non-numeric pr" {
+  connect_both
+  run bash "$SCRIPTS/remote.sh" subscribe "../escape" bob --pr 23
+  [ "$status" -ne 0 ]
+  run bash "$SCRIPTS/remote.sh" subscribe testteam "a/b" --pr 23
+  [ "$status" -ne 0 ]
+  run bash "$SCRIPTS/remote.sh" subscribe testteam bob --pr abc
+  [ "$status" -ne 0 ]
+  run bash "$SCRIPTS/remote.sh" subscribe testteam bob
+  [ "$status" -ne 0 ]
+}

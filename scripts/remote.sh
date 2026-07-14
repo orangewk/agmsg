@@ -16,6 +16,14 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 #        remote.sh sync              pull + import, then export + push
 #        remote.sh pull              fetch remote events into the local store
 #        remote.sh push              export local messages and push them out
+#        remote.sh subscribe <team> <agent> --pr <number>
+#                                    register this environment in the bus's
+#                                    subscriber registry (ADR 0006): the
+#                                    router wakes <agent> via a comment on
+#                                    the given open PR when a message for
+#                                    them lands on the bus
+#        remote.sh unsubscribe <team> <agent>
+#                                    remove that registration
 #        remote.sh remove            forget the bus (local store is untouched)
 #
 # pull/push/sync accept --quiet (suppress the one-line summary).
@@ -268,6 +276,57 @@ case "$ACTION" in
     fi
     ;;
 
+  subscribe)
+    S_TEAM="${1:?Usage: remote.sh subscribe <team> <agent> --pr <number>}"
+    S_AGENT="${2:?Usage: remote.sh subscribe <team> <agent> --pr <number>}"
+    shift 2 || true
+    S_PR=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --pr) S_PR="${2:?--pr needs a value}"; shift 2 ;;
+        --quiet) shift ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$S_PR" ] || { echo "Error: subscribe requires --pr <number> (the open PR this session watches)" >&2; exit 1; }
+    case "$S_PR" in *[!0-9]*|'') echo "Error: --pr must be a number" >&2; exit 1 ;; esac
+    # Registry entries become bus file paths; hold them to the same
+    # path-safety rule as event writer files.
+    _sync_team_pathsafe "$S_TEAM" || { echo "Error: path-unsafe team name: $S_TEAM" >&2; exit 1; }
+    _sync_team_pathsafe "$S_AGENT" || { echo "Error: path-unsafe agent name: $S_AGENT" >&2; exit 1; }
+    require_configured
+    require_git
+    trap sync_unlock EXIT
+    sync_lock || { echo "Error: another sync holds the store lock" >&2; exit 1; }
+    _sync_commit_dirty
+    sync_pull_remote >/dev/null 2>&1 || true
+    if REL=$(sync_subscribe "$S_TEAM" "$S_AGENT" "$S_PR"); then
+      say "Subscribed: $S_TEAM/$S_AGENT wakes via PR #$S_PR ($REL)"
+    else
+      echo "Error: could not push the subscription to the bus (offline? credentials?)" >&2
+      exit 1
+    fi
+    ;;
+
+  unsubscribe)
+    U_TEAM="${1:?Usage: remote.sh unsubscribe <team> <agent>}"
+    U_AGENT="${2:?Usage: remote.sh unsubscribe <team> <agent>}"
+    _sync_team_pathsafe "$U_TEAM" || { echo "Error: path-unsafe team name: $U_TEAM" >&2; exit 1; }
+    _sync_team_pathsafe "$U_AGENT" || { echo "Error: path-unsafe agent name: $U_AGENT" >&2; exit 1; }
+    require_configured
+    require_git
+    trap sync_unlock EXIT
+    sync_lock || { echo "Error: another sync holds the store lock" >&2; exit 1; }
+    _sync_commit_dirty
+    sync_pull_remote >/dev/null 2>&1 || true
+    if sync_unsubscribe "$U_TEAM" "$U_AGENT"; then
+      say "Unsubscribed: $U_TEAM/$U_AGENT"
+    else
+      echo "Error: could not push the unsubscription to the bus (offline? credentials?)" >&2
+      exit 1
+    fi
+    ;;
+
   remove)
     require_configured
     rm -f "$(sync_conf_path)"
@@ -276,7 +335,7 @@ case "$ACTION" in
     ;;
 
   *)
-    echo "Unknown action: $ACTION (use add|bootstrap|status|sync|pull|push|remove)" >&2
+    echo "Unknown action: $ACTION (use add|bootstrap|status|sync|pull|push|subscribe|unsubscribe|remove)" >&2
     exit 1
     ;;
 esac
