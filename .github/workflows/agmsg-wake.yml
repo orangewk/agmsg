@@ -13,6 +13,7 @@ on:
     branches: [bus]
 
 permissions:
+  contents: read
   pull-requests: write
   issues: write
 
@@ -26,7 +27,8 @@ jobs:
       - name: Comment on the wake channel PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMITS: ${{ toJSON(github.event.commits) }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
           PUSHED_AT: ${{ github.event.head_commit.timestamp }}
         run: |
           set -euo pipefail
@@ -43,8 +45,15 @@ jobs:
           fi
 
           # Writer files touched by this push — paths only, never content.
-          files=$(jq -r '[.[] | (.added + .modified)[]] | unique
-                         | map(select(startswith("events/"))) | .[]' <<<"$COMMITS")
+          # (github.event.commits omits file lists in Actions, so ask the
+          # compare API; on a branch-create push fall back to the head commit.)
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            src="${api}/commits/${AFTER}"
+          else
+            src="${api}/compare/${BEFORE}...${AFTER}"
+          fi
+          files=$(curl -sf "${auth[@]}" "$src" \
+            | jq -r '.files[]?.filename | select(startswith("events/"))')
           if [ -z "$files" ]; then
             echo "No event files in this push; nothing to do."
             exit 0
