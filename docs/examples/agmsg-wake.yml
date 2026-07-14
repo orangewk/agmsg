@@ -1,0 +1,75 @@
+# agmsg wake glue — wakes webhook-subscribed cloud agent sessions when the
+# bus receives new events, by commenting on the perpetual "wake channel" PR
+# (the open PR whose head branch is agmsg/wake-channel).
+#
+# Security posture: this workflow never checks out or executes bus content,
+# uses no third-party actions, and posts file *paths* only — never message
+# bodies. Keep it that way: anyone with push access to the bus branch can
+# edit this file, so the bus remains a single trust domain (ADR 0005).
+name: agmsg wake
+
+on:
+  push:
+    branches: [bus]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: agmsg-wake
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on the wake channel PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PUSHED_AT: ${{ github.event.head_commit.timestamp }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+          owner="${GITHUB_REPOSITORY%%/*}"
+
+          pr=$(curl -sf "${auth[@]}" \
+            "${api}/pulls?state=open&head=${owner}:agmsg/wake-channel" \
+            | jq -r '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            echo "No open wake channel PR (head agmsg/wake-channel); nothing to do."
+            exit 0
+          fi
+
+          # Writer files touched by this push — paths only, never content.
+          # (github.event.commits omits file lists in Actions, so ask the
+          # compare API; on a branch-create push fall back to the head commit.)
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            src="${api}/commits/${AFTER}"
+          else
+            src="${api}/compare/${BEFORE}...${AFTER}"
+          fi
+          files=$(curl -sf "${auth[@]}" "$src" \
+            | jq -r '.files[]?.filename | select(startswith("events/"))')
+          if [ -z "$files" ]; then
+            echo "No event files in this push; nothing to do."
+            exit 0
+          fi
+
+          # Drop earlier wake comments so the PR does not accumulate noise.
+          curl -sf "${auth[@]}" "${api}/issues/${pr}/comments?per_page=100" \
+            | jq -r '.[] | select(.user.login == "github-actions[bot]")
+                         | select(.body | startswith("<!-- agmsg-wake -->"))
+                         | .id' \
+            | while read -r cid; do
+                curl -s -X DELETE "${auth[@]}" "${api}/issues/comments/${cid}" || true
+              done
+
+          body=$(printf '<!-- agmsg-wake -->\n:alarm_clock: agmsg bus updated at %s\n\n```\n%s\n```' \
+                 "${PUSHED_AT:-unknown}" "$files")
+          jq -n --arg body "$body" '{body: $body}' \
+            | curl -sf -X POST "${auth[@]}" "${api}/issues/${pr}/comments" -d @- >/dev/null
+          echo "Woke wake channel PR #${pr}."

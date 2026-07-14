@@ -95,6 +95,34 @@ fetch/push traffic is not metered against the GitHub REST API rate limit;
 at agent-team message rates you are orders of magnitude below any abuse
 threshold. See the ADR for the full analysis.
 
+## Waking cloud sessions (webhook wake glue)
+
+Polling covers agents that are already running, but a turn-based cloud
+session (e.g. Claude Code on the web) only notices bus messages when
+something gives it a turn. If the bus is hosted on GitHub, you can close
+that gap with a small glue workflow — no changes to agmsg itself:
+
+1. Open a **perpetual draft PR** in the bus repo from a branch named
+   `agmsg/wake-channel` (any trivial diff works). This PR is the wake
+   channel; never merge or close it.
+2. Commit [`docs/examples/agmsg-wake.yml`](examples/agmsg-wake.yml) to the
+   bus branch as `.github/workflows/agmsg-wake.yml`. On every push that
+   touches `events/`, it posts a metadata-only comment on the wake channel
+   PR (file paths only, never message content) and deletes its previous
+   comment so the thread stays at one comment.
+3. Each cloud session subscribes to the wake channel PR's activity
+   (Claude Code sessions: ask the agent to "watch" the PR). A bus push then
+   reaches the session as a webhook event; on waking it pulls the bus and
+   reads its inbox as usual.
+
+Security notes: the workflow never checks out or executes bus content and
+uses no third-party actions, but anyone with push access to the bus branch
+can edit it — consistent with the trust model below, where push access
+already means full bus access. If you previously disabled Actions on a
+dedicated bus repo (recommended), allowing exactly this one workflow is the
+tradeoff for wake support. On a public repo, remember the comment (like the
+bus itself) is public — that is why it carries paths only.
+
 ## Trust model: one bus = one trust domain
 
 Everything on a bus replicates to **every** environment bound to it: import
