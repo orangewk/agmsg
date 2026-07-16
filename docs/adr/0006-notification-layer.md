@@ -44,6 +44,27 @@ declared in the table below. New event types must declare theirs.
 | **deliverable** | `message_sent` (and legacy lines with no `type`) | yes | the recipient only |
 | **state gossip** | `message_read` | yes | no one — it converges whenever the peer next syncs |
 
+**Cost principle (model context is the expensive resource).** *(amended
+2026-07-16)* The wake decision itself runs outside any model session — in
+scripts, the router, and the registry. Until a deliverable exists for a
+recipient, a check must not add a single token to a model session's
+context. Two costs stack when this is violated:
+
+- an empty-check turn permanently occupies session context and pollutes
+  the visible thread (the original motivation for this layer);
+- intermittent in-session checks are also the worst case for prompt-cache
+  economics: checks spaced beyond the provider's cache TTL re-read the
+  session's entire accumulated context at cold input price on every wake,
+  so the cost of "nothing to do" grows with the age of the thread it
+  lands in.
+
+This is why the class table exists: state gossip converges on the next
+sync precisely so it never buys a model turn. Upstream's native Scheduled
+monitor (fujibee/agmsg#375) illustrates the contrast — its metadata check
+is a shell script, but the *carrier* of each check is a scheduled model
+turn in the visible thread, so every empty check pays the turn + cache
+cost this layer is designed to avoid (analysis: issue #22).
+
 **Subscriber routing (delivery).** The bus carries a registry alongside the
 events — one JSON file per (team, agent) that says who wants to be woken and
 how:
@@ -117,4 +138,6 @@ leave with `remote.sh unsubscribe <team> <agent>`.
 
 - ADR 0005 (transport), issue #16 / PR #21 (read receipts)
 - fujibee/agmsg#374 (host-side wake boundary; future `wake.kind`)
+- fujibee/agmsg#375 + issue #22 (upstream Scheduled monitor analysis behind
+  the cost principle)
 - PR #23 (first wake channel PR), PR #24 (implementation)
