@@ -90,12 +90,11 @@ EOF
   [ "$output" = $'team\talice' ]
 }
 
-@test "codex-bridge: resolve-only lists all identities when unfiltered" {
+@test "codex-bridge: resolve-only rejects multiple identities without a role pair" {
   skip_on_windows "codex bridge identity resolution on Windows (#182)"
   run node "$TYPES/codex/codex-bridge.js" --project "$PROJ" --resolve-only
-  [ "$status" -eq 0 ]
-  [[ "$output" == *$'team\talice'* ]]
-  [[ "$output" == *$'team\tbob'* ]]
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "launch one bridge per --pair" ]]
 }
 
 @test "codex-bridge: explicit --pair keeps a single identity" {
@@ -887,6 +886,16 @@ rl.on("line", (line) => {
       send({ jsonrpc: "2.0", id: message.id, error: { message: "missing inline inbox body" } });
       return;
     }
+    const expectedRoots = [
+      process.env.PROJ,
+      `${process.env.TEST_SKILL_DIR}/custom-store`,
+      `${process.env.TEST_SKILL_DIR}/teams`,
+      `${process.env.TEST_SKILL_DIR}/run`,
+    ];
+    if (JSON.stringify(message.params.runtimeWorkspaceRoots) !== JSON.stringify(expectedRoots)) {
+      send({ jsonrpc: "2.0", id: message.id, error: { message: "wrong runtime workspace roots" } });
+      return;
+    }
     send({ jsonrpc: "2.0", id: message.id, result: {} });
     setTimeout(() => {
       send({
@@ -902,7 +911,12 @@ rl.on("line", (line) => {
 EOF
 
   AGMSG_CODEX_APP_SERVER_CMD="node $fake" run node "$TYPES/codex/codex-bridge.js" \
-    --project "$PROJ" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
+    --project "$PROJ" \
+    --workspace-root "$TEST_SKILL_DIR/custom-store" \
+    --workspace-root "$TEST_SKILL_DIR/teams" \
+    --workspace-root "$TEST_SKILL_DIR/run" \
+    --workspace-root "$PROJ" \
+    --team team --name alice --timeout 1 --interval 1 --max-wakes 1 --inline-inbox
 
   [ "$status" -eq 0 ]
   [[ "$output" =~ "started turn" ]]

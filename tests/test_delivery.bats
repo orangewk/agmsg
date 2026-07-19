@@ -752,6 +752,7 @@ JSON
   phys=$(cd "$realproj" && pwd -P)
 
   bash "$SCRIPTS/join.sh" team alice codex "$linkproj" >/dev/null
+  _seed_role_record team alice thread-sym "$linkproj" codex
 
   # Stage a Codex rollout whose session_meta records the PHYSICAL cwd.
   local sdir="$HOME/.codex/sessions/2026/06/19"
@@ -946,7 +947,8 @@ EOF
   # issue's own FIFO repro. A plain `sleep N | check-inbox.sh` does NOT
   # reproduce this: bash waits for every pipeline member, so it looks like a
   # hang even when the hook itself exits immediately.
-  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } > "$fifo" &
+  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } \
+    3>&- 4>&- > "$fifo" &
   local writer_pid="$!"
 
   local newpath="$bindir:$PATH"
@@ -1562,6 +1564,7 @@ JSON
 # --- Codex monitor bridge (#41) ---
 @test "session-start.sh for codex starts bridge when monitor launcher env is present" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice thread-123 "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
   cat >"$fake" <<'EOF'
@@ -1571,6 +1574,7 @@ EOF
   chmod +x "$fake"
 
   AGMSG_CODEX_BRIDGE=1 \
+  AGMSG_STORAGE_PATH="$TEST_SKILL_DIR/custom-store" \
   AGMSG_CODEX_BRIDGE_APP_SERVER="unix://$TEST_SKILL_DIR/run/codex-app-server.test.sock" \
   AGMSG_CODEX_BRIDGE_CMD="$fake" \
   AGMSG_TEST_LOG="$log" \
@@ -1584,6 +1588,7 @@ EOF
 
   [ -f "$log" ]
   grep -q -- "--project $TEST_PROJECT" "$log"
+  grep -q -- "--workspace-root $TEST_SKILL_DIR/custom-store" "$log"
   grep -q -- "--thread thread-123" "$log"
   grep -q -- "--app-server unix://$TEST_SKILL_DIR/run/codex-app-server.test.sock" "$log"
   grep -q -- "--inline-inbox" "$log"
@@ -1863,6 +1868,7 @@ EOF
 
 @test "session-start.sh for codex resolves thread id from rollout when CODEX_THREAD_ID is unset" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice rollout-thread-999 "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
   cat >"$fake" <<'EOF'
@@ -1892,6 +1898,7 @@ EOF
 
 @test "session-start.sh for codex resolves the rollout by real mtime, not filename order (#416)" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice stale-by-name-uuid "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
   cat >"$fake" <<'EOF'

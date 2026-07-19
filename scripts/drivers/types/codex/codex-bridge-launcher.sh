@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs outside Codex's tool sandbox and owns the app-server connection. One
-# bridge subscribes to every unpinned codex identity in this project.
+# The launcher is detached from codex-monitor.sh and may outlive the shell that
+# invoked it. Never retain test-harness result/trace descriptors through the
+# dispatcher -> role child -> bridge process chain.
+exec 3>&- 4>&-
+
+# Runs outside Codex's tool sandbox and owns the app-server connections. The
+# dispatcher starts one bridge per recorded Codex role in this project.
 #
 # On codex 0.141+ the SessionStart hook cannot resolve the thread id
 # (CODEX_THREAD_ID is not exported and no rollout is written for --remote
@@ -14,6 +19,7 @@ TYPE="${1:?Usage: codex-bridge-launcher.sh <type> <project_path> <app_server> <p
 PROJECT="${2:?Missing project_path}"
 APP_SERVER="${3:?Missing app_server}"
 PARENT_PID="${4:?Missing parent_pid}"
+ROLE_PAIR="${5:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -22,10 +28,15 @@ RUN_DIR="$SKILL_DIR/run"
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 PROJECT_HASH="$(printf '%s' "$PROJECT" | agmsg_sha1)"
 REQUEST_FILE="$RUN_DIR/codex-bridge-request.$PROJECT_HASH"
+DISPATCHER_LOCK_RESOURCE="codex-dispatcher:$PROJECT_HASH"
+SERVER_PID_FILE="$RUN_DIR/codex-app-server.$PROJECT_HASH.pid"
 
 # shellcheck source=../../../lib/node.sh
 source "$SCRIPT_DIR/../../../lib/node.sh"
 NODE_BIN="$(agmsg_resolve_node)"
+# shellcheck source=../../../lib/storage.sh
+source "$SCRIPT_DIR/../../../lib/storage.sh"
+STORAGE_DIR="$(agmsg_storage_dir)"
 TAB="$(printf '\t')"
 
 # role-session record (#350): the bridge prefers this role's RECORDED codex thread
@@ -40,9 +51,62 @@ PROJECT_PHYS="$(agmsg_canonical_path "$PROJECT" 2>/dev/null || printf '%s' "$PRO
 
 mkdir -p "$RUN_DIR"
 
+# The app-server is shared by every Codex TUI in a project. Bind dispatcher and
+# role-child lifetime to that shared process rather than whichever TUI happened
+# to start first. Tests/older launchers without the sidecar retain parent-PID
+# fallback behavior.
+LIFETIME_PID="$(cat "$SERVER_PID_FILE" 2>/dev/null || true)"
+if [ -z "$LIFETIME_PID" ] || ! kill -0 "$LIFETIME_PID" 2>/dev/null; then
+  LIFETIME_PID="$PARENT_PID"
+fi
+
+release_dispatcher_lock() {
+  agmsg_runtime_lock_release "$DISPATCHER_LOCK_RESOURCE" "$$"
+}
+
+acquire_dispatcher_lock() {
+  local owner="" attempt _barrier_attempt _barrier_count
+  for attempt in {1..20}; do
+    owner="$(agmsg_runtime_lock_acquire "$DISPATCHER_LOCK_RESOURCE" "$$" 2>/dev/null || true)"
+    if [ "$owner" = "$$" ]; then
+      trap release_dispatcher_lock EXIT
+      trap 'exit 0' INT TERM
+      return 0
+    fi
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      return 1
+    fi
+    if [ -n "${AGMSG_TEST_DISPATCHER_STALE_BARRIER:-}" ]; then
+      : > "$AGMSG_TEST_DISPATCHER_STALE_BARRIER.$$"
+      for _barrier_attempt in {1..100}; do
+        _barrier_count="$(find "$(dirname "$AGMSG_TEST_DISPATCHER_STALE_BARRIER")" \
+          -maxdepth 1 -name "$(basename "$AGMSG_TEST_DISPATCHER_STALE_BARRIER").*" \
+          -type f 2>/dev/null | wc -l | tr -d ' ')"
+        [ "$_barrier_count" -ge 2 ] && break
+        sleep 0.05
+      done
+    fi
+    # Replace only the exact stale generation observed above. SQLite serializes
+    # both statements with competing reclaimers, so once A replaces stale S
+    # with live A, B's `owner = S` delete cannot remove A (true CAS semantics).
+    owner="$(agmsg_runtime_lock_acquire "$DISPATCHER_LOCK_RESOURCE" "$$" "${owner:-0}" 2>/dev/null || true)"
+    if [ "$owner" = "$$" ]; then
+      trap release_dispatcher_lock EXIT
+      trap 'exit 0' INT TERM
+      return 0
+    fi
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
 resolve_identity() {  # prints "team<TAB>name" lines for the project's codex roles
   "$SCRIPT_DIR/../../../identities.sh" "$PROJECT" "$TYPE" 2>/dev/null \
     | awk -v t="$TAB" 'NF >= 2 { print $1 t $2 }' \
+    | { if [ -n "$ROLE_PAIR" ]; then grep -Fx "$ROLE_PAIR" || true; else cat; fi; } \
     | sort -u
 }
 
@@ -62,6 +126,28 @@ safety_fingerprint() {
 
 # actas may register the role a moment after launch, so retry while the parent
 # (codex-monitor.sh) is alive. Multiple identities are intentional (#150).
+# The parent only dispatches. Every role receives an independent child launcher
+# and therefore an independent bridge bound to its own recorded thread.
+if [ -z "$ROLE_PAIR" ]; then
+  acquire_dispatcher_lock || exit 0
+  known_pairs=""
+  while agmsg_runtime_lock_verify "$DISPATCHER_LOCK_RESOURCE" "$$" \
+    && kill -0 "$LIFETIME_PID" 2>/dev/null; do
+    current_pairs="$(resolve_identity || true)"
+    while IFS="$TAB" read -r child_team child_name; do
+      [ -n "$child_team" ] || continue
+      child_pair="$child_team"$'\t'"$child_name"
+      printf '%s\n' "$known_pairs" | grep -Fxq "$child_pair" && continue
+      # Close bats' result fd when present; a detached child must not keep the
+      # test harness pipe open after its test has completed.
+      nohup "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$LIFETIME_PID" "$child_pair" >/dev/null 2>&1 3>&- 4>&- &
+      known_pairs="${known_pairs:+$known_pairs$'\n'}$child_pair"
+    done <<< "$current_pairs"
+    sleep 0.3
+  done
+  exit 0
+fi
+
 ids=""
 while kill -0 "$PARENT_PID" 2>/dev/null; do
   ids="$(resolve_identity || true)"
@@ -99,11 +185,12 @@ while IFS="$TAB" read -r candidate_team candidate_name; do
     # never consume its unread rows from this project. A lone same-project role keeps #350's legacy recorded-thread affinity even
     # before a concrete request thread is available; multiplexed roles require
     # proof and are excluded while the hint is only `loaded`.
-    if [ "$candidate_project_phys" != "$PROJECT_PHYS" ] \
-       || { { [ "$thread_hint" = "loaded" ] && [ "$raw_identity_count" != "1" ]; } \
-            || { [ "$thread_hint" != "loaded" ] && [ "$candidate_thread" != "$thread_hint" ]; }; }; then
+    if [ "$candidate_project_phys" != "$PROJECT_PHYS" ]; then
       continue
     fi
+  else
+    # A role without a recorded seat has no live TUI to receive its turn.
+    continue
   fi
   safe_ids="${safe_ids:+$safe_ids$'\n'}${candidate_team}"$'\t'"${candidate_name}"
 done <<< "$ids"
@@ -113,7 +200,7 @@ ids="$safe_ids"
 if [ -z "$ids" ]; then
   kill -0 "$PARENT_PID" 2>/dev/null || exit 0
   sleep 0.3
-  exec "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$PARENT_PID"
+  exec "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$PARENT_PID" "$ROLE_PAIR"
 fi
 
 identity_count="$(printf '%s\n' "$ids" | grep -c . || true)"
@@ -160,7 +247,7 @@ while kill -0 "$PARENT_PID" 2>/dev/null; do
       old_pid="$(cat "$pidfile" 2>/dev/null || true)"
       [ -n "$old_pid" ] && kill "$old_pid" 2>/dev/null || true
     fi
-    exec "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$PARENT_PID"
+    exec "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$PARENT_PID" "$ROLE_PAIR"
   fi
   # Resolve the app-server URL (and thread) this iteration would launch against
   # FIRST, so the reuse check can compare a live bridge's bound server with the
@@ -179,29 +266,22 @@ EOF
     fi
   fi
 
-  # With exactly one identity, preserve #350's role-session thread affinity.
-  # Multiple identities are multiplexed into the active project thread; a role
-  # that has a recorded thread is handled by its own future launcher pass rather
-  # than being silently mapped to another role's recorded thread.
-  # thread is whichever conversation the server last touched -- ambiguous when a
-  # cwd has run more than one codex thread, so a co-resident thread can capture
-  # this role's messages. The role-session record (#339) stores this role's own
-  # thread deterministically; use it when present AND recorded for THIS project.
-  # A request-file thread (above) still wins; roles with no record fall back to
-  # "loaded". A foreign-project record was filtered out before launch (#150).
-  # Freshness holds because a role re-runs actas on resume (#339), which
-  # rewrites the record with its current thread.
-  if [ "$thread_id" = "loaded" ] && [ "$(printf '%s\n' "$ids" | grep -c . || true)" = "1" ]; then
-    IFS="$TAB" read -r team name <<EOF
+  # A child launcher is role-scoped. The project request file only supplies a
+  # current app-server endpoint; its thread belongs to whichever role most
+  # recently fired SessionStart and must never override this role's seat.
+  IFS="$TAB" read -r team name <<EOF
 $ids
 EOF
-    rec_thread="$(agmsg_role_session_uuid "$team" "$name" 2>/dev/null || true)"
-    if [ -n "$rec_thread" ]; then
-      rec_project="$(agmsg_role_session_get "$team" "$name" project 2>/dev/null || true)"
-      rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
-      [ "$rec_project_phys" = "$PROJECT_PHYS" ] && thread_id="$rec_thread"
-    fi
+  rec_thread="$(agmsg_role_session_uuid "$team" "$name" 2>/dev/null || true)"
+  rec_project="$(agmsg_role_session_get "$team" "$name" project 2>/dev/null || true)"
+  rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
+  if [ -z "$rec_thread" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ]; then
+    sleep 0.3
+    continue
   fi
+  thread_id="$rec_thread"
+
+  # The role-session record is the sole thread authority (#150 phase 2/#350).
 
   if [ -f "$pidfile" ]; then
     bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
@@ -225,17 +305,29 @@ EOF
       fi
       kill "$bridge_pid" 2>/dev/null || true
       rm -f "$pidfile" "$appserver_file" "$thread_file"
+    else
+      rm -f "$pidfile" "$appserver_file" "$thread_file"
     fi
   fi
 
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" \
+    --workspace-root "$STORAGE_DIR" \
+    --workspace-root "$SKILL_DIR/teams" \
+    --workspace-root "$SKILL_DIR/run" \
     --type "$TYPE" \
     "${bridge_pairs[@]}" \
     --thread "$thread_id" \
     --app-server "$req_app_server" \
     --inline-inbox \
-    >>"$log" 2>&1 &
+    >>"$log" 2>&1 3>&- 4>&- &
+  launched_pid=$!
+  printf '%s\n' "$launched_pid" > "$pidfile"
+  if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
+    wait "$launched_pid" 2>/dev/null || true
+    recorded_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ "$recorded_pid" != "$launched_pid" ] || rm -f "$pidfile"
+  fi
   # Record what this bridge is bound to so a later launcher can detect staleness.
   printf '%s' "$req_app_server" > "$appserver_file"
   printf '%s' "$thread_id" > "$thread_file"
