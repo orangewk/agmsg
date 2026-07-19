@@ -145,7 +145,12 @@ sync_migrate() {
 # The pending insert precedes the UPDATE in one transaction; a crash cannot
 # leave a read row without its receipt candidate.
 sync_mark_read() {
-  local db="$1" team_sql="$2" agent_sql="$3"
+  local db="$1" team_sql="$2" agent_sql="$3" ids_sql="${4:-}" id_filter=""
+  case "$ids_sql" in
+    '' ) ;;
+    *[!0-9,]* ) return 1 ;;
+    * ) id_filter=" AND id IN ($ids_sql)" ;;
+  esac
   sync_migrate "$db" || return 1
   agmsg_sqlite "$db" "
     BEGIN IMMEDIATE;
@@ -153,13 +158,13 @@ sync_mark_read() {
     SELECT uuid, strftime('%Y-%m-%dT%H:%M:%SZ','now')
     FROM messages
     WHERE team='$team_sql' AND to_agent='$agent_sql'
-      AND read_at IS NULL AND uuid IS NOT NULL;
+      AND read_at IS NULL AND uuid IS NOT NULL$id_filter;
     UPDATE messages
     SET read_at = COALESCE(
       (SELECT read_at FROM sync_reads_pending
        WHERE sync_reads_pending.uuid = messages.uuid),
       strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-    WHERE team='$team_sql' AND to_agent='$agent_sql' AND read_at IS NULL;
+    WHERE team='$team_sql' AND to_agent='$agent_sql' AND read_at IS NULL$id_filter;
     COMMIT;"
 }
 
