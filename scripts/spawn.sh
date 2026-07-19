@@ -294,7 +294,8 @@ resolve_team() {
   project_sql_in=$(agmsg_project_sql_in_list "$PROJECT")
   for config_file in "$TEAMS_DIR"/*/config.json; do
     [ -f "$config_file" ] || continue
-    cfg_sql=$(printf '%s' "$config_file" | sed "s/'/''/g")
+    # readfile() needs a native-Windows path — agmsg_sql_readfile_path converts and SQL-escapes it.
+    cfg_sql=$(agmsg_sql_readfile_path "$config_file")
     team_name=$(agmsg_sqlite_mem \
       "SELECT json_extract(CAST(readfile('$cfg_sql') AS TEXT), '\$.name');")
     # Does any agent in this team have a registration for PROJECT (any type)?
@@ -525,13 +526,6 @@ launch_in_tmux() {
   local _spawn_rec; _spawn_rec="$(agmsg_spawn_path "$TEAM" "$NAME")"
   printf '%s\t%s\t%s\n' "$target_id" "$PROJECT" "$AGENT_TYPE" \
     > "$_spawn_rec" 2>/dev/null || true
-  # Lifecycle ledger (#8): despawn.sh (both the graceful and --force path) and
-  # session-end's actas-lock release are the disposal side — see
-  # manifest_record_dispose calls added there. Best-effort; a missed record
-  # just means gc.sh's future scheduled-task/automation sweep (not yet
-  # implemented) won't see this placement as its own — it does not affect
-  # despawn's existing tmux-id-based teardown, which reads $_spawn_rec
-  # directly and does not consult the manifest.
   manifest_record_create state-file \
     "$(manifest_state_file_id "$_spawn_rec")" \
     "$TEAM/$NAME" \

@@ -5,6 +5,8 @@ description: Cross-agent messaging via SQLite. Send messages between Claude Code
 
 Agent messaging command. **IMPORTANT: Always use the provided scripts. NEVER directly read or edit config files, DB, or team data. There is NO register.sh — use join.sh to join a team.**
 
+**Shell requirement:** All agmsg scripts are Bash scripts. Always execute them via `bash`, never via PowerShell or cmd directly. If your default shell is not Bash (e.g. PowerShell on Windows), wrap every command with `bash -lc '...'`. Example: `bash -lc '~/.agents/skills/__SKILL_NAME__/scripts/send.sh myteam alice bob "hello"'`. Do NOT construct DB paths manually — the scripts handle path resolution internally. If you need to redirect storage, use `AGMSG_STORAGE_PATH` (the supported override).
+
 ## Identity
 
 If you already know your AGENT and TEAMS from a previous `$__SKILL_NAME__` call in this session, skip to **Execute** below.
@@ -31,7 +33,7 @@ Four possible outputs:
   > - **Agent name**: this agent's identity within the team
 
   1. Ask: "Enter a team name (joins existing or creates new)"
-  2. Ask: "Enter a name for this agent"
+  2. If the team name given already appears in `available_teams`, run `~/.agents/skills/__SKILL_NAME__/scripts/team.sh <team>` to see the current roster (name, type, project) and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role/number suffixes like `aggie-cc1`/`aggie-cc2`, or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. Then ask: "Enter a name for this agent (suggestions: <name1>, <name2>, <name3> — or type your own)". For a brand-new team, skip the roster check and just ask: "Enter a name for this agent".
   3. **You MUST use join.sh** — run: `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <agent_name> cursor "$(pwd)"`
   4. Show the result and explain:
 
@@ -58,7 +60,7 @@ Four possible outputs:
      - **Wait for the user's answer before proceeding.** Empty input means `1` (turn).
      - Map the chosen number to a mode (`1`→`turn`, `2`→`off`) and run:
        `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <mode> cursor "$(pwd)"`
-     - OpenCode has no Monitor tool, so `monitor` and `both` modes are not offered here.
+     - Cursor CLI has no Monitor tool, so `monitor` and `both` modes are not offered here.
 
   6. Then check inbox for the newly joined team.
 
@@ -102,11 +104,11 @@ If argument starts with "config set" (e.g. "config set hook.check_interval 30"):
 2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/config.sh set <key> <value>`
 
 If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
-1. Parse the new role name.
+1. Parse the new role name. If none was given (e.g. bare "actas", or the user asks you to suggest one), run `~/.agents/skills/__SKILL_NAME__/scripts/team.sh <team>` for each TEAM to see the current roster. Look for a naming convention already in play (e.g. a shared base name with role/number suffixes like `aggie-cc1`/`aggie-cc2`, or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label). Either way, names must not collide with the roster. Ask the user to pick one or type their own before continuing.
 2. Run `~/.agents/skills/__SKILL_NAME__/scripts/identities.sh "$(pwd)" cursor` to see whether the role is already registered for this (project, type).
 3. If the name does not appear in the output, join under the existing team. For a single team, run `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <name> cursor "$(pwd)"`. For multiple teams, ask the user which team to join the new role into.
 4. Set the session's active FROM to `<name>` for every `send.sh` call until another `actas`.
-5. Tell the user: "Now acting as `<name>`. Sends will use `<name>` as the from agent. (OpenCode has no Monitor tool, so receive still covers all of your registered roles in this project.)"
+5. Tell the user: "Now acting as `<name>`. Sends will use `<name>` as the from agent. (Cursor CLI has no Monitor tool, so receive still covers all of your registered roles in this project.)"
 
 If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
 1. Parse the role name.
@@ -119,7 +121,7 @@ If argument is "mode" (no further args):
 2. Show the output to the user.
 
 If argument starts with "mode" followed by a mode name (e.g. "mode turn"):
-1. Parse the mode. OpenCode supports only `turn` and `off` — reject `monitor` and `both` with: "OpenCode has no Monitor tool; only `turn` or `off` modes are supported."
+1. Parse the mode. Cursor CLI supports only `turn` and `off` — reject `monitor` and `both` with: "Cursor CLI has no Monitor tool; only `turn` or `off` modes are supported."
 2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <mode> cursor "$(pwd)"`
 
 If argument is "hook on" (legacy alias):

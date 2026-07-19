@@ -19,10 +19,8 @@ source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/sync.sh"
 
-# Remote transport (ADR 0005): a manual inbox check should see what other
-# environments sent, so pull first. Best-effort — offline must not break the
-# inbox — and the pull may CREATE the DB in a receive-only environment, so it
-# runs before the -f check.
+# A manual inbox check should include messages from other environments.
+# Pull first because a receive-only environment may not have a DB yet.
 if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
   bash "$SCRIPT_DIR/remote.sh" pull --quiet >/dev/null 2>&1 || true
 fi
@@ -39,9 +37,10 @@ _agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
 TEAM_SQL="$(_agmsg_sqlesc "$TEAM")"
 AGENT_SQL="$(_agmsg_sqlesc "$AGENT")"
 
-# Get unread messages — escape newlines/tabs in body to keep one record per line
+# Get unread messages — id first so the mark step below targets exactly these
+# rows; escape newlines/tabs in body to keep one record per line
 UNREAD=$(agmsg_sqlite "$DB" "
-  SELECT from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
+  SELECT id || char(31) || from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
   FROM messages WHERE team='$TEAM_SQL' AND to_agent='$AGENT_SQL' AND read_at IS NULL
   ORDER BY created_at ASC;
 ")
@@ -52,20 +51,42 @@ if [ -z "$UNREAD" ]; then
   exit 0
 fi
 
-# Display
+# Display, collecting the ids actually shown
 COUNT=$(echo "$UNREAD" | wc -l | tr -d ' ')
 echo "$COUNT new message(s):"
 echo ""
-while IFS=$'\x1f' read -r from body ts; do
+IDS=""
+while IFS=$'\x1f' read -r id from body ts; do
   echo "  [$ts] $from: $body"
+  case "$id" in
+    ''|*[!0-9]*) ;; # defensive: never splice a non-numeric value into SQL
+    *) IDS="${IDS:+$IDS,}$id" ;;
+  esac
 done <<< "$UNREAD"
 echo ""
 
-# Mark as read (non-fatal — may fail in sandboxed environments)
-if sync_configured; then
-  sync_mark_read "$DB" "$TEAM_SQL" "$AGENT_SQL" 2>/dev/null \
-    || agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM_SQL' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
-  sync_push_best_effort
-else
-  agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM_SQL' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+# Test seam: a two-file barrier that lets the race regression test land a
+# message deterministically between display and mark. No-op unless set.
+if [ -n "${AGMSG_TEST_MARK_BARRIER:-}" ]; then
+  : > "$AGMSG_TEST_MARK_BARRIER.reached"
+  _agmsg_barrier_waited=0
+  while [ ! -e "$AGMSG_TEST_MARK_BARRIER.release" ]; do
+    sleep 0.05
+    _agmsg_barrier_waited=$((_agmsg_barrier_waited + 1))
+    [ "$_agmsg_barrier_waited" -ge 200 ] && break # 10s safety cap
+  done
+fi
+
+# Mark as read (non-fatal — may fail in sandboxed environments).
+# Only the ids displayed above: a blanket "WHERE read_at IS NULL" would also
+# swallow messages that arrived between the SELECT and this UPDATE — they
+# would be marked read without ever having been shown.
+if [ -n "$IDS" ]; then
+  if sync_configured; then
+    sync_mark_read "$DB" "$TEAM_SQL" "$AGENT_SQL" "$IDS" 2>/dev/null \
+      || agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
+    sync_push_best_effort
+  else
+    agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id IN ($IDS);" 2>/dev/null || true
+  fi
 fi
