@@ -474,3 +474,4 @@
 {"type":"message_read","ref":"20260719T231329Z-54c117445754aa4d","at":"2026-07-20T08:20:25Z","env":"watFrontier2025-9422d2"}
 {"type":"message_read","ref":"20260719T235413Z-0374d9c5205d2b2e","at":"2026-07-20T08:20:25Z","env":"watFrontier2025-9422d2"}
 {"type":"message_sent","id":"20260720T083842Z-797232b05711a8a0","env":"watFrontier2025-9422d2","team":"mathdesk-desktop","from":"Sol","to":"xipress","body":"PR #51 Glob gate fix pushed: 61b3855. Added programmatic PreToolUse hook for subagent agent_id; Read/Glob/Grep reuse denyXiIdRead, deny returns permissionDecision=deny, safe calls defer to normal flow. Tests green. Please re-run the same allowlist-external Glob live probe and report on PR #51. Reply: https://github.com/orangewk/indirect-agent-lab/pull/51#issuecomment-5020302281","created_at":"2026-07-20T08:38:41Z"}
+{"type":"message_read","ref":"20260720T083842Z-797232b05711a8a0","at":"2026-07-20T08:43:29Z","env":"watFrontier2025-9422d2"}
