@@ -21,6 +21,15 @@
 //      process, records manifest dispose, and removes the state-file set —
 //      the `delivery.sh set off codex` teardown path (via
 //      scripts/drivers/types/codex/_delivery.sh's agmsg_delivery_on_disable).
+//   5. delivery.sh: stop_codex_bridge actually stops the codex-bridge.js
+//      process it finds alive (orangewk/agmsg#8 follow-up: bpid is a
+//      Windows-native pid — codex-bridge.js's writeMeta() writes its own
+//      process.pid, not the launcher's `nohup ... &` bash $! — and a plain
+//      `kill "$bpid"` (MSYS pid space) silently failed against it even though
+//      `delivery.sh set off codex` reported "Stopped 1 Codex bridge"; fixed by
+//      extracting stop_poc_waker's existing native-kill helper, previously
+//      private to that function, into a shared _agmsg_kill_native_pid both
+//      functions now call).
 //
 // Run via plain `node`, not bats — same reasoning as tests/test-manifest-gc.cjs
 // and tests/test-idle-ttl.cjs (the full bats suite hangs on this Windows dev
@@ -504,7 +513,15 @@ async function runAll() {
       // errors, because half the extracted script's ${...} references had
       // already been silently mangled by the JS engine, not bash, before
       // bash ever saw the string).
-      const fnBody = execFileSync(bash, ["-c", `sed -n '/^stop_poc_waker() {/,/^}/p' ${bashQuote(path.join(dir, "scripts", "delivery.sh"))}`], { encoding: "utf8" });
+      // stop_poc_waker calls _agmsg_kill_native_pid (defined earlier in
+      // delivery.sh, shared with stop_codex_bridge — see that helper's own
+      // comment for why the two functions now share one native-kill
+      // primitive instead of stop_poc_waker keeping a private copy). Extract
+      // both definitions, in file order, so the driver script below has
+      // everything stop_poc_waker's body actually calls.
+      const deliveryShPath = bashQuote(path.join(dir, "scripts", "delivery.sh"));
+      const killHelperBody = execFileSync(bash, ["-c", `sed -n '/^_agmsg_kill_native_pid() {/,/^}/p' ${deliveryShPath}`], { encoding: "utf8" });
+      const fnBody = killHelperBody + execFileSync(bash, ["-c", `sed -n '/^stop_poc_waker() {/,/^}/p' ${deliveryShPath}`], { encoding: "utf8" });
       const driverScript = path.join(dir, "stop-poc-waker-driver.sh");
       fs.writeFileSync(
         driverScript,
@@ -561,6 +578,110 @@ async function runAll() {
       }
       fs.rmSync(dir, { recursive: true, force: true });
       fs.rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  // --- 5. delivery.sh: stop_codex_bridge actually kills the native bpid -----
+  await asyncTest("delivery.sh's stop_codex_bridge kills a live native-pid bridge process (regression for the plain-`kill` bug)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agmsg-waker-lifecycle-test-bridgeoff-"));
+    // stop_codex_bridge (delivery.sh) needs the FULL scripts/ tree: it shells
+    // out to identities.sh (which itself needs lib/resolve-project.sh,
+    // lib/storage.sh, lib/registry-lock.sh, and a real sqlite3 + teams/
+    // config.json — join.sh below creates that config), same reasoning as
+    // the stop_poc_waker driver above.
+    copyDirSync(path.join(repo, "scripts"), path.join(dir, "scripts"));
+    fs.mkdirSync(path.join(dir, "run"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "teams"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "db"), { recursive: true });
+    execFileSync(bash, [path.join(dir, "scripts", "internal", "init-db.sh")], { encoding: "utf8", env: bashEnv() });
+
+    const project = path.join(dir, "project");
+    fs.mkdirSync(project, { recursive: true });
+    const home = path.join(dir, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const env = { ...bashEnv(), HOME: home };
+
+    // Register a codex identity for this project — stop_codex_bridge's own
+    // `identities.sh "$project" codex` lookup needs this pair to find the
+    // pidfile at all (mirrors tests/test_delivery.bats's own `join.sh team
+    // alice codex "$TEST_PROJECT"` setup for its stop_codex_bridge coverage).
+    execFileSync(bash, [path.join(dir, "scripts", "join.sh"), "team", "alice", "codex", project], { encoding: "utf8", env });
+
+    let bridgeChild = null;
+    try {
+      // A real, long-lived Node child stands in for codex-bridge.js: what
+      // matters for this regression is ONLY that child.pid is a genuine
+      // Windows-native pid. codex-bridge.js binds and reports its own
+      // process.pid via writeMeta() — a plain `spawn()` here reports that
+      // same native pid, so this exercises the exact "native pid, plain
+      // `kill` fails" gap the bug lived in (see _agmsg_kill_native_pid's own
+      // comment in delivery.sh for the full mechanism).
+      bridgeChild = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 30000)"]);
+      await new Promise((resolve) => { sleepMs(300); resolve(); });
+
+      const pidfile = path.join(dir, "run", "codex-bridge.team.alice.pid");
+      fs.writeFileSync(pidfile, `${bridgeChild.pid}\n`);
+      fs.writeFileSync(path.join(dir, "run", "codex-bridge.team.alice.meta"), `pid=${bridgeChild.pid}\n`);
+      fs.writeFileSync(path.join(dir, "run", "codex-bridge.team.alice.log"), "");
+      fs.writeFileSync(path.join(dir, "run", "codex-bridge.team.alice.appserver"), "");
+
+      // Confirm the fixture is alive BEFORE calling stop_codex_bridge, so a
+      // later "is it dead" check can't pass merely because it was never
+      // running.
+      let aliveBefore = true;
+      try { process.kill(bridgeChild.pid, 0); } catch (_) { aliveBefore = false; }
+      assert.ok(aliveBefore, "fixture bridge process should be alive before stop_codex_bridge runs");
+
+      // Pull only stop_codex_bridge's own definition (plus the shared
+      // _agmsg_kill_native_pid helper it now calls) out of delivery.sh — same
+      // "source just the function" driver pattern as the stop_poc_waker test
+      // above (delivery.sh itself is a top-level "set -euo pipefail" script
+      // keyed on $1, so sourcing it directly would run its arg-parsing and
+      // exit).
+      const deliveryShPath = path.join(dir, "scripts", "delivery.sh");
+      const fnBody = execFileSync(
+        bash,
+        ["-c", `sed -n '/^_agmsg_kill_native_pid() {/,/^}/p;/^stop_codex_bridge() {/,/^}/p' ${bashQuote(deliveryShPath)}`],
+        { encoding: "utf8" },
+      );
+      const driverScript = path.join(dir, "stop-codex-bridge-driver.sh");
+      fs.writeFileSync(
+        driverScript,
+        [
+          "set -euo pipefail",
+          `SKILL_DIR=${bashQuote(dir)}`,
+          'SCRIPT_DIR="$SKILL_DIR/scripts"',
+          'RUN_DIR="$SKILL_DIR/run"',
+          'source "$SCRIPT_DIR/lib/compat.sh"',
+          'source "$SCRIPT_DIR/lib/resolve-project.sh"',
+          'source "$SCRIPT_DIR/lib/instance-id.sh"',
+          'source "$SCRIPT_DIR/lib/node.sh"',
+          'source "$SCRIPT_DIR/lib/hash.sh"',
+          'source "$SCRIPT_DIR/lib/type-registry.sh"',
+          'source "$SCRIPT_DIR/lib/storage.sh"',
+          'source "$SCRIPT_DIR/lib/manifest.sh"',
+          fnBody,
+          `stop_codex_bridge ${bashQuote(project)}`,
+        ].join("\n"),
+      );
+      const out = execFileSync(bash, ["-c", `source ${bashQuote(driverScript)}`], { encoding: "utf8", timeout: 20000, env });
+      assert.strictEqual(out.trim(), "1", `stop_codex_bridge should report 1 killed, got: ${out}`);
+
+      const deadline = Date.now() + 5000;
+      let bridgeGone = false;
+      while (Date.now() < deadline && !bridgeGone) {
+        try { process.kill(bridgeChild.pid, 0); } catch (_) { bridgeGone = true; }
+        if (!bridgeGone) sleepMs(200);
+      }
+      assert.ok(bridgeGone, "bridge process (native pid) must actually be dead after stop_codex_bridge — this is the regression a plain `kill \"$bpid\"` failed silently at");
+      assert.ok(!fs.existsSync(pidfile), "bridge pidfile should be removed");
+
+      bridgeChild = null;
+    } finally {
+      if (bridgeChild) {
+        try { execFileSync("taskkill.exe", ["/PID", String(bridgeChild.pid), "/T", "/F"], { stdio: "ignore" }); } catch (_) {}
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
