@@ -31,10 +31,14 @@ bus means "share from now on", not "publish my backlog into a permanent git
 history". Pass `--include-history` to also export the pre-existing backlog
 (machine migration, backup).
 
-That's it. `send.sh` now pushes new messages to the bus in the background,
-and the Stop-hook inbox check (and `inbox.sh`) pulls remote messages before
-reading, so cross-environment messages arrive through the exact same
-delivery path as local ones.
+That's it. `send.sh` now pushes new messages to the bus. On Unix the push runs
+in the background. On Windows/MSYS it runs in the foreground because managed
+shells may terminate background descendants when the command returns; a
+successful `send.sh` therefore confirms that the event reached the bus.
+Set `AGMSG_REMOTE_PUSH_SYNC=1` to force foreground delivery elsewhere, or `0`
+to opt into background delivery explicitly. The Stop-hook inbox check (and
+`inbox.sh`) pulls remote messages before reading, so cross-environment messages
+arrive through the exact same delivery path as local ones.
 
 ## Commands
 

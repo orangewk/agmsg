@@ -153,6 +153,26 @@ sqlite_mem_db() {
   [ "$status" -ne 0 ]
 }
 
+@test "inbox: MSYS waits for its read receipt to reach the bus" {
+  connect_both
+  bash "$SCRIPTS/send.sh" testteam alice bob "windows read receipt" >/dev/null
+  in_b "$SCRIPTS/remote.sh" pull
+
+  # Delay the receipt push so an async implementation would return before the
+  # bare bus contains the message_read event.
+  hook="$TEST_SKILL_DIR/bus.git/hooks/pre-receive"
+  printf '%s\n' '#!/usr/bin/env bash' 'sleep 2' > "$hook"
+  chmod +x "$hook"
+
+  run env -u AGMSG_REMOTE_PUSH_SYNC MSYSTEM=MINGW64 AGMSG_STORAGE_PATH="$ENV_B" \
+    bash "$SCRIPTS/inbox.sh" testteam bob
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "windows read receipt" ]]
+
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q '"type":"message_read"' HEAD --
+  [ "$status" -eq 0 ]
+}
+
 @test "sync: a read receipt does not block later messages from the same env (#16)" {
   connect_both
   bash "$SCRIPTS/send.sh" testteam alice bob "first message" >/dev/null
@@ -483,6 +503,25 @@ sqlite_mem_db() {
     [ ! -d "$TEST_SKILL_DIR/db/bus.lock" ] && break
     sleep 0.5
   done
+}
+
+@test "send: MSYS defaults to foreground push before returning" {
+  connect_both
+
+  # Make the push observably slower than send.sh's local insert. An async
+  # implementation returns before this hook finishes; the managed-shell-safe
+  # MSYS default must wait until the event is present on the bus.
+  hook="$TEST_SKILL_DIR/bus.git/hooks/pre-receive"
+  printf '%s\n' '#!/usr/bin/env bash' 'sleep 2' > "$hook"
+  chmod +x "$hook"
+
+  run env -u AGMSG_REMOTE_PUSH_SYNC MSYSTEM=MINGW64 \
+    bash "$SCRIPTS/send.sh" testteam alice bob "windows durable push"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Sent to bob" ]]
+
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "windows durable push" HEAD --
+  [ "$status" -eq 0 ]
 }
 
 # --- subscriber registry (ADR 0006) ---

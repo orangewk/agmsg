@@ -169,12 +169,18 @@ sync_mark_read() {
 }
 
 # A read is local UX state, but it must reach the bus without requiring the
-# caller to remember a separate remote.sh push. Match send.sh's best-effort
-# behavior; tests and callers that need deterministic completion can set
-# AGMSG_REMOTE_PUSH_SYNC=1.
+# caller to remember a separate remote.sh push. Managed Windows shells can
+# tear down descendants when inbox/check-inbox exits, so match send.sh's
+# platform default there. AGMSG_REMOTE_PUSH_SYNC explicitly overrides it.
 sync_push_best_effort() {
+  local push_sync="${AGMSG_REMOTE_PUSH_SYNC:-}"
   sync_configured || return 0
-  if [ "${AGMSG_REMOTE_PUSH_SYNC:-}" = "1" ]; then
+  if [ -z "${AGMSG_REMOTE_PUSH_SYNC+x}" ]; then
+    case "${MSYSTEM:-$(uname -s 2>/dev/null || true)}" in
+      MINGW*|MSYS*|CYGWIN*|CLANGARM*) push_sync=1 ;;
+    esac
+  fi
+  if [ "$push_sync" = "1" ]; then
     bash "$(_sync_scripts_dir)/remote.sh" push --quiet >/dev/null 2>&1 || true
   else
     (bash "$(_sync_scripts_dir)/remote.sh" push --quiet >/dev/null 2>&1 || true) &
