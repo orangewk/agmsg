@@ -90,15 +90,25 @@ if ! printf '%s
 ' "$INSERT" | agmsg_sqlite "$DB"
 fi
 
-# Remote transport (ADR 0005): export + push in the background so send
-# returns at local speed. A failed or skipped push is caught up by the next
-# push/pull cycle; the message is already durable in the local store.
-# AGMSG_REMOTE_PUSH_SYNC=1 pushes in the foreground instead — for callers
-# that must not leave a writer racing behind them (tests tearing down the
-# store, scripts that exit immediately after send).
+# Remote transport (ADR 0005): Unix shells export + push in the background so
+# send returns at local speed. Managed Windows shells can tear down descendants
+# as soon as the command exits, stranding a uuid-bearing row before it reaches
+# the writer file. Default to foreground push on MSYS/Git Bash so "Sent" means
+# the event reached the bus. AGMSG_REMOTE_PUSH_SYNC explicitly overrides the
+# platform default: 1 = foreground, any other value = background.
 if [ -f "$(agmsg_storage_dir)/remote.conf" ]; then
-  if [ "${AGMSG_REMOTE_PUSH_SYNC:-}" = "1" ]; then
-    bash "$SCRIPT_DIR/remote.sh" push --quiet >/dev/null 2>&1 || true
+  REMOTE_PUSH_SYNC="${AGMSG_REMOTE_PUSH_SYNC:-}"
+  if [ -z "${AGMSG_REMOTE_PUSH_SYNC+x}" ]; then
+    case "${MSYSTEM:-$(uname -s 2>/dev/null || true)}" in
+      MINGW*|MSYS*|CYGWIN*|CLANGARM*) REMOTE_PUSH_SYNC=1 ;;
+    esac
+  fi
+
+  if [ "$REMOTE_PUSH_SYNC" = "1" ]; then
+    if ! bash "$SCRIPT_DIR/remote.sh" push --quiet; then
+      echo "Error: message saved locally, but remote bus push failed. Run remote.sh push to retry." >&2
+      exit 1
+    fi
   else
     (bash "$SCRIPT_DIR/remote.sh" push --quiet >/dev/null 2>&1 || true) &
   fi

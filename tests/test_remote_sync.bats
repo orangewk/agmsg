@@ -485,6 +485,25 @@ sqlite_mem_db() {
   done
 }
 
+@test "send: MSYS defaults to foreground push before returning" {
+  connect_both
+
+  # Make the push observably slower than send.sh's local insert. An async
+  # implementation returns before this hook finishes; the managed-shell-safe
+  # MSYS default must wait until the event is present on the bus.
+  hook="$TEST_SKILL_DIR/bus.git/hooks/pre-receive"
+  printf '%s\n' '#!/usr/bin/env bash' 'sleep 2' > "$hook"
+  chmod +x "$hook"
+
+  run env -u AGMSG_REMOTE_PUSH_SYNC MSYSTEM=MINGW64 \
+    bash "$SCRIPTS/send.sh" testteam alice bob "windows durable push"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Sent to bob" ]]
+
+  run git -C "$TEST_SKILL_DIR/bus.git" grep -q "windows durable push" HEAD --
+  [ "$status" -eq 0 ]
+}
+
 # --- subscriber registry (ADR 0006) ---
 
 @test "subscribe: writes the registry entry to the bus and pushes it (#ADR-0006)" {
