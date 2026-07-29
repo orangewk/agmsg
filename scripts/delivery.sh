@@ -324,6 +324,45 @@ by this command.
 EOF
 }
 
+# Kill a Windows-NATIVE pid. Plain `kill "$pid"` (bash's builtin) only
+# operates in MSYS's own pid space and FAILS ("No such process") against a
+# native pid — confirmed by direct repro while building the WP3a test suite
+# (tests/test-waker-lifecycle.cjs): a real nohup-launched node child's native
+# pid survived a plain `kill "$pid"` call from this same bash untouched, even
+# though _agmsg_pid_alive/compat_get_native_cmdline (both native-space-aware)
+# correctly confirmed it alive just beforehand. taskkill.exe (with /T to also
+# take any child processes, /F to force) is the native-space kill primitive
+# this repo already uses for exactly this case — see
+# codex-app-server-owner.js's own stop(). Unix has no such split (msys vs
+# native pid spaces are a Windows-only concept), so plain `kill` is correct
+# there.
+#
+# Shared by stop_codex_bridge (below) and stop_poc_waker (#8 WP3a) — both kill
+# a Windows-native pid (codex-bridge.js's / the PoC scripts' own process.pid,
+# not bash's $!; see manifest.sh's PID SPACE DECISION). Originally only
+# stop_poc_waker had this helper (as a private inner function); stop_codex_bridge
+# used a plain `kill "$bpid"` instead, which silently failed to actually stop
+# the bridge process despite `delivery.sh set off codex` reporting success
+# (orangewk/agmsg#8 follow-up).
+_agmsg_kill_native_pid() {
+  local pid="$1"
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*)
+      # MSYS_NO_PATHCONV=1: without it, MSYS bash's automatic POSIX->Windows
+      # path mangling rewrites the leading-slash argument "/PID" into a bogus
+      # path (observed: "C:/Program Files/Git/PID"), and taskkill.exe fails
+      # with "invalid argument" — confirmed by direct repro while building the
+      # WP3a test suite. Same fix instance-id.sh's own _agmsg_pid_alive already
+      # applies to its `tasklist /FI "PID eq ..."` call, for the identical
+      # reason.
+      MSYS_NO_PATHCONV=1 taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
+      ;;
+    *)
+      kill "$pid" 2>/dev/null
+      ;;
+  esac
+}
+
 # Stop the Codex monitor bridge(s) for a project and remove their run artifacts,
 # then tear down the project's shared app-server record too (it is keyed per
 # project, so `off` should not leave it running). Used by `set off codex` (and
@@ -342,9 +381,11 @@ stop_codex_bridge() {
       # bpid is a Windows-native pid (codex-bridge.js's writeMeta() writes its
       # own process.pid; the launcher's `nohup node ... &` means bash's $!
       # would be the nohup subshell, not this pid — see manifest.sh's PID
-      # SPACE DECISION). Native liveness check, not kill -0.
+      # SPACE DECISION). Native liveness check, not kill -0, and native-space
+      # kill (_agmsg_kill_native_pid), not plain `kill` (see that helper's own
+      # comment for why a plain `kill "$bpid"` here silently fails).
       if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid" 2>/dev/null; then
-        kill "$bpid" 2>/dev/null && killed=$((killed + 1))
+        _agmsg_kill_native_pid "$bpid" && killed=$((killed + 1))
       fi
       if [ -n "$bpid" ]; then
         manifest_record_dispose process \
@@ -439,36 +480,12 @@ stop_poc_waker() {
   local project="$1"
   local killed=0
 
-  # Kill a Windows-NATIVE pid. Plain `kill "$pid"` (bash's builtin) only
-  # operates in MSYS's own pid space and FAILS ("No such process") against a
-  # native pid — confirmed by direct repro while building this WP3a test
-  # suite: a real nohup-launched node child's native pid survived a plain
-  # `kill "$pid"` call from this same bash untouched, even though
-  # _agmsg_pid_alive/compat_get_native_cmdline (both native-space-aware)
-  # correctly confirmed it alive just beforehand. taskkill.exe (with /T to
-  # also take the fake-codex.ps1 PowerShell wrapper's own app-server child, /F
-  # to force) is the native-space kill primitive this repo already uses for
-  # exactly this case — see codex-app-server-owner.js's own stop(). Unix has
-  # no such split (msys vs native pid spaces are a Windows-only concept), so
-  # plain `kill` is correct there.
-  _stop_poc_waker_kill_native() {
-    local pid="$1"
-    case "${MSYSTEM:-}" in
-      MINGW*|MSYS*|CLANGARM*)
-        # MSYS_NO_PATHCONV=1: without it, MSYS bash's automatic POSIX->Windows
-        # path mangling rewrites the leading-slash argument "/PID" into a
-        # bogus path (observed: "C:/Program Files/Git/PID"), and taskkill.exe
-        # fails with "invalid argument" — confirmed by direct repro while
-        # building this WP3a test suite. Same fix instance-id.sh's own
-        # _agmsg_pid_alive already applies to its `tasklist /FI "PID eq ..."`
-        # call, for the identical reason.
-        MSYS_NO_PATHCONV=1 taskkill.exe /PID "$pid" /T /F >/dev/null 2>&1
-        ;;
-      *)
-        kill "$pid" 2>/dev/null
-        ;;
-    esac
-  }
+  # Native-pid kill: see _agmsg_kill_native_pid's own comment (defined above,
+  # next to stop_codex_bridge) for the full rationale. Both this function and
+  # stop_codex_bridge kill a Windows-native pid, so they share one helper
+  # rather than each keeping its own copy (this function used to define a
+  # private _stop_poc_waker_kill_native identical to it; stop_codex_bridge used
+  # a plain `kill`, which is the bug _agmsg_kill_native_pid's extraction fixed).
 
   # delivery-supervisor.js: one lock file per project, keyed by delivery-
   # supervisor.js's OWN FNV hash of the project path (not agmsg_sha1 — a
@@ -501,7 +518,7 @@ stop_poc_waker() {
         cmd="$(compat_get_native_cmdline "$pid" 2>/dev/null || true)"
         case "$cmd" in
           *delivery-supervisor*)
-            _stop_poc_waker_kill_native "$pid" && killed=$((killed + 1))
+            _agmsg_kill_native_pid "$pid" && killed=$((killed + 1))
             ;;
         esac
       fi
@@ -529,7 +546,7 @@ stop_poc_waker() {
       owner_cmd="$(compat_get_native_cmdline "$owner_pid" 2>/dev/null || true)"
       case "$owner_cmd" in
         *codex*app-server*)
-          _stop_poc_waker_kill_native "$owner_pid" && killed=$((killed + 1))
+          _agmsg_kill_native_pid "$owner_pid" && killed=$((killed + 1))
           ;;
       esac
     fi
