@@ -99,7 +99,7 @@ run_launcher() {
   put_record team alice rec-thread-1 "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=3
   printf '%s\n' 99999999 > "$RUN_DIR/codex-bridge.team.alice.pid"
-  run_launcher & local driver_pid=$!
+  run_launcher 3>&- & local driver_pid=$!
 
   local i recorded=""
   for i in {1..50}; do
@@ -221,4 +221,131 @@ run_launcher() {
   grep -q -- $'--pair team\talice --thread thread-before' "$CAPTURE"
   grep -q -- $'--pair team\talice --thread thread-after' "$CAPTURE"
   ! grep -q -- '--pair team bob' "$CAPTURE"
+}
+
+# Count live role-child launcher processes for this test's project. A child is
+# distinguished from a dispatcher by carrying the role pair as its 5th argument;
+# match on the agent name rather than the whole pair, because macOS ps renders
+# the tab inside that argument as the escape sequence \011, not a literal tab.
+#
+# Only processes whose parent is not itself a match are counted. Every command
+# substitution the launcher runs forks a subshell that inherits the launcher's
+# argv, so those subshells are indistinguishable from a real child by command
+# line alone -- a naive count reads 3 where there is one child, depending purely
+# on when the sample lands. Filtering on ppid counts independent children, which
+# is the property these tests are actually about.
+count_child_launchers() {
+  ps -Ao pid=,ppid=,args= 2>/dev/null \
+    | grep -F "$LAUNCHER" \
+    | grep -F "$PROJ" \
+    | grep alice \
+    | awk '{ pid[$1] = 1; parent[$1] = $2 }
+           END { n = 0; for (p in pid) if (!(parent[p] in pid)) n++; print n }'
+}
+
+# Block until the child count settles on <n>, then return it. Spawn and exit are
+# both asynchronous, so sampling on the first sighting races the transition.
+wait_for_child_count() {
+  local want="$1" i
+  for i in {1..100}; do
+    [ "$(count_child_launchers)" -eq "$want" ] && break
+    sleep 0.1
+  done
+  count_child_launchers
+}
+
+@test "launcher: a replacement dispatcher does not double the role children (#485)" {
+  put_record team alice thread-alice "$PROJ" codex
+  export MOCK_BRIDGE_SLEEP=12
+  sleep 14 3>&- & local parent_a=$!
+  sleep 14 3>&- & local parent_b=$!
+
+  # Dispatcher A spawns the role child, which is nohup'd and outlives A.
+  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_a" >/dev/null 2>&1 3>&- &
+  local dispatcher_a=$!
+  [ "$(wait_for_child_count 1)" -eq 1 ]
+
+  # SIGKILL is what a pane teardown effectively does to a dispatcher that never
+  # trapped the signal: the EXIT trap does not run, so the lock row is left
+  # behind owned by a dead pid, exactly the state a replacement dispatcher hits.
+  kill -9 "$dispatcher_a" 2>/dev/null || true
+  wait "$dispatcher_a" 2>/dev/null || true
+  [ "$(wait_for_child_count 1)" -eq 1 ]
+
+  # Dispatcher B reclaims the stale lock and, with an empty known_pairs, spawns
+  # a second child for the SAME pair. Without the per-role lock that child would
+  # live on and poll forever alongside the first.
+  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_b" >/dev/null 2>&1 3>&- &
+  local dispatcher_b=$!
+  # The duplicate is spawned and then has to lose the lock race; settle on the
+  # steady state rather than on whichever side of that transition we land.
+  [ "$(wait_for_child_count 1)" -eq 1 ]
+  sleep 1
+  [ "$(count_child_launchers)" -eq 1 ]
+
+  kill "$dispatcher_b" 2>/dev/null || true
+  wait "$dispatcher_b" 2>/dev/null || true
+  kill "$parent_a" "$parent_b" 2>/dev/null || true
+  wait "$parent_a" 2>/dev/null || true
+  wait "$parent_b" 2>/dev/null || true
+}
+
+@test "launcher: a re-registered role gets a fresh child after deregistration (#485)" {
+  put_record team alice thread-alice "$PROJ" codex
+  export MOCK_BRIDGE_SLEEP=12
+  sleep 20 3>&- & local parent=$!
+  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
+  local dispatcher=$!
+  [ "$(wait_for_child_count 1)" -eq 1 ]
+
+  # Deregistering the role retires its child through the existing re-exec path.
+  bash "$SCRIPTS/leave.sh" team alice >/dev/null 2>&1 || true
+  [ "$(wait_for_child_count 0)" -eq 0 ]
+
+  # The dispatcher must have forgotten the pair. Otherwise known_pairs still
+  # lists it, the re-spawn is suppressed, and the role silently never gets a
+  # bridge again for the rest of the app-server's life.
+  bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
+  put_record team alice thread-alice "$PROJ" codex
+  [ "$(wait_for_child_count 1)" -eq 1 ]
+
+  kill "$dispatcher" 2>/dev/null || true
+  wait "$dispatcher" 2>/dev/null || true
+  kill "$parent" 2>/dev/null || true
+  wait "$parent" 2>/dev/null || true
+}
+
+@test "launcher: the identity cache still sees a role added mid-loop (#466)" {
+  # The poll no longer re-runs identities.sh every tick; it serves a cache
+  # guarded on the team configs' mtimes. This is the test that fails if that
+  # guard never invalidates: a role joined while the dispatcher is already
+  # looping has to be picked up anyway.
+  put_record team alice thread-alice "$PROJ" codex
+  export MOCK_BRIDGE_SLEEP=20
+  sleep 25 3>&- & local parent=$!
+  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
+  local dispatcher=$!
+  local i
+  for i in {1..80}; do
+    grep -q -- $'--pair team\talice' "$CAPTURE" 2>/dev/null && break
+    sleep 0.1
+  done
+  grep -q -- $'--pair team\talice' "$CAPTURE"
+
+  # Let the loop settle into its backed-off steady state before changing
+  # anything, so this exercises a cache hit being invalidated rather than a
+  # loop that happened to still be resolving every tick.
+  sleep 3
+  bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
+  put_record team bob thread-bob "$PROJ" codex
+  for i in {1..100}; do
+    grep -q -- $'--pair team\tbob' "$CAPTURE" 2>/dev/null && break
+    sleep 0.1
+  done
+  grep -q -- $'--pair team\tbob --thread thread-bob' "$CAPTURE"
+
+  kill "$dispatcher" 2>/dev/null || true
+  wait "$dispatcher" 2>/dev/null || true
+  kill "$parent" 2>/dev/null || true
+  wait "$parent" 2>/dev/null || true
 }

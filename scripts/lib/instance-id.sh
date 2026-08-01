@@ -33,19 +33,89 @@
 [ -n "${_AGMSG_INSTANCE_ID_SH:-}" ] && return 0
 _AGMSG_INSTANCE_ID_SH=1
 
-# Cross-platform pid liveness check. Git Bash's kill(1) only sees MSYS2/Cygwin
-# PIDs; native Windows processes (Claude Code, etc.) are invisible to it, so
-# kill -0 always returns false for them (#134). On Windows we fall back to
-# tasklist.exe which queries the native process table.
+# Cross-platform pid liveness check, and the ONLY one any shipped script should
+# use. A bare `kill -0 "$pid" 2>/dev/null` is not a liveness check: it answers
+# "can I signal this", and the two differ exactly where it matters.
+#
+# Git Bash's kill(1) only sees MSYS2/Cygwin PIDs; native Windows processes
+# (Claude Code, etc.) are invisible to it, so kill -0 always returns false for
+# them (#134). On Windows we fall back to tasklist.exe, which queries the native
+# process table.
+#
+# Everywhere else, saying "dead" requires kill(2) and ps to agree. A failed
+# `kill -0` is ESRCH (dead) or EPERM (alive, but not signalable by us — a
+# sandbox does exactly this). Reading only the exit status reports a live
+# process as gone, which is how a running watcher or bridge gets printed as a
+# stale pidfile, how a live lock owner gets its lock reclaimed out from under
+# it, and how a second app-server gets started beside the first.
+# True iff <value> is a plain positive decimal pid, i.e. a value that names one
+# process when handed to kill(1).
+#
+# Digits-only is NOT enough. `kill -0 0` does not ask about pid 0 — 0 means "the
+# caller's own process group" — so it succeeds, and a caller that then runs
+# `kill "$pid"` TERMs the whole group, itself included. A corrupt or hostile
+# pidfile holding 0 is all it takes. A leading zero is rejected for a related
+# reason: nothing here writes one, and kill(1) may read it as octal, so it names
+# an unpredictable process.
+#
+# Patterns only, never `$(( ))`: arithmetic evaluation runs its argument.
+#
+# Split out from _agmsg_pid_alive so a caller that kills a recorded pid WITHOUT
+# asking about liveness first can still refuse the values that do not name one
+# process.
+_agmsg_pid_valid() {
+  local pid="${1:-}" max=2147483647
+  case "$pid" in ''|*[!0-9]*|0*) return 1 ;; esac
+  # The upper bound is the platform's, not one number. A Windows process id is a
+  # DWORD, and the liveness path there queries the native process table via
+  # tasklist rather than kill(1)'s signed pid_t — applying the POSIX bound to it
+  # would call a legitimate native pid dead and its live watcher stale.
+  case "${MSYSTEM:-}" in MINGW*|MSYS*|CLANGARM*) max=4294967295 ;; esac
+  # And it has to fit whichever of those the platform uses. The POSIX ceiling is
+  # what makes the rest of this library safe: past INT32_MAX, kill(1) rejects the
+  # ARGUMENT ("not a pid or valid job spec") rather than reporting ESRCH — and
+  # _agmsg_pid_alive reads every non-ESRCH failure as alive, so an oversized
+  # value in a pidfile would read as alive forever: its lock never reclaimed, its
+  # bridge never restarted, its status line permanently wrong. Bounding the input
+  # is what keeps "not ESRCH" meaning "EPERM". The Windows ceiling is a plain
+  # range check on the value tasklist will be asked about; nothing there parses
+  # it as a signal target.
+  #
+  # Length is a builtin, and the digits are already known to have no leading
+  # zero, so at equal length a STRING compare is the numeric one. No `$(( ))`
+  # and no `-gt` on the untrusted value: both evaluate what they are given.
+  [ "${#pid}" -le 10 ] || return 1
+  if [ "${#pid}" -eq 10 ] && [ "$pid" \> "$max" ]; then return 1; fi
+  return 0
+}
+
 _agmsg_pid_alive() {
-  local pid="$1"
+  local pid="$1" err stat
+  _agmsg_pid_valid "$pid" || return 1
   case "${MSYSTEM:-}" in
     MINGW*|MSYS*|CLANGARM*)
       MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
       return $?
       ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  # Fast path, and the common answer: the builtin, no fork. Callers poll this in
+  # loops whose whole point is to be fork-free (#466), so the alive case must
+  # not cost a subshell.
+  kill -0 "$pid" 2>/dev/null && return 0
+  # Only now pay for the error text. `export LC_ALL=C` (not a bare prefix, which
+  # misses the builtin on bash 3.2) forces English for the match below.
+  err="$(export LC_ALL=C; kill -0 "$pid" 2>&1)" && return 0
+  case "$err" in
+    *[Nn]'o such process'*) ;;
+    *) return 0 ;;   # EPERM and anything unrecognised mean "assume alive"
+  esac
+  # kill(2) says gone. ps does not depend on signalling permission at all, so
+  # requiring it to agree is what keeps a sandbox from turning "cannot signal"
+  # into "not running".
+  stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -n "$stat" ] || return 1
+  case "$stat" in Z*) return 1 ;; esac   # exited, just not reaped yet
+  return 0
 }
 
 # Compose from an explicit pid. Bare sid when pid is empty/non-numeric.
@@ -267,7 +337,7 @@ agmsg_reap_orphan_grok_watchers() {
   # Default IFS so `read` splits the leading pid column off the rest as args; an
   # empty IFS would put the whole line in $pid and match nothing.
   while read -r pid args; do
-    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    _agmsg_pid_valid "$pid" || continue
     [ -n "${args:-}" ] || continue
     [ "$pid" = "$self" ] && continue
     agmsg_args_is_grok_watcher "$args" "$project" || continue

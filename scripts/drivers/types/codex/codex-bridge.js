@@ -25,7 +25,7 @@ const BASH_BIN = process.env.GIT_BASH || process.env.AGMSG_BASH || "bash";
 function usage() {
   console.log(`Usage: codex-bridge.js --project <path> [--type codex] [--team <team>] [--name <agent>]
 
-Beta Codex app-server bridge for agmsg pseudo-monitoring.
+Codex app-server bridge for agmsg pseudo-monitoring.
 
 Options:
   --project <path>        Project path to monitor.
@@ -51,6 +51,12 @@ Options:
                           CODEX_THREAD_ID; "loaded" discovers the live TUI thread
                           via thread/loaded/list (codex 0.141+, see #170).
   --loaded-timeout <ms>   Max wait for a loaded thread to appear (default: 30000).
+  --turn-timeout <sec>    Idle watchdog: assume a turn ended after this many
+                          seconds with no app-server activity for it at all
+                          (default: 60; 0 disables). Re-armed on any
+                          reasoning/tool-call/message notification, so an
+                          actively-working turn is never cut off regardless
+                          of total duration — only true silence trips it.
   --inline-inbox          Read inbox in the bridge and include message text in the turn input.
   --resolve-only          Print resolved team/name and exit.
   --help                  Show this help.
@@ -230,6 +236,11 @@ class AppServerClient {
     this.handlers = new Map();
     this.requestHandlers = new Map();
     this.child = null;
+    // Set by CodexBridge to learn about ANY thread-scoped activity, even for
+    // methods with no registered handler below -- e.g. reasoning/tool-call
+    // progress notifications the bridge doesn't otherwise care about, but
+    // which still prove a turn is alive. See onThreadActivity() call site.
+    this.onThreadActivity = null;
   }
 
   start() {
@@ -295,6 +306,17 @@ class AppServerClient {
     // exact #299 deadlock this fix exists to close. `method` presence is
     // what a JSON-RPC response never has, so it is the correct discriminator.
     if (message.method) {
+      // Fires for every thread-scoped notification/request, including the
+      // many the bridge has no specific handler for (reasoning deltas, tool
+      // -call/command-output progress, etc.) -- unlike the handlers Map
+      // below, which silently drops anything it has no registered method
+      // for. This is the ONLY generic signal that a turn is still doing
+      // something; without it, a turn that spends most of its time in
+      // exactly those unhandled notification types looks idle to the turn
+      // watchdog even while it is actively working. See onThreadActivity().
+      if (this.onThreadActivity && message.params && message.params.threadId) {
+        this.onThreadActivity(message.params.threadId);
+      }
       if (Object.prototype.hasOwnProperty.call(message, "id")) {
         this.dispatchRequest(message.id, message.method, message.params || {});
       } else if (this.handlers.has(message.method)) {
@@ -413,6 +435,10 @@ class WebSocketAppServerClient {
     this.pending = new Map();
     this.handlers = new Map();
     this.requestHandlers = new Map();
+    // Set by CodexBridge to learn about ANY thread-scoped activity, even for
+    // methods with no registered handler below. See the identical property
+    // and its call site in AppServerClient.handleLine().
+    this.onThreadActivity = null;
     this.socket = null;
     this.buffer = Buffer.alloc(0);
     this.connected = false;
@@ -622,6 +648,17 @@ class WebSocketAppServerClient {
     // this fix exists to close. `method` presence is what a JSON-RPC response
     // never has, so it is the correct discriminator.
     if (message.method) {
+      // Fires for every thread-scoped notification/request, including the
+      // many the bridge has no specific handler for (reasoning deltas, tool
+      // -call/command-output progress, etc.) -- unlike the handlers Map
+      // below, which silently drops anything it has no registered method
+      // for. This is the ONLY generic signal that a turn is still doing
+      // something; without it, a turn that spends most of its time in
+      // exactly those unhandled notification types looks idle to the turn
+      // watchdog even while it is actively working. See onThreadActivity().
+      if (this.onThreadActivity && message.params && message.params.threadId) {
+        this.onThreadActivity(message.params.threadId);
+      }
       if (Object.prototype.hasOwnProperty.call(message, "id")) {
         this.dispatchRequest(message.id, message.method, message.params || {});
       } else if (this.handlers.has(message.method)) {
@@ -798,6 +835,14 @@ class CodexBridge {
     this.ensureSingleInstance();
     this.writeMeta();
     this.installSignals();
+    // Any thread-scoped app-server activity for OUR active turn re-arms the
+    // idle watchdog -- reasoning, tool-call/command progress, agent-message
+    // deltas, all of it, not just one specific notification type. See
+    // startTurnWatchdog()'s comment for why a fixed-from-start ceiling was
+    // wrong here.
+    this.client.onThreadActivity = (threadId) => {
+      if (threadId === this.threadId && this.turnActive) this.startTurnWatchdog();
+    };
     this.client.on("process/exited", this.clientHandler("process/exited", (params) => this.onProcessExited(params)));
     this.client.on("error", this.clientHandler("error", (params) => this.onServerError(params)));
     this.client.on("item/agentMessage/delta", this.clientHandler("item/agentMessage/delta", (params) => this.onAgentMessageDelta(params)));
@@ -1152,13 +1197,23 @@ class CodexBridge {
     }
   }
 
+  // Idle watchdog, not a fixed ceiling on the turn's total duration: ANY
+  // thread-scoped app-server activity re-arms it (client.onThreadActivity,
+  // set in run() -- reasoning deltas, tool-call/command progress, agent
+  // -message deltas, all of it), so a turn that is actively doing something
+  // never trips it no matter how long it runs — only turnTimeout seconds of
+  // true silence does. This matters because the app-server does not reliably
+  // send turn/completed (#41), so something has to detect a turn that will
+  // never report completion; a turn that is visibly still working is not
+  // that case, and cutting it off before it reaches its own send.sh call
+  // silently drops whatever it was about to report.
   startTurnWatchdog() {
     this.clearTurnWatchdog();
     if (!this.opts.turnTimeout) return;
     this.turnTimer = setTimeout(() => {
       this.turnTimer = null;
       console.error(
-        `codex-bridge: no turn completion within ${this.opts.turnTimeout}s; assuming the turn ended and resuming`,
+        `codex-bridge: no turn activity within ${this.opts.turnTimeout}s; assuming the turn ended and resuming`,
       );
       this.onTurnEnded().catch((error) =>
         console.error(`codex-bridge: resume after turn timeout failed: ${error.message}`),
@@ -1205,6 +1260,9 @@ class CodexBridge {
   onAgentMessageDelta(params) {
     if (params.threadId !== this.threadId) return;
     process.stderr.write(params.delta);
+    // Watchdog re-arm on this activity is handled generically by
+    // client.onThreadActivity (see run()), covering every notification type,
+    // not just this one.
   }
 
   buildPrompt() {

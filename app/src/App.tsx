@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Maximize2,
@@ -147,6 +148,71 @@ export function shellSplitStillValid(
   if (currentTeam !== requestedTeam) return false;
   return windows.some((w) => w.id === windowId && w.team === requestedTeam);
 }
+
+// C0 control characters (\u0000-\u001f) and DEL (\u007f) — legal in a
+// macOS/Linux filename, but this string is about to be written straight
+// into a PTY as literal input. A newline in a filename would submit
+// whatever's currently on the target prompt the instant the file is
+// dropped; ESC-prefixed bytes are terminal control sequences, not text.
+// The whole drop is rejected rather than stripping the offending bytes:
+// stripping would silently turn the dropped path into a DIFFERENT, wrong
+// path instead of the one actually dropped (co1 review, PR #481).
+const DROP_PATH_CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+
+export function hasUnsafeDropPath(paths: string[]): boolean {
+  return paths.some((p) => DROP_PATH_CONTROL_CHAR_RE.test(p));
+}
+
+// Multiple dropped files become one space-separated line of bare paths, or
+// null if any of them fails the control-character check above (the whole
+// drop is rejected, not just the unsafe path — see its doc). Deliberately
+// NOT shell-quoted: the target of a drop is almost always an agent CLI's
+// own prompt line (koit's framing — "same as cc/codex"), not a literal
+// shell command, and quoting broke path recognition there in live testing
+// — Claude Code's own file-path heuristic doesn't match a quote-wrapped
+// string, it just reads as plain text (Codex tolerated quotes fine, but
+// the common case has to work for both).
+export function joinDroppedPaths(paths: string[]): string | null {
+  if (hasUnsafeDropPath(paths)) return null;
+  return paths.join(" ");
+}
+
+// Which pane, if any, a dropped file should land in when it didn't land on
+// any specific pane cell (dropped on the sidebar, tab bar, Team Room, ...)
+// — the active tab's actually-focused pane if it has one, else its first
+// pane, per koit's spec ("特定できない場合はactiveへ" — koit's follow-up
+// live-testing feedback: prefer the focused pane specifically, not just
+// whichever leaf happens to be first in the tree). A pane found directly
+// under the cursor is always already in the active window (inactive
+// windows' panes are display:none — see the stage render below — so
+// elementFromPoint can never hit one), so this fallback only matters for
+// the "missed every pane cell" case. lastFocusedPaneId is checked against
+// this specific window's own leaves rather than trusted blindly: it's
+// tracked globally across the whole app (TerminalPane's onFocusPane), so a
+// stale value from a pane in some OTHER tab (never focused anything in the
+// current one yet) must fall through to "first leaf", not point outside
+// the active tab entirely.
+export function resolveFileDropTarget(
+  hitPaneId: string | null,
+  windows: ReadonlyArray<Pick<Window, "id" | "root">>,
+  activeWindowId: string,
+  lastFocusedPaneId: string | null,
+): string | null {
+  if (hitPaneId) return hitPaneId;
+  const activeWindow = windows.find((w) => w.id === activeWindowId);
+  if (!activeWindow) return null;
+  const activeLeaves = leaves(activeWindow.root);
+  if (lastFocusedPaneId && activeLeaves.includes(lastFocusedPaneId)) return lastFocusedPaneId;
+  return activeLeaves[0] ?? null;
+}
+
+// The pane cell (if any) at a given viewport point — shared by the internal
+// pointer-drag hit-test and the external file-drop handler. Not unit-
+// testable in isolation (elementFromPoint needs real layout, which jsdom
+// doesn't compute); exercised via manual live testing instead.
+function paneIdAtPoint(x: number, y: number): string | null {
+  return document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-pane-id]")?.dataset.paneId ?? null;
+}
 // A pane being dragged, and where within the target pane it's hovering —
 // drives both the drop classification (paneTree's classifyDrop) and the
 // half-occupied preview highlight (see dropPreview below). null while
@@ -192,11 +258,35 @@ const SUPPRESS_APPUSER_PROMPT_KEY = "agmsg-app-suppress-appuser-prompt";
 // AUTO_TIMEZONE, which tracks the OS timezone live rather than freezing
 // whatever was detected at first launch.
 const TIMEZONE_KEY = "agmsg-app-timezone";
-// Custom drag-and-drop MIME type for pane-swap drags (see PANE_DRAG_MIME
-// usages below) — a made-up type, not text/plain, so a stray OS file drag
-// or an unrelated drag elsewhere on the page never accidentally matches a
-// pane-cell's drop zone.
-const PANE_DRAG_MIME = "application/x-agmsg-pane";
+// Minimum pointer travel (px) before a pane-header pointerdown counts as a
+// drag rather than a click — see startPaneDrag.
+const DRAG_THRESHOLD_PX = 4;
+// How long after a real pane-header drag ends its own onClick should still
+// no-op for a same-element native click that follows — see
+// dragJustFinishedRef's doc.
+const CLICK_SUPPRESS_WINDOW_MS = 300;
+
+// What startPaneDrag's finish() records — which pane the drag was FOR, not
+// just when it ended. Scoping by pane matters: a global timestamp alone
+// would suppress a deliberate click on some OTHER pane header too, just
+// because it happens to land within the window of an unrelated pane's drag
+// finishing (co1 review, PR #481, 3rd round).
+export type DragFinishInfo = { paneId: string; finishedAt: number } | null;
+
+// Whether the pane-header's onClick should treat an incoming click as the
+// tail end of a just-finished drag gesture (no-op) rather than a genuine
+// new click on the button — true only for a click on the SAME pane the
+// drag was for, within a short window. The caller (onClick) is expected to
+// clear dragFinish (set it back to null) whenever this returns true —
+// "consuming" it — so a genuinely separate second click on the same pane,
+// even one that lands inside the same window, isn't ALSO wrongly
+// suppressed; an unbounded "consume exactly one click" native listener had
+// its own problems (see git history), but a per-pane bounded ref without
+// consuming still over-suppresses. Pure so the co1-requested regressions
+// are unit-testable without simulating real pointer/click event sequences.
+export function shouldSuppressClickAfterDrag(dragFinish: DragFinishInfo, paneId: string, now: number): boolean {
+  return dragFinish !== null && dragFinish.paneId === paneId && now - dragFinish.finishedAt < CLICK_SUPPRESS_WINDOW_MS;
+}
 // A spawnable agent type discovered from agmsg's type registry.
 export type AgentType = { name: string; cli: string; options: string[] };
 
@@ -389,10 +479,10 @@ export default function App() {
   // Swap two panes' positions by name: click one pane's name to "pick it
   // up" (its id goes here), then click another pane's name in the same
   // window to swap. Click the same name again to cancel. Also doubles as
-  // the HTML5 drag source id during a drag-and-drop swap (dragstart sets
-  // it, dragend clears it) — click and drag share this one state and the
-  // same "armed" highlight, since they're just two ways to pick the same
-  // pane up.
+  // the pointer-drag source id during a drag-and-drop swap (startPaneDrag
+  // sets it once the gesture crosses the drag threshold, clears it on
+  // finish/cancel) — click and drag share this one state and the same
+  // "armed" highlight, since they're just two ways to pick the same pane up.
   const [swapSource, setSwapSource] = useState<string | null>(null);
   // The pane currently under the cursor during a drag, and which of
   // paneTree's 16 drop zones it's over — drives both the drop's outcome
@@ -406,6 +496,31 @@ export default function App() {
   // Dropping on the empty strip past the last tab moves the pane to a new
   // tab of its own — same as ctxMenu.pane.moveNewTab, just via drag.
   const [dragOverNewTab, setDragOverNewTab] = useState(false);
+  // Live cursor position while a pane-header pointer-drag is past the
+  // threshold (see startPaneDrag) — null until then, and again once the
+  // gesture ends. Only source of truth for the floating name chip that
+  // replaces the old HTML5 setDragImage ghost (pointer-event drags have no
+  // native drag-image snapshot of their own).
+  const [dragPointer, setDragPointer] = useState<{ x: number; y: number } | null>(null);
+  // Which pane, if any, an in-flight EXTERNAL file drag (from Finder/
+  // Explorer, via Tauri's onDragDropEvent — see the mount effect below) is
+  // currently hovering — reuses the same .pane-cell.drop-target highlight
+  // language as the internal drag-drop preview above, so "this pane will
+  // receive it" reads consistently regardless of what's being dragged.
+  const [externalDropPaneId, setExternalDropPaneId] = useState<string | null>(null);
+  // Most recently focused pane, across the whole app (TerminalPane's
+  // onFocusPane) — the external-file-drop fallback target when a drop
+  // misses every pane cell (koit: prefer the active tab's actual focused
+  // pane over just its first one). A plain ref, not state — nothing renders
+  // off this, it's only read inside the drag-drop effect below, so tracking
+  // it as state would just be a re-render on every pane focus change for no
+  // visible benefit. Whether it's usable depends on whether it's still in
+  // the CURRENT active window — resolveFileDropTarget checks that, not this
+  // ref directly.
+  const lastFocusedPaneIdRef = useRef<string | null>(null);
+  const handleFocusPane = useCallback((id: string) => {
+    lastFocusedPaneIdRef.current = id;
+  }, []);
   // Which tab is currently showing an inline rename input, and its draft text.
   const [renamingWindowId, setRenamingWindowId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -449,6 +564,34 @@ export default function App() {
   // or close the target tab (co1, PR #431).
   const teamRef = useRef<string>("");
   teamRef.current = team;
+  // The current tab/window id, for the external-file-drop handler (mount-
+  // once effect, refs so it doesn't need to resubscribe on every tab
+  // switch) to fall back to when a dropped file doesn't land on any
+  // specific pane cell — see resolveFileDropTarget below.
+  const activeRef = useRef<string>("room");
+  activeRef.current = active;
+  // Force-cancels an in-flight pane-header pointer-drag (startPaneDrag
+  // below) if this component ever unmounts mid-gesture — App itself never
+  // does in practice (root component, lives for the whole session), but the
+  // event listeners it registers live on `document`/`window`, outside
+  // React's own teardown, so nothing else would ever clear them (co1
+  // review, PR #481).
+  const activePaneDragCancelRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    return () => activePaneDragCancelRef.current?.();
+  }, []);
+  // Which pane a real pane-header drag last finished for, and when
+  // (committed OR cancelled — Escape/blur/pointercancel can still end with
+  // the pointer back over the source button, which fires a native click
+  // there same as any other same-element press/release pair). The dragged
+  // pane's own onClick below checks this (shouldSuppressClickAfterDrag) and
+  // no-ops + clears it if it matches, so that click doesn't ALSO re-run the
+  // swap-arm toggle right after finish() already handled the gesture as a
+  // drag. Scoped per-pane and consumed on use, not a global unbounded
+  // "consume the next click" listener or a bare timestamp — both over-
+  // suppress in different ways (see shouldSuppressClickAfterDrag's own doc
+  // and git history; co1 review, PR #481, rounds 2 and 3).
+  const dragJustFinishedRef = useRef<DragFinishInfo>(null);
   const applyAgentState = useCallback((paneId: string, state: RawState) => {
     setPaneStatus((current) => applyStateChange(current, paneId, state));
   }, []);
@@ -942,6 +1085,73 @@ export default function App() {
     return () => void p.then((unlisten) => unlisten());
   }, [closeWindowPane]);
 
+  // Dragging a file from Finder/Explorer onto the app used to hand off to
+  // the webview's own default drop navigation — for an image, that meant
+  // the whole window replaced its content with the image and the app was
+  // stuck (koit bug report). Tauri's dragDropEnabled (tauri.conf.json,
+  // flipped on for this feature) intercepts the OS-level drop entirely and
+  // routes it through this native event instead, which is also what makes
+  // the fix and the feature the same change: with nothing left to hand off
+  // to, the webview never gets a chance to navigate.
+  //
+  // Mount-once (refs, not state, for the live team/windows/active lookups)
+  // — matches the teamRef/windowsRef/activeRef pattern used elsewhere for
+  // the same reason: resubscribing a Tauri listener on every tab switch
+  // would be wasteful and isn't needed since the callback always reads
+  // current refs at drop time.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      const isWindows = navigator.userAgent.toLowerCase().includes("windows");
+      const u = await getCurrentWebview().onDragDropEvent((event) => {
+        if (event.payload.type === "leave") {
+          setExternalDropPaneId(null);
+          return;
+        }
+        // 'enter' and 'over' both carry position. Despite the JS type
+        // being PhysicalPosition on every platform, wry's own macOS
+        // backend (wkwebview/drag_drop.rs) actually reports AppKit view
+        // POINTS — i.e. already logical/CSS-equivalent — mislabeled, not
+        // scaled; tauri-runtime-wry passes those straight through with no
+        // conversion (confirmed by reading both sources directly). Windows
+        // (webview2/drag_drop.rs, via Win32 ScreenToClient) reports real
+        // device pixels, which DOES need the devicePixelRatio divide. Using
+        // .toLogical() unconditionally halved every coordinate on a 2x
+        // Retina Mac, which was consistently landing in/near the top-left
+        // pane regardless of actual drop position (koit bug report).
+        const { x, y } = isWindows
+          ? event.payload.position.toLogical(window.devicePixelRatio)
+          : event.payload.position;
+        const hitPaneId = paneIdAtPoint(x, y);
+        if (event.payload.type !== "drop") {
+          setExternalDropPaneId(hitPaneId);
+          return;
+        }
+        setExternalDropPaneId(null);
+        const text = joinDroppedPaths(event.payload.paths);
+        if (text === null) return; // control chars in a path — reject the whole drop, write nothing
+        const targetPaneId = resolveFileDropTarget(
+          hitPaneId,
+          windowsRef.current,
+          activeRef.current,
+          lastFocusedPaneIdRef.current,
+        );
+        if (!targetPaneId) return;
+        void invoke("pty_write", { id: targetPaneId, data: text });
+      });
+      if (cancelled) {
+        u();
+        return;
+      }
+      unlisten = u;
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   // Close a whole tab: kill every pane it holds.
   const closeWindow = useCallback((windowId: string) => {
     const w = windowsRef.current.find((x) => x.id === windowId);
@@ -1110,6 +1320,171 @@ export default function App() {
       setActive(targetWindowId);
     },
     [detachPane],
+  );
+
+  // Where a pane-header pointer-drag currently resolves to: a tab (move into
+  // that tab), the empty strip past the last tab (move to a brand-new tab),
+  // or another pane cell (swap or directional split, per classifyDrop) —
+  // one lookup shared by every pointermove tick during startPaneDrag below.
+  // Elements carry data-window-id/data-pane-id specifically so this can
+  // identify a target without relying on React event delegation (there's no
+  // "real" event routed to the hovered element anymore — see startPaneDrag's
+  // own doc for why).
+  type PaneDragHit =
+    | { kind: "tab"; windowId: string }
+    | { kind: "newTab" }
+    | { kind: "pane"; paneId: string; zone: ReturnType<typeof classifyDrop> };
+  const hitTestPaneDrag = useCallback((x: number, y: number, excludePaneId: string): PaneDragHit | null => {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const tabEl = el.closest<HTMLElement>("[data-window-id]");
+    if (tabEl) return { kind: "tab", windowId: tabEl.dataset.windowId! };
+    if (el.closest(".tabs-drag-spacer")) return { kind: "newTab" };
+    const paneEl = el.closest<HTMLElement>("[data-pane-id]");
+    if (paneEl && paneEl.dataset.paneId && paneEl.dataset.paneId !== excludePaneId) {
+      const box = paneEl.getBoundingClientRect();
+      const zone = classifyDrop((x - box.left) / box.width, (y - box.top) / box.height);
+      return { kind: "pane", paneId: paneEl.dataset.paneId, zone };
+    }
+    return null;
+  }, []);
+
+  // Picks up a pane header for a drag-reorder gesture — the pointer-event
+  // replacement for the old HTML5 draggable/dragstart/dragover/drop system
+  // (removed: Tauri's dragDropEnabled, needed for real absolute paths on
+  // external file drops, disables the webview's native HTML5 drag-and-drop
+  // entirely — the two are mutually exclusive by Tauri's own design, not a
+  // bug). Deliberately does NOT call preventDefault or touch any state
+  // until the pointer has actually moved past DRAG_THRESHOLD_PX: below that,
+  // this is a plain click, and the existing onClick handler on the same
+  // button (unchanged) fires normally once pointerup lands back on it.
+  //
+  // Lifecycle robustness (co1 review, PR #481 — the first version only
+  // listened for pointermove/pointerup/Escape):
+  // - setPointerCapture on the source button, released on cleanup: without
+  //   it, the pointer leaving the OS window before release means pointerup
+  //   never reaches `document` at all, leaking swapSource/preview/chip and
+  //   the listeners themselves forever (a stuck "ghost" drag).
+  // - pointerId is captured at start and checked on every subsequent event
+  //   — a second pointer's events (another touch/pen input) must never
+  //   drive or finish someone else's gesture.
+  // - pointercancel and window blur (app loses focus mid-drag — e.g. an OS
+  //   dialog, Cmd-Tab) both force finish(false), same as Escape.
+  // - a real drag can still end with the pointer back over the SOURCE
+  //   button (drag out and back, or Escape-cancel then release there) —
+  //   that DOES fire a native click on it same as any other press/release
+  //   pair landing on the same element, which would otherwise also run
+  //   onClick's swap-arm toggle right after finish() already handled the
+  //   gesture as a drag. dragJustFinishedRef (declared above, checked by
+  //   the pane-header's own onClick) is a per-pane, short bounded window
+  //   rather than an unbounded "consume the next click" listener — see its
+  //   own doc for why (co1 review, PR #481, 2nd round: a drag that ends via
+  //   blur/pointercancel/unmount with the pointer released outside the app
+  //   never gets a matching click to consume at all, so a pending listener
+  //   would sit on the button forever and wrongly swallow the next,
+  //   unrelated real click).
+  // - activePaneDragCancelRef (declared above) lets unmount force a cancel;
+  //   real listeners still live on document/window, outside React's tree.
+  //   Also force-cancels any still-active PRIOR gesture at the start of a
+  //   new one — multi-pointer input could otherwise overwrite the ref
+  //   without ever tearing down the first gesture's listeners.
+  const startPaneDrag = useCallback(
+    (e: React.PointerEvent<HTMLButtonElement>, paneId: string) => {
+      activePaneDragCancelRef.current?.();
+      const pointerId = e.pointerId;
+      const target = e.currentTarget;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let dragging = false;
+      let lastHit: PaneDragHit | null = null;
+
+      const applyHit = (hit: PaneDragHit | null) => {
+        lastHit = hit;
+        setDragOverWindowId(hit?.kind === "tab" ? hit.windowId : null);
+        setDragOverNewTab(hit?.kind === "newTab");
+        setDropPreview((cur) => {
+          if (hit?.kind !== "pane") return null;
+          if (cur?.paneId === hit.paneId && sameZone(cur.zone, hit.zone)) return cur;
+          return { paneId: hit.paneId, zone: hit.zone };
+        });
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        if (!dragging) {
+          if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD_PX) return;
+          dragging = true;
+          setSwapSource(paneId);
+        }
+        setDragPointer({ x: ev.clientX, y: ev.clientY });
+        applyHit(hitTestPaneDrag(ev.clientX, ev.clientY, paneId));
+      };
+
+      const cleanup = () => {
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onCancel);
+        document.removeEventListener("keydown", onKeyDown);
+        window.removeEventListener("blur", onBlur);
+        try {
+          target.releasePointerCapture(pointerId);
+        } catch {
+          // already released (e.g. pointercancel released it first) — fine
+        }
+        activePaneDragCancelRef.current = null;
+      };
+
+      // commit=false is Escape/blur/pointercancel: tear down without acting
+      // on lastHit.
+      const finish = (commit: boolean) => {
+        cleanup();
+        if (!dragging) return; // was a click — let the native click event handle it
+        dragJustFinishedRef.current = { paneId, finishedAt: Date.now() };
+        const hit = lastHit; // stable narrowed binding — lastHit is a mutable closure var
+        if (commit && hit) {
+          if (hit.kind === "tab") movePaneToWindow(paneId, hit.windowId);
+          else if (hit.kind === "newTab") moveToNewWindow(paneId);
+          else {
+            const targetWindow = windowsRef.current.find((w) => leaves(w.root).includes(hit.paneId));
+            if (targetWindow) {
+              if (hit.zone.kind === "swap") swapPanesAcrossWindows(paneId, targetWindow.id, hit.paneId);
+              else splitPaneBeside(paneId, targetWindow.id, hit.paneId, hit.zone.side);
+            }
+          }
+        }
+        setSwapSource(null);
+        setDropPreview(null);
+        setDragOverWindowId(null);
+        setDragOverNewTab(false);
+        setDragPointer(null);
+      };
+      const onUp = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        finish(true);
+      };
+      const onCancel = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        finish(false);
+      };
+      const onKeyDown = (ev: KeyboardEvent) => {
+        if (ev.key === "Escape") finish(false);
+      };
+      const onBlur = () => finish(false);
+
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onCancel);
+      document.addEventListener("keydown", onKeyDown);
+      window.addEventListener("blur", onBlur);
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        // best-effort — document-level listeners above are the real
+        // delivery mechanism, capture just improves off-window reliability
+      }
+      activePaneDragCancelRef.current = () => finish(false);
+    },
+    [hitTestPaneDrag, movePaneToWindow, moveToNewWindow, swapPanesAcrossWindows, splitPaneBeside],
   );
 
   const setWindowLayout = useCallback((windowId: string, layout: PaneLayout) => {
@@ -1414,27 +1789,17 @@ export default function App() {
   }, []);
 
   return (
-    <div
-      className="app"
-      onClick={closeAllMenus}
-      onDragOverCapture={(e) => {
-        // WebKit doesn't reliably show a "no-drop" cursor just from
-        // dropEffect = "none" — it only trusts that value once something in
-        // the chain has preventDefault()'d, otherwise it falls back to a
-        // generic "copy" (+) cursor. So every dragover gets preventDefault()
-        // + dropEffect = "none" here first, in the capture phase (root ->
-        // target, runs before any target's own bubble-phase onDragOver
-        // below) — a real drop target's handler still runs after and
-        // overrides dropEffect back to "move". Since nothing here reads
-        // getData or acts on drop, an invalid area silently accepting the
-        // preventDefault is harmless: releasing there fires a drop event
-        // with no handler attached, i.e. still a no-op.
-        if (e.dataTransfer.types.includes(PANE_DRAG_MIME)) {
-          e.preventDefault();
-          e.dataTransfer.dropEffect = "none";
-        }
-      }}
-    >
+    <div className="app" onClick={closeAllMenus}>
+      {dragPointer && swapSource && (
+        // Follows the cursor during a pane-header pointer-drag — the visible
+        // replacement for the old HTML5 setDragImage ghost (which relied on
+        // native drag-image snapshotting pointer events don't have).
+        // pointer-events: none (App.css) so document.elementFromPoint in
+        // hitTestPaneDrag sees through it to the real target underneath.
+        <div className="pane-drag-chip" style={{ left: dragPointer.x + 10, top: dragPointer.y + 10 }}>
+          {panes.find((p) => p.id === swapSource)?.label}
+        </div>
+      )}
       {installingAgmsg && (
         <div className="startup-installing-banner">
           <span>{t("startupError.installing")}</span>
@@ -1801,6 +2166,7 @@ export default function App() {
             {teamWindows.map((w) => (
               <span
                 key={w.id}
+                data-window-id={w.id}
                 className={[
                   active === w.id ? "tab active" : "tab",
                   dragOverWindowId === w.id && "drop-target",
@@ -1812,24 +2178,6 @@ export default function App() {
                   e.stopPropagation();
                   closeAllMenus();
                   setWindowMenu({ windowId: w.id, x: e.clientX, y: e.clientY });
-                }}
-                onDragOver={(e) => {
-                  if (!e.dataTransfer.types.includes(PANE_DRAG_MIME)) return;
-                  e.preventDefault();
-                  e.dataTransfer.dropEffect = "move";
-                  setDragOverWindowId((cur) => (cur === w.id ? cur : w.id));
-                }}
-                onDragLeave={(e) => {
-                  if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                    setDragOverWindowId((cur) => (cur === w.id ? null : cur));
-                  }
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  setDragOverWindowId(null);
-                  setSwapSource(null);
-                  const sourceId = e.dataTransfer.getData(PANE_DRAG_MIME);
-                  if (sourceId) movePaneToWindow(sourceId, w.id);
                 }}
               >
                 {renamingWindowId === w.id ? (
@@ -1876,24 +2224,6 @@ export default function App() {
             <div
               className={dragOverNewTab ? "tabs-drag-spacer drop-target" : "tabs-drag-spacer"}
               data-tauri-drag-region
-              onDragOver={(e) => {
-                if (!e.dataTransfer.types.includes(PANE_DRAG_MIME)) return;
-                e.preventDefault();
-                e.dataTransfer.dropEffect = "move";
-                setDragOverNewTab(true);
-              }}
-              onDragLeave={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                  setDragOverNewTab(false);
-                }
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                setDragOverNewTab(false);
-                setSwapSource(null);
-                const sourceId = e.dataTransfer.getData(PANE_DRAG_MIME);
-                if (sourceId) moveToNewWindow(sourceId);
-              }}
             />
           </nav>
 
@@ -1951,9 +2281,10 @@ export default function App() {
               return (
                 <div
                   key={p.id}
+                  data-pane-id={p.id}
                   className={[
                     isActiveWindow ? "pane-cell" : "pane-cell inactive",
-                    preview?.kind === "swap" && "drop-target",
+                    (preview?.kind === "swap" || externalDropPaneId === p.id) && "drop-target",
                   ]
                     .filter(Boolean)
                     .join(" ")}
@@ -1974,50 +2305,6 @@ export default function App() {
                     paddingTop: cellSize ? cellSize.h / 2 : undefined,
                     paddingBottom: cellSize ? cellSize.h / 2 : undefined,
                   }}
-                  onDragOver={(e) => {
-                    // Gate on dataTransfer.types, NOT React state: dragover
-                    // fires on whatever element is under the cursor, whose
-                    // closures were made at ITS OWN last render — swapSource
-                    // there can be one render behind the dragstart that just
-                    // set it elsewhere. types is native DataTransfer state,
-                    // always current regardless of React's render timing.
-                    // (getData() itself isn't readable until the drop event —
-                    // that's a browser security restriction — types is.)
-                    if (!e.dataTransfer.types.includes(PANE_DRAG_MIME)) return;
-                    e.preventDefault(); // required to allow dropping
-                    e.dataTransfer.dropEffect = "move";
-                    // Classify by WHERE within this pane's own box the
-                    // cursor is (paneTree's 16-zone rule) — corner/center
-                    // bands mean swap (today's behavior), an edge band
-                    // means a directional split-replace on that side.
-                    const box = e.currentTarget.getBoundingClientRect();
-                    const xFrac = (e.clientX - box.left) / box.width;
-                    const yFrac = (e.clientY - box.top) / box.height;
-                    const zone = classifyDrop(xFrac, yFrac);
-                    setDropPreview((cur) => (cur?.paneId === p.id && sameZone(cur.zone, zone) ? cur : { paneId: p.id, zone }));
-                  }}
-                  onDragLeave={(e) => {
-                    // Only clear if we're leaving this cell for something
-                    // outside it — a child element's dragleave (e.g. moving
-                    // from the header onto the terminal below) shouldn't
-                    // flicker the highlight off.
-                    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                      setDropPreview((cur) => (cur?.paneId === p.id ? null : cur));
-                    }
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const zone = dropPreview?.paneId === p.id ? dropPreview.zone : null;
-                    setDropPreview(null);
-                    setSwapSource(null);
-                    const sourceId = e.dataTransfer.getData(PANE_DRAG_MIME);
-                    if (!sourceId || sourceId === p.id || !zone) return;
-                    if (zone.kind === "swap") {
-                      swapPanesAcrossWindows(sourceId, win.id, p.id);
-                    } else {
-                      splitPaneBeside(sourceId, win.id, p.id, zone.side);
-                    }
-                  }}
                 >
                   {preview?.kind === "split" && (
                     <div className={`pane-split-preview preview-${preview.side}`} />
@@ -2036,35 +2323,23 @@ export default function App() {
                         swapSource === p.id ? "pane-header-label swap-armed" : "pane-header-label"
                       }
                       title={t("pane.swapTitle")}
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.effectAllowed = "move";
-                        // A custom MIME type, not text/plain — so dragover
-                        // elsewhere in the page (or a stray OS file drag)
-                        // never matches PANE_DRAG_MIME and gets treated as
-                        // a valid drop target by accident.
-                        e.dataTransfer.setData(PANE_DRAG_MIME, p.id);
-                        // The label's own box is flex-stretched to fill the
-                        // header, so the browser's default drag snapshot
-                        // would be the whole bar's width. Swap in a ghost
-                        // sized to the text instead, then discard it —
-                        // setDragImage snapshots synchronously here.
-                        const ghost = document.createElement("div");
-                        ghost.textContent = p.label;
-                        ghost.className = "pane-drag-ghost";
-                        document.body.appendChild(ghost);
-                        e.dataTransfer.setDragImage(ghost, 10, 10);
-                        setTimeout(() => ghost.remove(), 0);
-                        setSwapSource(p.id);
-                      }}
-                      onDragEnd={() => {
-                        setSwapSource(null);
-                        setDropPreview(null);
-                        setDragOverWindowId(null);
-                        setDragOverNewTab(false);
+                      onPointerDown={(e) => {
+                        if (e.button !== 0) return; // left button only, same as native drag
+                        startPaneDrag(e, p.id);
                       }}
                       onClick={(e) => {
                         e.stopPropagation();
+                        // A real drag that just ended (committed or
+                        // cancelled) can still fire this same-element
+                        // native click if the pointer ended up back over
+                        // THIS pane's own button — see dragJustFinishedRef's
+                        // doc. Not this gesture's click to act on; consume
+                        // it (clear the ref) so a genuinely separate second
+                        // click on this same pane isn't ALSO suppressed.
+                        if (shouldSuppressClickAfterDrag(dragJustFinishedRef.current, p.id, Date.now())) {
+                          dragJustFinishedRef.current = null;
+                          return;
+                        }
                         if (swapSource === p.id) {
                           setSwapSource(null);
                         } else if (swapSource && leaves(win.root).includes(swapSource)) {
@@ -2101,8 +2376,10 @@ export default function App() {
                     args={p.args}
                     cwd={p.cwd}
                     fontSize={terminalFontSize}
+                    active={isActiveWindow}
                     onAgentState={applyAgentState}
                     onCellSize={handleCellSize}
+                    onFocusPane={handleFocusPane}
                   />
                 </div>
               );

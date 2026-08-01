@@ -60,7 +60,7 @@ npx agmsg
 #    OpenCode:     $agmsg
 ```
 
-これだけだ。スラッシュコマンドは初回使用時にチーム名とエージェント名を尋ね、続けて[配信モード](#配信モード)を選ばせる（Claude Codeのデフォルトは `monitor` — リアルタイムプッシュ。Codexはベータの `monitor` ブリッジまたは `turn` を提供）。その後は自然な言葉でエージェントに話しかければよい — 詳しくは下記の[初回実行](#初回実行)を参照。
+これだけだ。スラッシュコマンドは初回使用時にチーム名とエージェント名を尋ね、続けて[配信モード](#配信モード)を選ばせる（Claude CodeとCodexのデフォルトは `monitor` — リアルタイムプッシュ。Codexはブリッジ経由で実現する）。その後は自然な言葉でエージェントに話しかければよい — 詳しくは下記の[初回実行](#初回実行)を参照。
 
 先にコードを確認したい、最新の `main` を追いたい、あるいはカスタムのコマンド名にしたい場合は、下記の[インストール](#インストール)にある `setup.sh` ワンライナー、`git clone`、Claude Codeプラグインマーケットプレイスの各手順を参照。
 
@@ -233,8 +233,8 @@ despawnは指定されたメンバーにのみ作用する — `despawn` を実�
 
 | モード | 仕組み | レイテンシ | 向いている相手 |
 |---|---|---|---|
-| **`monitor`**（Claude Codeのデフォルト） | SessionStartフック → Monitorツール → ブロッキングSQLiteストリーム | 約5秒 | リアルタイムプッシュを望むClaude Codeユーザー |
-| **`turn`**（Codex / Copilot CLI / OpenCodeのデフォルト） | アシスタントのターン間でStopフックが `check-inbox.sh` を発火 | 次のやり取りまで | Codex / Copilot CLI / OpenCode（Monitorツールなし）、より静かなループを好むClaude Codeユーザー |
+| **`monitor`**（Claude Codeのデフォルト。OpenCodeではopencode-sentinel pluginで利用可能） | SessionStartフック → Monitorツール → ブロッキングSQLiteストリーム | 約5秒 | リアルタイムプッシュを望むClaude Codeユーザー |
+| **`turn`**（Codex / Copilot CLI / OpenCode（plugin未導入）のデフォルト） | アシスタントのターン間でStopフックが `check-inbox.sh` を発火 | 次のやり取りまで | monitorを実行していないCodex / Copilot CLI / OpenCodeユーザー、より静かなループを好むClaude Codeユーザー |
 | **`both`** | monitorを主に、turnをセッションごとの安全網として | 約5秒。ウォッチャー障害時はturn相当にフォールバック | 二重の保険をかけたい場合 |
 | **`off`** | 自動配信なし | 手動の `/agmsg` のみ | ミニマリスト |
 
@@ -288,9 +288,9 @@ despawnは指定されたメンバーにのみ作用する — `despawn` を実�
 $agmsg                          — または /skills → agmsg
 ```
 
-Codexは `mode monitor` を**ベータ**のapp-serverブリッジとしてサポートし、加えて `mode turn` と `mode off` にも対応している。
+Codexは `mode monitor` をapp-serverブリッジ経由でサポートし、加えて `mode turn` と `mode off` にも対応している。
 
-> ⚠️ **monitorベータはCodexの起動方法を変える — 理解した上でのみオプトインすること。** CodexにはMonitorツールがないため、`mode monitor` はインタラクティブシェル内で `codex` をagmsgのmonitorシム経由にルーティングするシェル関数を表示する。monitorモードのプロジェクトでは、このシムがインタラクティブな起動を、受信したagmsgメッセージを現在のCodexスレッドのターンに変換するブリッジ経由にルーティングする。`codex exec` とmonitor対象外のプロジェクトは実物のCodexにそのまま通る。これは実験的なCodex app-serverの挙動に依存しており、既知の粗さがある（TUIを閉じるとオーファンが残る — #149、プロジェクトごとに1アイデンティティのみ — #150）。
+> ⚠️ **monitorモードはCodexの起動方法を変える — それを承知した上で有効化すること。** CodexにはMonitorツールがないため、`mode monitor` はインタラクティブシェル内で `codex` をagmsgのmonitorシム経由にルーティングするシェル関数を表示する。monitorモードのプロジェクトでは、このシムがインタラクティブな起動を、受信したagmsgメッセージを現在のCodexスレッドのターンに変換するブリッジ経由にルーティングする。`codex exec` とmonitor対象外のプロジェクトは実物のCodexにそのまま通る。これはCodex app-serverの挙動に依存しており、既知の制限がある（TUIを閉じるとオーファンが残る — #149）。
 
 グローバルなPATHシムを好むなら、`~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-shim-install.sh install` を実行し、`~/.agents/bin` を実物のCodexバイナリより前にPATHに置く。`~/.agents/skills/<cmd>/scripts/drivers/types/codex/codex-monitor.sh` で直接起動することもできる。Codexのサンドボックスはスキルの `db/`、`teams/`、`run/` ディレクトリへの書き込みを許可する必要がある — `~/.codex/config.toml` が存在する場合、`install.sh` がその `writable_roots` を設定する。セットアップの詳細と内部動作: [docs/codex-monitor-beta.md](docs/codex-monitor-beta.md)。
 
@@ -308,7 +308,7 @@ Copilotインストーラーは `~/.copilot/skills/agmsg/` に `SKILL.md` を配
 $agmsg
 ```
 
-`./install.sh` でインストールする（`~/.config/opencode/` が存在する場合、OpenCode向けスキルがデフォルトのCodex向け共有スキルと並んで自動的に配置される）。`--agent-type opencode` はCodexがインストールされていないOpenCode専用環境でのみ使う。OpenCodeは手動およびturn/off配信ワークフローに対応している。現時点では `mode turn` と `mode off` のみサポート — `monitor`、`both`、`spawn opencode` は非対応。
+`./install.sh` でインストールする（`~/.config/opencode/` が存在する場合、OpenCode向けスキルがデフォルトのCodex向け共有スキルと並んで自動的に配置される）。`--agent-type opencode` はCodexがインストールされていないOpenCode専用環境でのみ使う。OpenCodeは `mode monitor`（外部プラグイン [`opencode-sentinel`](https://github.com/tsukimiya/opencode-sentinel) 経由。プラグイン未導入時は turn へのフォールバックをruleが指示するが、それに従うのはagentであってagmsgが強制するものではない）、`mode turn`、`mode off` に対応。`spawn opencode` は `opencode --prompt`（ブートプロンプトのターンが終わってもTUIが滞在するモード）経由で利用可能。`both` は非対応。
 
 これによりOpenCodeは、Ollamaのようなローカルプロバイダーを使う構成を含め、ローカルのコーディングエージェントとして役立つ。
 
@@ -370,6 +370,10 @@ v1にはない。2つのエージェントが同じ名前を購読していれ�
 **古いルームから新しいエージェントを再シードできるか?**
 
 メッセージストアは実質的にリプレイログだ。「ルームXから復元」というワンショットのコマンドはまだないが、`history.sh` で文字起こしを取得し、それを新しいエージェントにプロンプトとして渡すことはできる。それを可能にする鍵が永続化だと考えてほしい。
+
+**読み方は?**
+
+「えーじーめっせーじ」または「えーじーえむえすじー」。どちらでも大丈夫です。
 
 ## アップデート
 
@@ -530,8 +534,8 @@ agmsgのプラグイン可能な単位は軸（axis）ごとにグループ化�
 ## コミュニティ
 
 - **Product Hunt**: Product of the Day 5位、[2026-06-09ローンチ](https://www.producthunt.com/products/agmsg) — 219アップボート、39コメント
-- **派生プロジェクト**: `agmsg-shogi`、`agmsg-go`、`agmsg-mcp`（コミュニティ製）
-- **外部コントリビューター**: [@MiuraKatsu](https://github.com/MiuraKatsu)（Geminiサポート + whoami自動検出）、[@roundrop](https://github.com/roundrop)（Copilot CLIサポート）、[@TOMONOSUKEJP](https://github.com/TOMONOSUKEJP)（ネイティブWindows / Git Bash）、[@kenshin-yamada](https://github.com/kenshin-yamada)（ウォッチャーのスコープ修正）、[@utenadev](https://github.com/utenadev)（OpenCode貢献）、[@lucianlamp](https://github.com/lucianlamp)（ネイティブWindows PowerShellヘルパー）、[@tatsuya6502](https://github.com/tatsuya6502)（サンドボックス化されたBashツールのサポート）
+- **コミュニティプロジェクト**（[showcase](https://agmsg.cc) にも掲載）: [`agkanban`](https://github.com/lucianlamp/agkanban) — agmsg と組み合わせて使うマルチエージェント向けかんばんボード / [`agmsg-office`](https://github.com/shinshin86/agmsg-office) — メッセージログを、舞台上でキャラクターが話す形で再生 / [`agmsg-viewer`](https://github.com/utenadev/agmsg-viewer) — メッセージ履歴をブラウザのチャット画面で閲覧 / [`agmsg-bubblelog`](https://github.com/dreiachse-cyber/agmsg-bubblelog) — チームのログをメッセンジャー風のスレッドとしてローカルで再生 / [`agmsg-tui`](https://github.com/rrrrnmtsu/agmsg-tui) — Rust/ratatui のターミナルクライアント。SSH・mosh・tmux と相性がよい
+- **外部コントリビューター**: [@MiuraKatsu](https://github.com/MiuraKatsu)（Geminiサポート + whoami自動検出）、[@roundrop](https://github.com/roundrop)（Copilot CLIサポート）、[@TOMONOSUKEJP](https://github.com/TOMONOSUKEJP)（ネイティブWindows / Git Bash）、[@kenshin-yamada](https://github.com/kenshin-yamada)（ウォッチャーのスコープ修正）、[@utenadev](https://github.com/utenadev)（OpenCode貢献）、[@lucianlamp](https://github.com/lucianlamp)（ネイティブWindows PowerShellヘルパー）、[@tatsuya6502](https://github.com/tatsuya6502)（サンドボックス化されたBashツールのサポート）、[@Masashi-Ono0611](https://github.com/Masashi-Ono0611)（project_path検証、ウォッチドッグとウォッチャーの修正）、[@chemica-tan](https://github.com/chemica-tan)（Windows codexブリッジ: プロジェクト比較とポート解析）、[@otsune](https://github.com/otsune)（PowerShellからのGit Bashクォート）、[@tsukimiya](https://github.com/tsukimiya)（OpenCode: 常駐spawnとmonitor配送）
 
 ## プロジェクトサイト（agmsg.cc）
 

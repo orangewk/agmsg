@@ -39,6 +39,13 @@
 # shellcheck disable=SC1091
 . "$SKILL_DIR/scripts/lib/storage.sh"
 
+# _agmsg_pid_alive: the EPERM-aware liveness check both the ancestor walk and the
+# marker GC below need. Sourced here rather than left to the caller — a missing
+# definition used to mean the walk fell back to a bare `kill -0`, which reports a
+# live agent as gone under a sandbox. Double-source guarded.
+# shellcheck disable=SC1091
+. "$SKILL_DIR/scripts/lib/instance-id.sh"
+
 _agmsg_run_dir() { printf '%s/run' "$SKILL_DIR"; }
 
 # Canonicalize a directory path by resolving symlinks to its physical location.
@@ -252,7 +259,7 @@ _agmsg_agent_binaries() {
 agmsg_pid_is_agent() {
   local pid="$1" type="$2"
   [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  _agmsg_pid_alive "$pid" || return 1
   local binaries comm cmdline first base bin
   binaries=$(_agmsg_agent_binaries "$type")
   comm=$(compat_get_comm "$pid" 2>/dev/null || true)
@@ -335,12 +342,15 @@ agmsg_read_project_marker() {
 agmsg_marker_gc_stale() {
   local dir; dir="$(_agmsg_run_dir)"
   [ -d "$dir" ] || return 0
+  # Skip if _agmsg_pid_alive (EPERM-aware; instance-id.sh) isn't loaded, so a
+  # "command not found" can't fall through to `|| rm -f` and delete a live marker.
+  declare -F _agmsg_pid_alive >/dev/null 2>&1 || return 0
   local f pid
   for f in "$dir"/proj.*.project; do
     [ -f "$f" ] || continue
     pid=${f##*/proj.}; pid=${pid%.project}
     case "$pid" in ''|*[!0-9]*) continue ;; esac
-    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+    _agmsg_pid_alive "$pid" || rm -f "$f"
   done
 }
 
