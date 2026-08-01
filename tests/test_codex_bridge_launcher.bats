@@ -26,6 +26,17 @@ EOF
   chmod +x "$MOCK"
   export AGMSG_CODEX_BRIDGE_CMD="$MOCK"
   export LAUNCHER="$SCRIPTS/drivers/types/codex/codex-bridge-launcher.sh"
+
+  # Observe launcher ownership through the same storage seam used in
+  # production. This is portable to Git Bash, whose minimal ps lacks -Ao.
+  source "$SCRIPTS/lib/hash.sh"
+  source "$SCRIPTS/lib/instance-id.sh"
+  source "$SCRIPTS/lib/storage.sh"
+  local project_hash pair_hash
+  project_hash="$(printf '%s' "$PROJ" | agmsg_sha1)"
+  pair_hash="$(printf '%s' $'team\talice' | agmsg_sha1)"
+  export DISPATCHER_LOCK_RESOURCE="codex-dispatcher:$project_hash"
+  export CHILD_LOCK_RESOURCE="codex-child:$project_hash:$pair_hash"
 }
 
 teardown() { teardown_test_env; }
@@ -42,6 +53,41 @@ write_request() {
   hash=$(SKILL_DIR="$TEST_SKILL_DIR" bash -c \
     'source "$1/lib/hash.sh"; printf "%s" "$2" | agmsg_sha1' _ "$SCRIPTS" "$PROJ")
   printf 'codex\t%s\tws://127.0.0.1:1\n' "$thread" > "$RUN_DIR/codex-bridge-request.$hash"
+}
+
+wait_for_capture_lines() {
+  local want="$1" i lines=0
+  for i in {1..150}; do
+    if [ -f "$CAPTURE" ]; then
+      lines="$(wc -l < "$CAPTURE" | tr -d ' ')"
+    fi
+    [ "$lines" -ge "$want" ] && break
+    sleep 0.1
+  done
+  printf '%s\n' "$lines"
+}
+
+wait_for_live_lock_owner() {
+  local resource="$1" i owner=""
+  for i in {1..150}; do
+    owner="$(agmsg_runtime_lock_owner "$resource" 2>/dev/null || true)"
+    if [ -n "$owner" ] && _agmsg_msys_pid_alive "$owner"; then
+      printf '%s\n' "$owner"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_lock_release() {
+  local resource="$1" i owner=""
+  for i in {1..150}; do
+    owner="$(agmsg_runtime_lock_owner "$resource" 2>/dev/null || true)"
+    [ -z "$owner" ] && return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 # Drive the launcher against a short-lived parent, blocking until it exits. fd 3
@@ -99,19 +145,27 @@ run_launcher() {
   put_record team alice rec-thread-1 "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=3
   printf '%s\n' 99999999 > "$RUN_DIR/codex-bridge.team.alice.pid"
-  run_launcher 3>&- & local driver_pid=$!
+  sleep 30 3>&- & local parent=$!
+  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
+  local dispatcher=$!
 
-  local i recorded=""
-  for i in {1..50}; do
+  local i recorded="" recorded_alive=1
+  for i in {1..150}; do
     recorded="$(cat "$RUN_DIR/codex-bridge.team.alice.pid" 2>/dev/null || true)"
-    [ -n "$recorded" ] && [ "$recorded" != 99999999 ] && break
+    if [ -n "$recorded" ] && [ "$recorded" != 99999999 ] && _agmsg_msys_pid_alive "$recorded"; then
+      recorded_alive=0
+      break
+    fi
     sleep 0.1
   done
+
+  kill "$dispatcher" "$parent" 2>/dev/null || true
+  wait "$dispatcher" 2>/dev/null || true
+  wait "$parent" 2>/dev/null || true
+
   [ -n "$recorded" ]
   [ "$recorded" != 99999999 ]
-  kill -0 "$recorded"
-
-  wait "$driver_pid" 2>/dev/null || true
+  [ "$recorded_alive" -eq 0 ]
 }
 
 @test "launcher: starts one bridge per recorded role and thread (#150 phase 2)" {
@@ -136,26 +190,30 @@ run_launcher() {
 @test "launcher: only one dispatcher runs per project" {
   put_record team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=8
-  sleep 10 3>&- & local parent_a=$!
-  sleep 10 3>&- & local parent_b=$!
+  sleep 30 3>&- & local parent_a=$!
+  sleep 30 3>&- & local parent_b=$!
 
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_a" >/dev/null 2>&1 3>&- &
   local launcher_a=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_b" >/dev/null 2>&1 3>&- &
   local launcher_b=$!
 
-  local i
-  for i in {1..50}; do
-    [ -f "$CAPTURE" ] && break
-    sleep 0.1
-  done
-  [ -f "$CAPTURE" ]
-  [ "$(wc -l < "$CAPTURE" | tr -d ' ')" -eq 1 ]
+  local dispatcher_owner="" child_owner="" lines=0
+  dispatcher_owner="$(wait_for_live_lock_owner "$DISPATCHER_LOCK_RESOURCE" || true)"
+  child_owner="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
+  lines="$(wait_for_capture_lines 1)"
+  sleep 1
+  [ -f "$CAPTURE" ] && lines="$(wc -l < "$CAPTURE" | tr -d ' ')"
 
+  kill "$launcher_a" "$launcher_b" "$parent_a" "$parent_b" 2>/dev/null || true
   wait "$launcher_a" 2>/dev/null || true
   wait "$launcher_b" 2>/dev/null || true
   wait "$parent_a" 2>/dev/null || true
   wait "$parent_b" 2>/dev/null || true
+
+  [ -n "$dispatcher_owner" ]
+  [ -n "$child_owner" ]
+  [ "$lines" -eq 1 ]
 }
 
 @test "launcher: stale dispatcher reclamation remains singleton under contention" {
@@ -169,26 +227,30 @@ run_launcher() {
   # The transactional lock protocol must not depend on that legacy reaper.
   mkdir "$RUN_DIR/codex-bridge-dispatcher.$hash.reap"
   export AGMSG_TEST_DISPATCHER_STALE_BARRIER="$TEST_SKILL_DIR/stale-observed"
-  sleep 10 3>&- & local parent_a=$!
-  sleep 10 3>&- & local parent_b=$!
+  sleep 30 3>&- & local parent_a=$!
+  sleep 30 3>&- & local parent_b=$!
 
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_a" >/dev/null 2>&1 3>&- &
   local launcher_a=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_b" >/dev/null 2>&1 3>&- &
   local launcher_b=$!
 
-  local i
-  for i in {1..50}; do
-    [ -f "$CAPTURE" ] && break
-    sleep 0.1
-  done
-  [ -f "$CAPTURE" ]
-  [ "$(wc -l < "$CAPTURE" | tr -d ' ')" -eq 1 ]
+  local dispatcher_owner="" child_owner="" lines=0
+  dispatcher_owner="$(wait_for_live_lock_owner "$DISPATCHER_LOCK_RESOURCE" || true)"
+  child_owner="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
+  lines="$(wait_for_capture_lines 1)"
+  sleep 1
+  [ -f "$CAPTURE" ] && lines="$(wc -l < "$CAPTURE" | tr -d ' ')"
 
+  kill "$launcher_a" "$launcher_b" "$parent_a" "$parent_b" 2>/dev/null || true
   wait "$launcher_a" 2>/dev/null || true
   wait "$launcher_b" 2>/dev/null || true
   wait "$parent_a" 2>/dev/null || true
   wait "$parent_b" 2>/dev/null || true
+
+  [ -n "$dispatcher_owner" ]
+  [ -n "$child_owner" ]
+  [ "$lines" -eq 1 ]
 }
 
 @test "launcher: project request thread never overrides per-role recorded threads (#150 phase 2)" {
@@ -223,96 +285,77 @@ run_launcher() {
   ! grep -q -- '--pair team bob' "$CAPTURE"
 }
 
-# Count live role-child launcher processes for this test's project. A child is
-# distinguished from a dispatcher by carrying the role pair as its 5th argument;
-# match on the agent name rather than the whole pair, because macOS ps renders
-# the tab inside that argument as the escape sequence \011, not a literal tab.
-#
-# Only processes whose parent is not itself a match are counted. Every command
-# substitution the launcher runs forks a subshell that inherits the launcher's
-# argv, so those subshells are indistinguishable from a real child by command
-# line alone -- a naive count reads 3 where there is one child, depending purely
-# on when the sample lands. Filtering on ppid counts independent children, which
-# is the property these tests are actually about.
-count_child_launchers() {
-  ps -Ao pid=,ppid=,args= 2>/dev/null \
-    | grep -F "$LAUNCHER" \
-    | grep -F "$PROJ" \
-    | grep alice \
-    | awk '{ pid[$1] = 1; parent[$1] = $2 }
-           END { n = 0; for (p in pid) if (!(parent[p] in pid)) n++; print n }'
-}
-
-# Block until the child count settles on <n>, then return it. Spawn and exit are
-# both asynchronous, so sampling on the first sighting races the transition.
-wait_for_child_count() {
-  local want="$1" i
-  for i in {1..100}; do
-    [ "$(count_child_launchers)" -eq "$want" ] && break
-    sleep 0.1
-  done
-  count_child_launchers
-}
-
 @test "launcher: a replacement dispatcher does not double the role children (#485)" {
   put_record team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=12
-  sleep 14 3>&- & local parent_a=$!
-  sleep 14 3>&- & local parent_b=$!
+  sleep 45 3>&- & local parent_a=$!
+  sleep 45 3>&- & local parent_b=$!
 
   # Dispatcher A spawns the role child, which is nohup'd and outlives A.
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_a" >/dev/null 2>&1 3>&- &
   local dispatcher_a=$!
-  [ "$(wait_for_child_count 1)" -eq 1 ]
+  local child_a="" child_after_kill="" child_after_replacement=""
+  child_a="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
 
   # SIGKILL is what a pane teardown effectively does to a dispatcher that never
   # trapped the signal: the EXIT trap does not run, so the lock row is left
   # behind owned by a dead pid, exactly the state a replacement dispatcher hits.
   kill -9 "$dispatcher_a" 2>/dev/null || true
   wait "$dispatcher_a" 2>/dev/null || true
-  [ "$(wait_for_child_count 1)" -eq 1 ]
+  child_after_kill="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
 
   # Dispatcher B reclaims the stale lock and, with an empty known_pairs, spawns
   # a second child for the SAME pair. Without the per-role lock that child would
   # live on and poll forever alongside the first.
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent_b" >/dev/null 2>&1 3>&- &
   local dispatcher_b=$!
-  # The duplicate is spawned and then has to lose the lock race; settle on the
-  # steady state rather than on whichever side of that transition we land.
-  [ "$(wait_for_child_count 1)" -eq 1 ]
+  # The duplicate is spawned and then loses the lock race. The original live
+  # owner must remain unchanged after the replacement dispatcher settles.
+  child_after_replacement="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
   sleep 1
-  [ "$(count_child_launchers)" -eq 1 ]
+  local settled_owner="$(agmsg_runtime_lock_owner "$CHILD_LOCK_RESOURCE" 2>/dev/null || true)"
 
   kill "$dispatcher_b" 2>/dev/null || true
   wait "$dispatcher_b" 2>/dev/null || true
   kill "$parent_a" "$parent_b" 2>/dev/null || true
   wait "$parent_a" 2>/dev/null || true
   wait "$parent_b" 2>/dev/null || true
+
+  [ -n "$child_a" ]
+  [ "$child_after_kill" = "$child_a" ]
+  [ "$child_after_replacement" = "$child_a" ]
+  [ "$settled_owner" = "$child_a" ]
 }
 
 @test "launcher: a re-registered role gets a fresh child after deregistration (#485)" {
   put_record team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=12
-  sleep 20 3>&- & local parent=$!
+  sleep 60 3>&- & local parent=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
   local dispatcher=$!
-  [ "$(wait_for_child_count 1)" -eq 1 ]
+  local child_before="" child_after="" released=1
+  child_before="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
 
   # Deregistering the role retires its child through the existing re-exec path.
   bash "$SCRIPTS/leave.sh" team alice >/dev/null 2>&1 || true
-  [ "$(wait_for_child_count 0)" -eq 0 ]
+  if wait_for_lock_release "$CHILD_LOCK_RESOURCE"; then released=0; fi
 
   # The dispatcher must have forgotten the pair. Otherwise known_pairs still
   # lists it, the re-spawn is suppressed, and the role silently never gets a
   # bridge again for the rest of the app-server's life.
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
   put_record team alice thread-alice "$PROJ" codex
-  [ "$(wait_for_child_count 1)" -eq 1 ]
+  child_after="$(wait_for_live_lock_owner "$CHILD_LOCK_RESOURCE" || true)"
 
   kill "$dispatcher" 2>/dev/null || true
   wait "$dispatcher" 2>/dev/null || true
   kill "$parent" 2>/dev/null || true
   wait "$parent" 2>/dev/null || true
+
+  [ -n "$child_before" ]
+  [ "$released" -eq 0 ]
+  [ -n "$child_after" ]
+  [ "$child_after" != "$child_before" ]
 }
 
 @test "launcher: the identity cache still sees a role added mid-loop (#466)" {
