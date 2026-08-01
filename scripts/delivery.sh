@@ -431,7 +431,7 @@ EOF
     ttl_pidfile="$RUN_DIR/codex-app-server.$project_hash.idle-ttl.pid"
     if [ -f "$ttl_pidfile" ]; then
       ttl_pid="$(cat "$ttl_pidfile" 2>/dev/null || true)"
-      if [ -n "$ttl_pid" ] && kill -0 "$ttl_pid" 2>/dev/null; then
+      if [ -n "$ttl_pid" ] && _agmsg_msys_pid_alive "$ttl_pid"; then
         ttl_cmd="$(compat_get_cmdline "$ttl_pid" 2>/dev/null || true)"
         case "$ttl_cmd" in
           *idle_ttl_run_loop*) kill "$ttl_pid" 2>/dev/null || true ;;

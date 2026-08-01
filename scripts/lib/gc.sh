@@ -22,7 +22,8 @@
 # Required caller-set variable: SKILL_DIR (agmsg skill root; run/ hangs off it).
 # Callers must also have sourced, before calling into this file:
 #   lib/compat.sh        — compat_get_cmdline, compat_get_native_cmdline
-#   lib/instance-id.sh   — _agmsg_pid_alive (native-pid liveness via tasklist)
+#   lib/instance-id.sh   — _agmsg_pid_alive (native-pid liveness via tasklist),
+#                          _agmsg_msys_pid_alive (shell/MSYS pid liveness)
 #   lib/manifest.sh       — manifest_record_dispose, manifest_open_processes,
 #                           manifest_process_id, manifest_process_is_same
 # This file does not re-source them itself to avoid redefining functions when
@@ -122,7 +123,7 @@ agmsg_gc_codex_app_server_pidfiles() {
       reaped=$((reaped + 1))
       continue
     fi
-    if kill -0 "$pid" 2>/dev/null; then
+    if _agmsg_msys_pid_alive "$pid"; then
       cmd="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
       case "$cmd" in
         *codex*app-server*) continue ;;  # alive and confirmed ours — leave it
@@ -158,7 +159,7 @@ agmsg_gc_codex_idle_ttl_pidfiles() {
       reaped=$((reaped + 1))
       continue
     fi
-    if kill -0 "$pid" 2>/dev/null; then
+    if _agmsg_msys_pid_alive "$pid"; then
       cmd="$(compat_get_cmdline "$pid" 2>/dev/null || true)"
       case "$cmd" in
         *idle_ttl_run_loop*) continue ;;  # alive and confirmed ours — leave it
@@ -292,7 +293,7 @@ agmsg_gc_manifest_reap_dead() {
     if [ "$pid_space" = "native" ]; then
       _agmsg_pid_alive "$pid" 2>/dev/null && alive=1
     else
-      kill -0 "$pid" 2>/dev/null && alive=1
+      _agmsg_msys_pid_alive "$pid" && alive=1
     fi
     # Delegate the cmdline-match to manifest_process_is_same (not a local
     # comparison) so both callers normalize a freshly-fetched cmdline the same
@@ -355,7 +356,7 @@ agmsg_gc_manifest_kill_orphans() {
     if [ "$pid_space" = "native" ]; then
       _agmsg_pid_alive "$pid" 2>/dev/null && is_alive=1 || is_alive=0
     else
-      kill -0 "$pid" 2>/dev/null && is_alive=1 || is_alive=0
+      _agmsg_msys_pid_alive "$pid" && is_alive=1 || is_alive=0
     fi
     if [ "$is_alive" = 1 ] && manifest_process_is_same "$pid" "$cmdline" "$pid_space"; then
       kill "$pid" 2>/dev/null || true

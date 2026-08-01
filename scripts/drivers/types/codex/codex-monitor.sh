@@ -265,7 +265,7 @@ case "${MSYSTEM:-}" in
   MINGW*|MSYS*|CLANGARM*)
     existing_reaper_pid="$(cat "$IDLE_TTL_PID_FILE" 2>/dev/null || true)"
     reaper_alive=0
-    if [ -n "$existing_reaper_pid" ] && kill -0 "$existing_reaper_pid" 2>/dev/null; then
+    if [ -n "$existing_reaper_pid" ] && _agmsg_msys_pid_alive "$existing_reaper_pid"; then
       reaper_cmd="$(compat_get_cmdline "$existing_reaper_pid" 2>/dev/null || true)"
       case "$reaper_cmd" in
         *"idle_ttl_run_loop $PORT "*) reaper_alive=1 ;;
@@ -276,6 +276,7 @@ case "${MSYSTEM:-}" in
       server_bg_for_ttl="$(cat "$SERVER_PID" 2>/dev/null || true)"
       if [ -n "$server_bg_for_ttl" ]; then
         idle_ttl_script="source $(printf '%q' "$SCRIPT_DIR/../../../lib/manifest.sh"); \
+source $(printf '%q' "$SCRIPT_DIR/../../../lib/instance-id.sh"); \
 source $(printf '%q' "$SCRIPT_DIR/../../../lib/idle-ttl.sh"); \
 idle_ttl_run_loop $(printf '%q' "$PORT") $(printf '%q' "$server_bg_for_ttl") \
 $(printf '%q' "$SERVER_PID") $(printf '%q' "$IDLE_TTL_SECONDS") $(printf '%q' "$IDLE_TTL_POLL_SECONDS")"

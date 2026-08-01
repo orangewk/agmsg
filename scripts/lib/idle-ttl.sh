@@ -113,7 +113,7 @@ idle_ttl_run_loop() {
     # away) — nothing left for this loop to own. Exit quietly; gc.sh's own
     # reap-on-startup / stop_codex_bridge already handle pidfile cleanup for a
     # server that's gone, this loop does not duplicate that.
-    kill -0 "$server_pid" 2>/dev/null || return 0
+    _agmsg_msys_pid_alive "$server_pid" || return 0
 
     # A newer codex-monitor.sh invocation replaced the recorded server (stale
     # version reuse-rejection in codex-monitor.sh) — this loop's server_pid is
@@ -156,9 +156,10 @@ idle_ttl_run_loop() {
   # This mirrors stop_codex_bridge's own confirm-before-kill discipline
   # (delivery.sh) rather than introducing a third kill-path convention.
   #
-  # Caller contract: manifest.sh (manifest_record_dispose, manifest_process_id)
-  # MUST already be sourced by the caller before invoking idle_ttl_run_loop, the
-  # same "caller sources, this file doesn't re-source" convention gc.sh uses
+  # Caller contract: instance-id.sh (_agmsg_msys_pid_alive) and manifest.sh
+  # (manifest_record_dispose, manifest_process_id) MUST already be sourced by
+  # the caller before invoking idle_ttl_run_loop, the same "caller sources,
+  # this file doesn't re-source" convention gc.sh uses
   # (see gc.sh's own header comment) — this file does not guard-source it so a
   # caller with a differently-configured copy (e.g. a test double) is never
   # silently shadowed.

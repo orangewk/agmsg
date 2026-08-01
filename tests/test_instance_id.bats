@@ -551,12 +551,13 @@ require_eperm_pid() {
 
 @test "no shipped script decides liveness with a bare kill -0" {
   # #500's lesson: a partially-hardened file reads as a fixed one. Every
-  # liveness check must go through _agmsg_pid_alive, which is EPERM-aware and
-  # cross-checks ps; instance-id.sh is where that check is implemented, so it
-  # is the one file allowed to call kill -0 directly.
+  # liveness check must go through the pid-space-aware helpers in
+  # instance-id.sh. They handle EPERM/native Windows lookup and are the only
+  # shipped implementation allowed to call kill -0 directly.
   local offenders
   offenders="$(cd "$BATS_TEST_DIRNAME/.." && grep -rn -e 'kill -0' -e 'kill -s 0' scripts bin 2>/dev/null \
     | grep -v '^scripts/lib/instance-id.sh:' \
+    | grep -v ':[0-9]*: *//' \
     | grep -v ':[0-9]*: *#' || true)"
   [ -z "$offenders" ] || { echo "$offenders"; false; }
 }
