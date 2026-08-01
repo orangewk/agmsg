@@ -118,6 +118,23 @@ _agmsg_pid_alive() {
   return 0
 }
 
+# Liveness for a pid explicitly recorded in the shell/MSYS pid space. Git
+# Bash's $! names that process in MSYS space, while _agmsg_pid_alive uses the
+# native Windows table there. Keep callers from silently mixing the two.
+# Outside Windows there is only one pid space, so retain the EPERM-aware check.
+_agmsg_msys_pid_alive() {
+  local pid="$1"
+  _agmsg_pid_valid "$pid" || return 1
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*|CYGWIN*)
+      kill -0 "$pid" 2>/dev/null
+      ;;
+    *)
+      _agmsg_pid_alive "$pid"
+      ;;
+  esac
+}
+
 # Compose from an explicit pid. Bare sid when pid is empty/non-numeric.
 agmsg_instance_id_from_pid() {
   local sid="$1" pid="$2"

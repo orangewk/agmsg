@@ -466,6 +466,15 @@ require_eperm_pid() {
   run _agmsg_pid_alive $$;     [ "$status" -eq 0 ]
 }
 
+@test "instance-id: MSYS-space liveness accepts a bash child on Windows" {
+  sleep 5 & local child=$!
+  run _agmsg_msys_pid_alive "$child"
+  local got="$status"
+  kill "$child" 2>/dev/null || true
+  wait "$child" 2>/dev/null || true
+  [ "$got" -eq 0 ]
+}
+
 @test "instance-id: 0 is not a live pid, it is this process group" {
   # `kill -0 0` SUCCEEDS: 0 addresses the caller's own process group, not pid 0.
   # A digits-only check therefore called 0 alive, and callers kill whatever this
