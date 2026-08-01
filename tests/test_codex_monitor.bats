@@ -62,7 +62,15 @@ teardown() {
   # Kill any app-server listeners these tests spawned.
   for pf in "$TEST_SKILL_DIR"/run/codex-app-server.*.pid; do
     [ -f "$pf" ] || continue
-    kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+    pid="$(cat "$pf" 2>/dev/null || true)"
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+    # Detached idle-TTL reapers can recreate run/ after fixture cleanup starts.
+    # Wait until every recorded MSYS process has actually exited first.
+    for i in {1..50}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
   done
   rm -rf "$TEST_PROJECT"
   teardown_test_env
@@ -177,10 +185,21 @@ EOF
   run env AGMSG_REAL_CODEX="$ansi_codex" \
     bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
   [ "$status" -eq 0 ]
+  local pidf first_pid
+  pidf="$(ls "$TEST_SKILL_DIR"/run/codex-app-server.*.pid | grep -v '\.idle-ttl\.pid$' | head -1)"
+  first_pid="$(cat "$pidf")"
   # The port was parsed out of the colorized banner: the handoff must be the
   # BRIDGED form (--remote ws://...), not the plain-codex fail-open.
   grep -q 'plain-codex <--remote> <ws://127\.0\.0\.1:[0-9][0-9]*>' "$CALL_LOG"
   [[ "$output" != *"did not report a listening port"* ]]
+
+  # SERVER_PID is an MSYS pid on Windows. A second launch must check it in that
+  # pid space and reuse the live server instead of querying tasklist with it as
+  # though it were a native pid.
+  run env AGMSG_REAL_CODEX="$ansi_codex" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" --codex-command codex --
+  [ "$status" -eq 0 ]
+  [ "$(cat "$pidf")" = "$first_pid" ]
 }
 
 @test "codex-monitor: never kills a non-codex process recorded under a reused pid" {

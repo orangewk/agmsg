@@ -131,6 +131,19 @@ port_alive() {  # $1 = port; succeeds if something is accepting on 127.0.0.1:$1
   (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
 }
 
+# SERVER_PID stores bash's $! from a plain background launch. On Git Bash that
+# is an MSYS pid, not the native Windows pid queried by _agmsg_pid_alive. Keep
+# this pid-space distinction explicit: using the native check here makes every
+# live app-server look stale on Windows and also aborts the startup poll before
+# the listening banner is written.
+APP_SERVER_PID_PLATFORM="$(uname -s 2>/dev/null || true)"
+app_server_pid_alive() {  # $1 = SERVER_PID value (MSYS on Windows)
+  case "$APP_SERVER_PID_PLATFORM" in
+    MINGW*|MSYS*|CYGWIN*) kill -0 "$1" 2>/dev/null ;;
+    *) _agmsg_pid_alive "$1" ;;
+  esac
+}
+
 PORT=""
 if [ -f "$PORT_FILE" ] && [ -f "$SERVER_PID" ]; then
   existing_port="$(cat "$PORT_FILE" 2>/dev/null || true)"
@@ -140,7 +153,7 @@ if [ -f "$PORT_FILE" ] && [ -f "$SERVER_PID" ]; then
   # so a foreign process that grabbed the same port after ours died is not
   # mistaken for the bridge app-server.
   if [ -n "$existing_port" ] && [ -n "$existing_pid" ] \
-    && _agmsg_pid_alive "$existing_pid" && port_alive "$existing_port"; then
+    && app_server_pid_alive "$existing_pid" && port_alive "$existing_port"; then
     # Confirm the recorded pid is actually OUR codex app-server before trusting OR
     # killing it: a recycled pid could belong to an unrelated process while the
     # recorded port happens to answer via something else. Only reuse/kill when the
@@ -210,7 +223,7 @@ if [ -z "$PORT" ]; then
     # Stop waiting the moment the app-server exits (e.g. a codex release dropped
     # `app-server --listen ws://`): no point burning the full timeout before we
     # fail open.
-    _agmsg_pid_alive "$server_bg" || break
+    app_server_pid_alive "$server_bg" || break
     sleep 0.1
   done
   if [ -z "$PORT" ]; then
