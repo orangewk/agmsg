@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Launch Codex with agmsg's app-server bridge enabled.
 #
-# This is a beta convenience wrapper: it hides the shared app-server socket and
+# This is a convenience wrapper: it hides the shared app-server socket and
 # lets session-start.sh launch codex-bridge.js in the background once Codex
 # exposes CODEX_THREAD_ID to hooks.
 
@@ -20,6 +20,9 @@ source "$SCRIPT_DIR/../../../lib/manifest.sh"
 # itself (only launches it as a separate `bash -c "source ...; idle_ttl_run_loop
 # ..."` process below, see the "Ensure an idle-TTL reaper loop" block), so
 # sourcing it into THIS process's own function table would be dead weight.
+# PID-space-aware liveness for the app-server reuse decision below.
+# shellcheck source=../../../lib/instance-id.sh
+source "$SCRIPT_DIR/../../../lib/instance-id.sh"
 
 PROJECT="$(pwd)"
 SOCKET_PATH=""
@@ -137,7 +140,7 @@ if [ -f "$PORT_FILE" ] && [ -f "$SERVER_PID" ]; then
   # so a foreign process that grabbed the same port after ours died is not
   # mistaken for the bridge app-server.
   if [ -n "$existing_port" ] && [ -n "$existing_pid" ] \
-    && kill -0 "$existing_pid" 2>/dev/null && port_alive "$existing_port"; then
+    && _agmsg_msys_pid_alive "$existing_pid" && port_alive "$existing_port"; then
     # Confirm the recorded pid is actually OUR codex app-server before trusting OR
     # killing it: a recycled pid could belong to an unrelated process while the
     # recorded port happens to answer via something else. Only reuse/kill when the
@@ -198,13 +201,16 @@ if [ -z "$PORT" ]; then
     "$(manifest_process_id "$server_bg" "codex app-server --listen ws://127.0.0.1:0" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" msys)" \
     "$$" \
     "delivery.sh set off codex (stop_codex_bridge) kills by confirmed cmdline; gc reaps if dead"
+  # codex 0.144+ colorizes this banner even when stdout is a redirected file
+  # (NO_COLOR is ignored), so strip ANSI SGR sequences before matching.
+  ansi_esc="$(printf '\033')"
   for _ in $(seq 1 100); do
-    PORT="$(sed -n 's#.*listening on: ws://127\.0\.0\.1:\([0-9][0-9]*\).*#\1#p' "$SERVER_LOG" | head -1)"
+    PORT="$(sed -n -e "s/${ansi_esc}\[[0-9;]*m//g" -e 's#.*listening on: ws://127\.0\.0\.1:\([0-9][0-9]*\).*#\1#p' "$SERVER_LOG" | head -1)"
     [ -n "$PORT" ] && break
     # Stop waiting the moment the app-server exits (e.g. a codex release dropped
     # `app-server --listen ws://`): no point burning the full timeout before we
     # fail open.
-    kill -0 "$server_bg" 2>/dev/null || break
+    _agmsg_msys_pid_alive "$server_bg" || break
     sleep 0.1
   done
   if [ -z "$PORT" ]; then
@@ -259,7 +265,7 @@ case "${MSYSTEM:-}" in
   MINGW*|MSYS*|CLANGARM*)
     existing_reaper_pid="$(cat "$IDLE_TTL_PID_FILE" 2>/dev/null || true)"
     reaper_alive=0
-    if [ -n "$existing_reaper_pid" ] && kill -0 "$existing_reaper_pid" 2>/dev/null; then
+    if [ -n "$existing_reaper_pid" ] && _agmsg_msys_pid_alive "$existing_reaper_pid"; then
       reaper_cmd="$(compat_get_cmdline "$existing_reaper_pid" 2>/dev/null || true)"
       case "$reaper_cmd" in
         *"idle_ttl_run_loop $PORT "*) reaper_alive=1 ;;
@@ -270,6 +276,7 @@ case "${MSYSTEM:-}" in
       server_bg_for_ttl="$(cat "$SERVER_PID" 2>/dev/null || true)"
       if [ -n "$server_bg_for_ttl" ]; then
         idle_ttl_script="source $(printf '%q' "$SCRIPT_DIR/../../../lib/manifest.sh"); \
+source $(printf '%q' "$SCRIPT_DIR/../../../lib/instance-id.sh"); \
 source $(printf '%q' "$SCRIPT_DIR/../../../lib/idle-ttl.sh"); \
 idle_ttl_run_loop $(printf '%q' "$PORT") $(printf '%q' "$server_bg_for_ttl") \
 $(printf '%q' "$SERVER_PID") $(printf '%q' "$IDLE_TTL_SECONDS") $(printf '%q' "$IDLE_TTL_POLL_SECONDS")"

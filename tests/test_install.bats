@@ -36,6 +36,13 @@ teardown() {
   [[ "$output" =~ "hello from install" ]]
 }
 
+@test "install: Codex skill documents safe Git Bash quoting for Windows PowerShell" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+
+  grep -Fq "& 'C:\\Program Files\\Git\\bin\\bash.exe' -lc '~/.agents/skills/agmsg/scripts/whoami.sh \"\$(pwd)\" codex'" "$SK/SKILL.md"
+  grep -Fq "Do not use POSIX \`'\"'\"'\` quote splicing in PowerShell" "$SK/SKILL.md"
+}
+
 @test "install: --update restores scripts/lib even if it went missing" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-update-projA
@@ -329,14 +336,19 @@ PS1
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-projA
   local sid="resue-sid-$$"
 
-  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code &
+  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
   local first=$!
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$first"
 
-  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code &
+  bash "$SK/scripts/watch.sh" "$sid" /tmp/install-projA claude-code 3>&- &
   local second=$!
   wait_for_pidfile_pid "$SK/run/watch.$sid.pid" "$second"
-  # And the previous one was actually killed.
+  # The pidfile can flip to $second a beat before $first's TERM trap has
+  # actually run — poll for its exit rather than checking the instant the
+  # pidfile changes (a single check raced this and flaked, see #124; same
+  # fix already applied to the equivalent check in test_watch.bats).
+  local i
+  for i in $(seq 1 30); do kill -0 "$first" 2>/dev/null || break; sleep 0.1; done
   run kill -0 "$first"
   [ "$status" -ne 0 ]
 

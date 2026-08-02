@@ -36,11 +36,27 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 # GROK_SESSION_ID). An empty first arg is tolerated and resolved below (after the
 # libs are sourced) rather than failing hard, so a runtime that cannot bake one
 # in — notably Grok Build's `monitor` tool, where "$GROK_SESSION_ID" expands to
-# empty — still starts the watcher. project_path and agent_type are required.
+# empty — still starts the watcher. A literal `-` first arg is the caller-side
+# sentinel for the same "no session id" case: some launcher shells re-evaluate
+# the command line and DROP a quoted-but-empty argument entirely (shifting every
+# later argument one slot left), so command templates pass
+# "${GROK_SESSION_ID:--}" and `-` is folded into the empty-arg path here.
+# project_path and agent_type are required.
 SESSION_ID="${1:-}"
-PROJECT_PATH="${2:?Missing project_path}"
-AGENT_TYPE="${3:?Missing agent_type}"
+[ "$SESSION_ID" = "-" ] && SESSION_ID=""
+PROJECT_PATH="${2:-}"
+AGENT_TYPE="${3:-}"
 ACTIVE_NAME="${4:-}"
+
+# Missing required args fail on STDOUT, not via ${n:?}: bash prints the :?
+# message to stderr, which the monitor tool consuming this stream never
+# surfaces — the launch would die invisibly. A short arg list is also how a
+# shifted three-argument launch (no active_name; empty session id dropped by
+# the caller shell, see above) presents, so name that cause here too.
+if [ -z "$PROJECT_PATH" ] || [ -z "$AGENT_TYPE" ]; then
+  echo "ERROR: watch.sh needs <session_id> <project_path> <agent_type> [active_name]; got $# argument(s). A caller shell may have dropped an empty session_id argument and shifted the rest. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -51,6 +67,38 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/sync.sh"
+
+# Fail loudly on an unknown agent_type instead of running with zero
+# subscriptions. The dominant real-world cause is a shifted argument list: a
+# launcher shell that drops an empty first argument (see the session_id note
+# above) makes project_path land in $2 and agent_type receive whatever was in
+# $4 — typically an agent/role name. identities.sh then resolves nothing and,
+# without this guard, the watcher keeps polling forever while delivering
+# nothing: a silent zero-subscription outage that looks alive from the
+# outside. Same shape as the DB-open healthcheck (#197): one loud line on
+# stdout (the monitor event stream), then exit.
+#
+# Hot path stays free: a built-in type is confirmed by a single manifest stat.
+# A name with '/' or '..' is rejected outright — it is never a type name, and
+# letting it reach the registry would concatenate it into a filesystem path
+# (e.g. '../types/claude-code' would resolve to a builtin manifest and pass).
+# Only a legitimate non-builtin name pays for the registry (trusted external
+# plugins can add types), and the full type enumeration runs only in the
+# error message.
+case "$AGENT_TYPE" in
+  */*|*..*)
+    echo "ERROR: invalid agent type '$AGENT_TYPE' (type names never contain '/' or '..'). Arguments may have shifted: a caller shell can drop an empty session_id argument entirely. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
+    exit 1
+    ;;
+esac
+if [ ! -f "$SCRIPT_DIR/drivers/types/$AGENT_TYPE/type.conf" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/type-registry.sh"
+  if ! agmsg_type_dir "$AGENT_TYPE" >/dev/null 2>&1; then
+    echo "ERROR: unknown agent type '$AGENT_TYPE' (supported: $(agmsg_known_types | sort -u | paste -sd, - | sed 's/,/, /g')). Arguments may have shifted: a caller shell can drop an empty session_id argument entirely. Pass the sentinel '-' (e.g. \"\${GROK_SESSION_ID:--}\") instead of an empty string."
+    exit 1
+  fi
+fi
 
 # Resolve a session id when the launcher could not bake one in (empty first arg).
 # Grok Build's `monitor` tool runs the watcher with $GROK_SESSION_ID unset, so
@@ -127,18 +175,20 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 # against pid recycling — only touch processes whose cmdline still matches
 # our watch.sh. See #66.
 #
-# When ps is unavailable (e.g. Claude Code sandbox), fall back to kill -0
-# which confirms the pid is alive but cannot validate the cmdline.
+# When ps is unavailable (e.g. Claude Code sandbox), fall back to _agmsg_pid_alive
+# which confirms the pid is alive but cannot validate the cmdline. It is EPERM-aware
+# so a live-but-unsignalable sibling watcher isn't misread as dead and left running.
 if [ -f "$PIDFILE" ]; then
   prev_pid=$(cat "$PIDFILE" 2>/dev/null || true)
-  if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && kill -0 "$prev_pid" 2>/dev/null; then
+  if [ -n "$prev_pid" ] && [ "$prev_pid" != "$$" ] && _agmsg_pid_alive "$prev_pid"; then
     prev_cmd=$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)
     if [ -n "$prev_cmd" ]; then
       case "$prev_cmd" in
         *"$SKILL_DIR/scripts/watch.sh"*) kill "$prev_pid" 2>/dev/null || true ;;
       esac
     else
-      # ps unavailable (sandboxed) — skip cmdline validation, rely on kill -0
+      # ps unavailable (sandboxed) — skip cmdline validation, rely on the
+      # _agmsg_pid_alive check above
       kill "$prev_pid" 2>/dev/null || true
     fi
   fi
@@ -278,6 +328,41 @@ done <<< "$PAIRS"
 WATERMARK_FILE="$RUN_DIR/watch.$SESSION_ID.watermark"
 persist_watermark() { printf '%s\n' "$LAST" > "$WATERMARK_FILE" 2>/dev/null || true; }
 
+# Mark a row's read_at so a later inbox.sh call does not re-surface it as
+# unread — the watermark only stops THIS watcher from re-streaming a row, it
+# never touches read_at (see the call sites below for the full rationale).
+# Shared by both the normal delivery path and the ctrl:despawn control-row
+# path so the two do not drift (#review finding, 2026-07-19). $1 is trusted
+# to be a DB-sourced id everywhere this is called, but it is guarded anyway
+# (matches inbox.sh's own defensive stance) since it is interpolated into SQL.
+#
+# $2/$3 (team, to) scope this to the DEFINITIVE receiver for that role:
+#   - an exclusive watcher (ACTIVE_NAME set) only marks its own role's rows.
+#   - a broad watcher (ACTIVE_NAME empty) subscribes to every registered role
+#     in the project (see PAIRS above), so without this guard it would also
+#     mark read_at for a role that has its OWN exclusive watcher — e.g. a
+#     leader's default SessionStart watcher racing/clobbering the read state
+#     an actas'd member's exclusive watcher is responsible for. Skip when an
+#     exclusive ready sentinel for (team, to) exists; that role's own watcher
+#     owns the read state (review finding, 2026-07-19).
+#
+# Note: this is a best-effort mark on local write success, not a delivery ack
+# — there is no protocol to confirm the downstream Monitor reader actually
+# consumed the line (a pipe write can succeed into a kernel buffer even if the
+# reader is about to exit). A stronger guarantee needs the claim/ack redesign
+# tracked in #373; out of scope for this fix (review finding, 2026-07-19).
+mark_read() {
+  local mid="$1" team="$2" to="$3"
+  case "$mid" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if [ -z "$ACTIVE_NAME" ] && [ -n "$team" ] && [ -n "$to" ]; then
+    [ -e "$(agmsg_ready_path "$team" "$to")" ] && return 0
+  fi
+  agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=$mid AND read_at IS NULL;" 2>/dev/null \
+    || echo "agmsg watch: could not mark message $mid read (db busy/unavailable); a later inbox.sh call will re-surface it" >&2
+}
+
 LAST=""
 if [ -f "$WATERMARK_FILE" ]; then
   LAST="$(cat "$WATERMARK_FILE" 2>/dev/null || true)"
@@ -362,6 +447,7 @@ while true; do
         # which also ends the agent CLI sharing it. Deterministic teardown, no
         # dependence on the agent LLM noticing the message. See #109.
         if [ "$body" = "ctrl:despawn" ]; then
+          mark_read "$id" "$team" "$to"
           LAST="$id"; persist_watermark
           # Only an EXCLUSIVE watcher dedicated to exactly this role tears
           # itself down. A broad-subscription watcher (e.g. a leader whose
@@ -373,9 +459,30 @@ while true; do
           if [ -z "$ACTIVE_NAME" ] || [ "$to" != "$ACTIVE_NAME" ]; then
             continue
           fi
+          # Read the placement record BEFORE reset.sh. reset.sh releases the
+          # actas lock, and the leader's despawn deletes the record as soon as
+          # it observes that lock go free — so reading it afterwards races the
+          # cleanup and would intermittently see nothing.
+          placed_id=""
+          spawn_rec="$(agmsg_spawn_path "$team" "$to")"
+          [ -f "$spawn_rec" ] && IFS=$'\t' read -r placed_id _ _ < "$spawn_rec"
           "$SCRIPT_DIR/reset.sh" "$PROJECT_PATH" "$AGENT_TYPE" "$to" "$SESSION_ID" >/dev/null 2>&1 || true
           if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
             tmux kill-pane -t "$TMUX_PANE" 2>/dev/null || true
+          # Closing a herdr pane needs more than "a pane id is in the
+          # environment". HERDR_* is inherited by every descendant of a herdr
+          # pane, so a watcher merely STARTED inside one — a developer running
+          # the test suite, or any agent that actas'd by hand — carries the
+          # HOST pane's id. Acting on that closes the host. Require both the
+          # full herdr environment (matching spawn's own detection) and proof
+          # that agmsg itself placed this pane: the recorded placement for this
+          # (team, agent) must name exactly the pane we are sitting in.
+          # Otherwise fall through to the manual branch. This is the herdr
+          # counterpart of the tmux path's ACTIVE_NAME gating (#109).
+          elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
+               && [ "$placed_id" = "herdr:$HERDR_PANE_ID" ] \
+               && command -v herdr >/dev/null 2>&1; then
+            herdr pane close "$HERDR_PANE_ID" 2>/dev/null || true
           else
             echo "agmsg watch: despawned '$to' (role dropped); close this window manually" >&2
           fi
@@ -385,6 +492,12 @@ while true; do
           cleanup
           exit 0
         fi
+        # Mark delivered so a later inbox.sh call (e.g. a respawned/resumed
+        # session's actas re-registration) does not re-surface this message as
+        # unread. Without this, every message ever streamed live stays
+        # read_at IS NULL forever, and a single inbox.sh call replays the
+        # entire history as "new".
+        mark_read "$id" "$team" "$to"
         LAST="$id"
         persist_watermark
       done <<< "$ROWS"

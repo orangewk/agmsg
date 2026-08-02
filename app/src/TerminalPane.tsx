@@ -2,10 +2,12 @@ import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createWriteBatcher } from "./writeBatcher";
+import { attachWebglAddon } from "./webglAttach";
 
 type Props = {
   /** Stable session id; also the key the backend stores the PTY under. */
@@ -14,10 +16,23 @@ type Props = {
   args?: string[];
   cwd?: string;
   fontSize?: number;
+  /** Whether this pane is the currently visible one. Every pane across
+   * every tab/team stays mounted for its whole session (see the .stage
+   * comment in App.tsx), so this drives WebGL context attach/detach — see
+   * the dedicated effect below — rather than mount/unmount. */
+  active: boolean;
   onAgentState?: (id: string, state: "idle" | "working" | "blocked" | "unknown") => void;
   /** Reported on every fit — the pane's current cell size in CSS px, so a
    * divider drag elsewhere can snap to whole terminal rows/cols. */
   onCellSize?: (widthPx: number, heightPx: number) => void;
+  /** Fired when this pane's terminal actually receives keyboard focus (a
+   * click inside it, or Tab-focus) — xterm.js's hidden input textarea is a
+   * focusable descendant of the container div below, so a plain onFocus
+   * there catches it via the bubbled focusin React normalizes to. Lets the
+   * app track "which pane in this tab was last actually used" for the
+   * external file-drop fallback target (koit: prefer the focused pane over
+   * just the tab's first one). */
+  onFocusPane?: (id: string) => void;
 };
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -31,7 +46,17 @@ function b64ToBytes(b64: string): Uint8Array {
  * One embedded agent terminal: an xterm.js view bound to a backend PTY session.
  * Output streams in via `pty-output` events; keystrokes go back via `pty_write`.
  */
-export function TerminalPane({ id, cmd, args = [], cwd, fontSize = 12, onAgentState, onCellSize }: Props) {
+export function TerminalPane({
+  id,
+  cmd,
+  args = [],
+  cwd,
+  fontSize = 12,
+  active,
+  onAgentState,
+  onCellSize,
+  onFocusPane,
+}: Props) {
   const ref = useRef<HTMLDivElement>(null);
   // Live handles to the current terminal/fit addon, for the font-size effect
   // below to reach — that effect must NOT be a dependency of the main effect
@@ -39,6 +64,10 @@ export function TerminalPane({ id, cmd, args = [], cwd, fontSize = 12, onAgentSt
   // running process).
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  // Set only while a WebGL context is actually attached (see the `active`
+  // effect below) — null whenever this pane is on the default DOM renderer,
+  // whether because it's inactive or because WebGL was never attached/lost.
+  const webglAddonRef = useRef<WebglAddon | null>(null);
   const idRef = useRef(id);
   idRef.current = id;
   const { t } = useTranslation();
@@ -213,5 +242,33 @@ export function TerminalPane({ id, cmd, args = [], cwd, fontSize = 12, onAgentSt
     onCellSize?.(el.offsetWidth / term.cols, el.offsetHeight / term.rows);
   }, [fontSize, onCellSize]);
 
-  return <div className="term-pane" ref={ref} />;
+  // WebGL-accelerated rendering, attached only while this pane is the
+  // visible one (see the `active` prop doc above). Issue #383: xterm's
+  // default DOM renderer does a full replaceChildren() DOM-node rebuild of
+  // an entire row on every content update — its own source calls this
+  // renderer "not meant to be particularly fast" and describes it as "a
+  // fallback for when the webgl addon is slow" (i.e. WebGL is the intended
+  // fast path, DOM is the fallback, and we'd been running the fallback
+  // unconditionally). A CLI's animated status text (frequent same-line SGR
+  // recoloring) forces that expensive rebuild repeatedly, which is the
+  // likely source of the reported render flicker.
+  //
+  // Scoped to `active`, not mount/unmount: every pane in every tab across
+  // every team stays mounted for its whole session, so eagerly attaching
+  // WebGL to every mounted pane would exhaust the browser's concurrent-
+  // context cap (Chromium: ~8-16) well before a typical multi-pane,
+  // multi-tab session's real pane count — multi-pane is this team's normal
+  // usage, not an edge case. Backgrounding a pane releases its context
+  // immediately rather than waiting for the browser to force-evict the
+  // oldest one.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || !active) return;
+    // Throw/dispose/context-loss edge cases live in attachWebglAddon
+    // (webglAttach.ts) so they're unit-testable without a real WebGL
+    // context — see that file for the failure-path reasoning.
+    return attachWebglAddon(term, () => new WebglAddon(), webglAddonRef);
+  }, [active]);
+
+  return <div className="term-pane" ref={ref} onFocus={() => onFocusPane?.(idRef.current)} />;
 }

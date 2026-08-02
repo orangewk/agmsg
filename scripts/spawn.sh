@@ -535,10 +535,15 @@ launch_in_tmux() {
 launch_macos_terminal() {
   # `open -a` is a launch, not an AppleEvent, so it does not trip the
   # Automation (TCC) consent prompts that `osascript ... do script` does.
+  # `-g`/`--background` keeps the newly opened terminal from stealing focus.
+  # This path is taken whenever $TMUX is unset -- notably when the spawning
+  # process itself has no tmux context (e.g. a GUI app, or any non-terminal
+  # caller), where a foreground terminal popup interrupts whatever the user
+  # is currently doing in the foreground app.
   local app="${1:-Terminal}"
   case "$app" in
-    iterm|iterm2|iTerm|iTerm2) open -a iTerm "$BOOT" ;;
-    *)                         open -a Terminal "$BOOT" ;;
+    iterm|iterm2|iTerm|iTerm2) open -g -a iTerm "$BOOT" ;;
+    *)                         open -g -a Terminal "$BOOT" ;;
   esac
 }
 
@@ -582,14 +587,86 @@ launch_with_template() {
   bash -c "$cmd"
 }
 
+is_herdr_env() {
+  [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] \
+    && command -v herdr >/dev/null 2>&1
+}
+
+# Extract one string field from a herdr JSON response by explicit path.
+#
+# herdr returns structured JSON, so the pane id must be addressed by path, not
+# by text matching. A greedy regex over the whole response picks the LAST
+# "pane_id" in it, which succeeds against a response carrying more than one
+# pane object and hands back somebody else's pane — the caller would then
+# rename it, run the boot script in it, and persist that id as the placement
+# record. Key order is not a contract either: a reordered or nested field
+# breaks a `[^}]*`-delimited match. sqlite3's JSON1 is already a core
+# dependency (whoami.sh, api.sh), so address the value directly.
+#
+# Fail closed: invalid JSON, a missing path, a non-string value, or an empty
+# string all yield empty output, and every caller treats empty as fatal.
+herdr_json_str() {
+  local resp="$1" path="$2" esc
+  esc="$(printf '%s' "$resp" | sed "s/'/''/g")"
+  agmsg_sqlite_mem "
+    WITH raw(json) AS (SELECT '$esc'),
+    doc(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
+    SELECT CASE
+             WHEN json_type(json, '$path') = 'text'
+             THEN json_extract(json, '$path')
+           END
+    FROM doc;
+  " 2>/dev/null
+}
+
+launch_in_herdr() {
+  local new_id resp
+  if [ "$TMUX_TARGET" = "window" ]; then
+    local ws="${HERDR_WORKSPACE_ID:-}"
+    if [ -z "$ws" ]; then
+      echo "spawn: --window requested but \$HERDR_WORKSPACE_ID is not set; falling back to split" >&2
+      TMUX_TARGET="pane"
+      launch_in_herdr
+      return $?
+    fi
+    resp="$(herdr tab create --workspace "$ws" --label "$NAME" --cwd "$PROJECT" 2>&1)" \
+      || die "herdr tab create failed: $resp"
+    new_id="$(herdr_json_str "$resp" '$.result.root_pane.pane_id')"
+    [ -n "$new_id" ] || die "herdr tab create: could not read result.root_pane.pane_id from response: $resp"
+  else
+    local dir="right"; [ "$SPLIT" = "v" ] && dir="down"
+    resp="$(herdr pane split "$HERDR_PANE_ID" --direction "$dir" --no-focus --cwd "$PROJECT" 2>&1)" \
+      || die "herdr pane split failed: $resp"
+    new_id="$(herdr_json_str "$resp" '$.result.pane.pane_id')"
+    [ -n "$new_id" ] || die "herdr pane split: could not read result.pane.pane_id from response: $resp"
+  fi
+  herdr pane rename "$new_id" "$NAME" >/dev/null 2>&1 || true
+  herdr pane run "$new_id" "$BOOT" 2>/dev/null \
+    || die "herdr pane run failed for pane $new_id"
+  # Record placement with herdr: scheme tag. The herdr pane_id contains ":"
+  # (e.g. wC:pN), so despawn strips the prefix with ${id#herdr:}.
+  local _spawn_rec
+  _spawn_rec="$(agmsg_spawn_path "$TEAM" "$NAME")"
+  mkdir -p "$(dirname "$_spawn_rec")"
+  printf 'herdr:%s\t%s\t%s\n' "$new_id" "$PROJECT" "$AGENT_TYPE" \
+    > "$_spawn_rec" 2>/dev/null || true
+}
+
 place_and_launch() {
+  # Priority: $TMUX (tmux-inside-herdr backward compat) → herdr → OS terminal.
   if [ -n "${TMUX:-}" ]; then
     launch_in_tmux
     echo "spawned ${AGENT_TYPE} '${NAME}' in tmux (${TMUX_TARGET})"
     return 0
   fi
 
-  # Non-tmux: open an OS terminal. A {cmd} template wins outright on any OS.
+  if is_herdr_env; then
+    launch_in_herdr
+    echo "spawned ${AGENT_TYPE} '${NAME}' in herdr (${TMUX_TARGET})"
+    return 0
+  fi
+
+  # Non-tmux/herdr: open an OS terminal. A {cmd} template wins outright on any OS.
   if [ -n "$TERMINAL_TMPL" ] && is_terminal_template "$TERMINAL_TMPL"; then
     launch_with_template
     echo "spawned ${AGENT_TYPE} '${NAME}' via custom terminal template"

@@ -9,6 +9,13 @@ set -euo pipefail
 #   delivery.sh stop
 #   delivery.sh restart [<project_path> <type>]
 #
+# `set`'s <project_path> must already exist as a directory (and be one this
+# process can enter), must not be empty/whitespace-only, and must not carry a
+# carriage return or newline byte anywhere in it -- it is never created
+# implicitly, and a malformed value is rejected rather than silently cleaned
+# up. Plain leading/trailing spaces or tabs are valid POSIX path characters
+# and are accepted as-is. See agmsg_validate_project_path below (#493).
+#
 # Modes:
 #   monitor  — SessionStart hook → Claude Code Monitor tool → watch.sh stream
 #   turn     — Stop hook → check-inbox.sh between turns (legacy)
@@ -63,6 +70,16 @@ RUN_DIR="$SKILL_DIR/run"
 # rule-file types' _delivery.sh plugs.
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/delivery-rulefile.sh"
+
+# Single-quote-escape $1 for splicing into a hook command string as its own
+# shell argument: replace each embedded ' with '\'' (close the quote, emit an
+# escaped literal quote, reopen the quote), matching the standard POSIX
+# technique. Unlike `'$var'`, this round-trips correctly through the shell
+# that later executes the resulting "command" value even when $var itself
+# contains a single quote.
+_agmsg_shq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
 
 # The per-project delivery hooks file is the type's manifest `hooks_file=`
 # (project-relative), not a hardcoded per-type case. The hook FORMAT written into
@@ -119,21 +136,30 @@ agmsg_delivery_apply_default() {
   strip_agmsg_event_file "$tmp_state" "Stop"
 
   # 2) Re-add what this mode wants.
+  #
+  # Each hook argument is wrapped with _agmsg_shq rather than a plain '...'
+  # literal: $project (and, in principle, $type) is attacker-influenceable —
+  # e.g. an extracted archive's directory name — and a bare `'$project'`
+  # breaks out of its argument boundary as soon as the value itself contains
+  # a single quote, letting the rest of the string run as shell syntax on the
+  # next SessionStart/SessionEnd/Stop event. The JSON-string escaping
+  # add_event_entry_file applies below only keeps the *JSON* well-formed; it
+  # says nothing about the shell that later executes the "command" value.
   case "$mode" in
     monitor)
-      local ss="'$SKILL_DIR/scripts/session-start.sh' '$type' '$project'"
-      local se="'$SKILL_DIR/scripts/session-end.sh'   '$type' '$project'"
+      local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+      local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
       add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       ;;
     turn)
-      local cmd="'$SKILL_DIR/scripts/check-inbox.sh' '$type' '$project'"
+      local cmd="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "Stop" "$cmd" "$ww"
       ;;
     both)
-      local ss="'$SKILL_DIR/scripts/session-start.sh' '$type' '$project'"
-      local se="'$SKILL_DIR/scripts/session-end.sh'   '$type' '$project'"
-      local st="'$SKILL_DIR/scripts/check-inbox.sh'   '$type' '$project'"
+      local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+      local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+      local st="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
       add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       add_event_entry_file "$tmp_state" "Stop"         "$st" "$ww"
@@ -230,7 +256,7 @@ agmsg_delivery_runtime_status_default() {
       [ -f "$f" ] || continue
       local pid
       pid=$(cat "$f" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
         alive=$((alive + 1))
       else
         dead=$((dead + 1))
@@ -288,7 +314,9 @@ emit_monitor_directive() {
   if [ -f "$pidfile" ]; then
     local existing
     existing=$(cat "$pidfile" 2>/dev/null || true)
-    if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
+    # EPERM-aware liveness (_agmsg_pid_alive): a sandbox-unsignalable watcher is
+    # still alive, so we must not re-emit and spawn a duplicate.
+    if [ -n "$existing" ] && _agmsg_pid_alive "$existing"; then
       cat <<EOF
 
 A watch.sh is already streaming into this session (pid $existing). No
@@ -343,7 +371,7 @@ stop_codex_bridge() {
       # own process.pid; the launcher's `nohup node ... &` means bash's $!
       # would be the nohup subshell, not this pid — see manifest.sh's PID
       # SPACE DECISION). Native liveness check, not kill -0.
-      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid" 2>/dev/null; then
+      if [ -n "$bpid" ] && _agmsg_pid_alive "$bpid"; then
         kill "$bpid" 2>/dev/null && killed=$((killed + 1))
       fi
       if [ -n "$bpid" ]; then
@@ -372,7 +400,7 @@ EOF
     server_pidfile="$RUN_DIR/codex-app-server.$project_hash.pid"
     if [ -f "$server_pidfile" ]; then
       server_pid="$(cat "$server_pidfile" 2>/dev/null || true)"
-      if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+      if [ -n "$server_pid" ] && _agmsg_pid_alive "$server_pid"; then
         server_cmd="$(compat_get_cmdline "$server_pid" 2>/dev/null || true)"
         case "$server_cmd" in
           *codex*app-server*) kill "$server_pid" 2>/dev/null || true ;;
@@ -403,7 +431,7 @@ EOF
     ttl_pidfile="$RUN_DIR/codex-app-server.$project_hash.idle-ttl.pid"
     if [ -f "$ttl_pidfile" ]; then
       ttl_pid="$(cat "$ttl_pidfile" 2>/dev/null || true)"
-      if [ -n "$ttl_pid" ] && kill -0 "$ttl_pid" 2>/dev/null; then
+      if [ -n "$ttl_pid" ] && _agmsg_msys_pid_alive "$ttl_pid"; then
         ttl_cmd="$(compat_get_cmdline "$ttl_pid" 2>/dev/null || true)"
         case "$ttl_cmd" in
           *idle_ttl_run_loop*) kill "$ttl_pid" 2>/dev/null || true ;;
@@ -546,10 +574,117 @@ stop_poc_waker() {
   echo "$killed"
 }
 
+# Reject a malformed project_path before any delivery-apply implementation
+# gets to build a hooks/rule file path from it and `mkdir -p` the result
+# (#493). Every implementation -- agmsg_delivery_apply_default,
+# rulefile_apply, and the cursor/copilot/grok-build overrides -- shares this
+# file's resolve_hooks_file(), and apply_settings (this function's sole
+# caller) is the only place any of them get invoked from, so validating here
+# once covers every agent type without touching each apply implementation.
+#
+# agmsg's primary callers are LLM agents composing this command from a
+# SKILL.md, so a literal argument carrying a stray trailing newline (unlike a
+# `$(pwd)`-style substitution, which already strips one) is a realistic input,
+# not an exotic edge case -- that is exactly the #493 repro, where such a
+# value got concatenated verbatim into a hooks_file path and mkdir -p'd into a
+# bogus sibling directory nobody asked for.
+#
+# Policy: reject only the input shapes #493 is actually about, and otherwise
+# use the caller's value literally. That is:
+#   1. empty, or made up entirely of whitespace (spaces/tabs/CR/LF);
+#   2. carrying a CR or LF byte anywhere -- leading, trailing, or embedded
+#      (the #493 repro is exactly a trailing LF from adjacent-quote
+#      concatenation; a leading or embedded one is just as likely to be the
+#      product of a broken command composition, so all three are refused the
+#      same way rather than treated as an intentional path byte);
+#   3. not already an existing directory; or
+#   4. an existing directory this process cannot actually enter.
+# A plain leading/trailing space or tab is a valid POSIX path byte -- some
+# directories are legitimately named that way -- so it is accepted and used
+# as-is, not silently trimmed and not rejected. Rejecting only carries the
+# same "loud error naming the exact value, not a silent guess" spirit for the
+# shapes above: a caller that built a bad command should see why, not have it
+# quietly "corrected" into something that happens to work this one time.
+#
+# The existence check + traversability probe below mirrors spawn.sh's
+# existing --project handling: an unvalidated project_path must never cause a
+# directory to be created implicitly.
+#
+# Echoes the caller's own path spelling back on success (validated, not
+# rewritten); prints an error naming the offending value to stderr and returns
+# non-zero on failure.
+agmsg_validate_project_path() {
+  local raw="$1" trimmed="$1"
+  while :; do
+    case "$trimmed" in
+      " "*|$'\t'*|$'\r'*|$'\n'*) trimmed="${trimmed#?}" ;;
+      *) break ;;
+    esac
+  done
+  while :; do
+    case "$trimmed" in
+      *" "|*$'\t'|*$'\r'|*$'\n') trimmed="${trimmed%?}" ;;
+      *) break ;;
+    esac
+  done
+
+  # Emptiness is judged after trimming space/tab/CR/LF from both ends, so a
+  # value that is only whitespace (of any of those four bytes) is caught here
+  # regardless of which one(s) it's made of.
+  if [ -z "$trimmed" ]; then
+    echo "delivery.sh: project_path is empty or only whitespace: $(printf '%q' "$raw")" >&2
+    return 1
+  fi
+  case "$raw" in
+    *$'\n'*|*$'\r'*)
+      # Judged against $raw (not $trimmed), so this catches a CR/LF anywhere
+      # in the value -- leading, trailing, or hiding in the middle -- while
+      # leaving plain leading/trailing spaces/tabs (already proven non-empty
+      # above) untouched.
+      echo "delivery.sh: project_path contains a carriage return or newline (leading, trailing, or embedded): $(printf '%q' "$raw")" >&2
+      return 1
+      ;;
+  esac
+  if [ ! -d "$raw" ]; then
+    echo "delivery.sh: project path does not exist: $(printf '%q' "$raw")" >&2
+    echo "  agmsg will not create a project directory implicitly -- pass an existing path (e.g. the output of \"\$(pwd)\")." >&2
+    return 1
+  fi
+  # -d passes for a directory we cannot actually enter, and every apply
+  # implementation goes on to write inside it, so prove traversability here
+  # rather than failing later with a confusing mkdir error. `--` keeps a real
+  # directory named like an option (`-P`, `-L`) from being parsed as one.
+  #
+  # The status is checked explicitly instead of being folded into a
+  # `$(cd ... && pwd)` command substitution: printf returns 0 regardless, so
+  # that shape lets a permission failure sail through as a successful
+  # validation of an empty path -- a validator that fails open is worse than
+  # no validator. CDPATH is cleared inside the subshell: with it set, a
+  # RELATIVE project_path can `cd` into a same-named directory somewhere on
+  # CDPATH instead of the one `-d` just checked -- an un-enterable local
+  # directory would then validate against a different, enterable one.
+  if ! ( CDPATH='' cd -- "$raw" ) >/dev/null 2>&1; then
+    echo "delivery.sh: project path exists but cannot be entered: $(printf '%q' "$raw")" >&2
+    return 1
+  fi
+
+  # Echo the caller's own spelling back. Canonicalizing here would be a second,
+  # unrequested behavioral change: it rewrites relative paths to absolute and
+  # collapses ./.., so anything downstream that compares or persists this value
+  # would start seeing a different string than the caller passed. #493 is about
+  # refusing malformed input, not about normalizing well-formed input.
+  printf '%s' "$raw"
+}
+
 do_set() {
   local MODE="${1:?Usage: delivery.sh set <mode> <type> <project_path>}"
   local TYPE="${2:?Missing type}"
   local PROJECT="${3:?Missing project_path}"
+
+  # Zeroth stage: the project path itself must be a real, unambiguous
+  # directory before any type-specific logic (which mkdir -p's a path built
+  # from it) runs. See agmsg_validate_project_path above (#493).
+  PROJECT="$(agmsg_validate_project_path "$PROJECT")" || exit 1
 
   # Two-stage validation. First: is this even a real mode? The four mode names
   # are engine vocabulary (not type-specific), so a typo is caught here with a
@@ -559,7 +694,7 @@ do_set() {
   esac
   # Second: does THIS type accept the mode? A type declares the modes its CLI
   # accepts via the delivery_modes= manifest key (e.g. codex omits 'both' — the
-  # bridge beta has no both-mode; rule-file types like opencode omit
+  # the bridge has no both-mode; rule-file types like opencode omit
   # 'monitor'/'both'). Reject anything not listed, before any file is touched.
   # Types without the key fall back to the full set so an unconfigured manifest
   # still works.
@@ -649,7 +784,7 @@ kill_all_watchers() {
       [ -f "$f" ] || continue
       local pid cmd
       pid=$(cat "$f" 2>/dev/null || echo "")
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if [ -n "$pid" ] && _agmsg_pid_alive "$pid"; then
         # Defensive: only kill if the pid's command line still looks like
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that reused the pid.

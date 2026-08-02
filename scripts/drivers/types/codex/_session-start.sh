@@ -175,7 +175,7 @@ EOF
     # attached (orangewk/agmsg#8 WP1 finding; fixed here in WP2). Use the
     # native-space liveness helper instead, same as stop_codex_bridge
     # (delivery.sh) and gc.sh's own codex-bridge pidfile reaper.
-    if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid" 2>/dev/null; then
+    if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid"; then
       exit 0
     fi
   fi

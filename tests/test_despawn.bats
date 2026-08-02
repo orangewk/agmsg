@@ -8,6 +8,14 @@ load test_helper
 
 setup() {
   setup_test_env
+  # Never inherit a real herdr environment from the test runner. A watcher
+  # started here that keeps the host's HERDR_PANE_ID will, on ctrl:despawn,
+  # close the developer's own pane — the suite kills the session running it.
+  # This belongs in setup, not on individual watch.sh launches: guarding each
+  # launch site means every test added later has to remember, and one that
+  # did not (the #439 read_at test, added after this file first grew herdr
+  # awareness) is exactly how a real host pane got closed.
+  unset HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID
   export PROJ="/tmp/agmsg-despawn-proj"
   export RUN="$TEST_SKILL_DIR/run"
   mkdir -p "$RUN"
@@ -23,12 +31,14 @@ teardown() {
   # Make the member session look alive so the leader sees a live lock to wait on.
   setup_live_owner "$RUN" sess-m
 
-  # Unset TMUX_PANE: the ctrl:despawn handler runs `tmux kill-pane -t $TMUX_PANE`,
-  # and a watcher launched from inside the developer's tmux would inherit the
-  # REAL pane id and close the session running the tests. With TMUX_PANE empty,
-  # the handler takes the "close manually" branch — role-drop is still asserted.
-  AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
-    >/dev/null 2>&1 &
+  # Unset TMUX_PANE and HERDR_PANE_ID: the ctrl:despawn handler runs
+  # `tmux kill-pane` / `herdr pane close`, and a watcher launched from inside
+  # the developer's environment would inherit the REAL pane id and close the
+  # session running the tests. With both empty, the handler takes the "close
+  # manually" branch — role-drop is still asserted.
+  AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE -u HERDR_PANE_ID -u HERDR_ENV \
+    bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
+    >/dev/null 2>&1 3>&- &
   local wpid=$! i
   # Wait for the watcher to attach (it claims the lock + writes the ready sentinel).
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RUN/ready.team__alice" ] && break; sleep 0.5; done
@@ -43,6 +53,36 @@ teardown() {
   [ ! -f "$RUN/actas.team__alice.session" ]
   run bash "$SCRIPTS/identities.sh" "$PROJ" claude-code
   [[ "$output" != *alice* ]]
+
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+}
+
+# read_at for the most recent message with the given body, empty if unread.
+_read_at_for_body() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_sqlite "$(agmsg_db_path)" \
+      "SELECT read_at FROM messages WHERE body='$1' ORDER BY id DESC LIMIT 1;" )
+}
+
+@test "despawn: graceful — ctrl:despawn control row is marked read (does not linger as unread)" {
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
+  setup_live_owner "$RUN" sess-m
+
+  AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
+    >/dev/null 2>&1 3>&- &
+  local wpid=$! i
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RUN/ready.team__alice" ] && break; sleep 0.5; done
+  [ -e "$RUN/ready.team__alice" ]
+
+  run bash "$SCRIPTS/despawn.sh" team leader alice --timeout 10
+  [ "$status" -eq 0 ]
+
+  # The ctrl:despawn row itself must not be left permanently unread — a
+  # broad (non-actas) watcher that later scans this project's inbox must not
+  # see it resurface as a "new" message (2026-07-19 review finding).
+  [ -n "$(_read_at_for_body "ctrl:despawn")" ]
 
   kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
 }
@@ -91,8 +131,9 @@ teardown() {
   bash "$SCRIPTS/join.sh" team boss claude-code "$PROJ" >/dev/null
 
   # Broad watcher (no actas arg) — subscribes to both alice and leader.
-  AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE bash "$SCRIPTS/watch.sh" sess-broad "$PROJ" claude-code \
-    >/dev/null 2>&1 &
+  AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE -u HERDR_PANE_ID -u HERDR_ENV \
+    bash "$SCRIPTS/watch.sh" sess-broad "$PROJ" claude-code \
+    >/dev/null 2>&1 3>&- &
   local wpid=$! i
   for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$wpid" 2>/dev/null && break; sleep 0.5; done
 
@@ -112,4 +153,29 @@ teardown() {
   run bash "$SCRIPTS/despawn.sh" team leader alice
   [ "$status" -eq 0 ]
   [[ "$output" == *"no-live-lock"* ]]
+}
+
+@test "despawn --force: kills a herdr: placement via herdr pane close" {
+  bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
+  # Record a herdr-tagged placement (herdr: scheme prefix).
+  printf 'herdr:wC:p99\t%s\tclaude-code\n' "$PROJ" > "$RUN/spawn.team__alice"
+  printf 'somesid\n' > "$RUN/actas.team__alice.session"
+
+  # Stub herdr so we can assert the pane close call without touching real herdr.
+  local stub_bin="$TEST_SKILL_DIR/stub-bin"
+  mkdir -p "$stub_bin"
+  cat > "$stub_bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HERDR_CALL_LOG"
+echo '{"id":"cli:pane:close","result":{"type":"ok"}}'
+STUB
+  chmod +x "$stub_bin/herdr"
+  export HERDR_CALL_LOG="$TEST_SKILL_DIR/herdr-calls.log"
+
+  run env PATH="$stub_bin:$PATH" bash "$SCRIPTS/despawn.sh" team leader alice --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"status=forced"* ]]
+  [ ! -f "$RUN/spawn.team__alice" ]
+  # herdr was called with "pane close wC:p99" (prefix stripped).
+  grep -q "pane close wC:p99" "$HERDR_CALL_LOG"
 }

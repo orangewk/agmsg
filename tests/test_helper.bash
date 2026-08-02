@@ -74,6 +74,111 @@ rf() {
   printf '%s' "$p" | sed "s/'/''/g"
 }
 
+# --- Bounded condition waits -------------------------------------------------
+#
+# Wait for a condition to become true, polling, instead of sleeping a fixed
+# interval and hoping. A fixed `sleep 1` after launching a watcher is wrong in
+# both directions at once: it costs a whole second when the watcher was ready in
+# 40ms, and it still flakes on a loaded runner where the watcher needs 1.2s.
+# Polling is both faster and steadier, which is why the pattern already existed
+# ad hoc in test_watch.bats, test_install.bats and test_codex_bridge_launcher.bats
+# before it was hoisted here.
+#
+# Each returns non-zero on timeout, so a caller can fail with its own message or
+# clean up a background process first. The 10s ceiling is far above any real
+# local transition and well under the per-job CI timeout.
+#
+# NOTE: these replace waits for a condition that will become TRUE. A test that
+# asserts something does NOT happen cannot poll for it — see the comment at the
+# remaining fixed sleeps in test_delivery.bats.
+
+_WAIT_TICKS=100    # x 0.1s = 10s ceiling
+_WAIT_INTERVAL=0.1
+
+wait_for_file() {
+  local file="$1" i
+  for i in $(seq 1 $_WAIT_TICKS); do
+    [ -f "$file" ] && return 0
+    sleep $_WAIT_INTERVAL
+  done
+  return 1
+}
+
+wait_for_missing() {
+  local path="$1" i
+  for i in $(seq 1 $_WAIT_TICKS); do
+    [ ! -e "$path" ] && return 0
+    sleep $_WAIT_INTERVAL
+  done
+  return 1
+}
+
+wait_for_file_contains() {
+  local file="$1" needle="$2" i
+  for i in $(seq 1 $_WAIT_TICKS); do
+    [ -f "$file" ] && grep -q "$needle" "$file" && return 0
+    sleep $_WAIT_INTERVAL
+  done
+  return 1
+}
+
+# Positive evidence that a pid is gone. NOT `kill -0 || gone`.
+#
+# A failed `kill -0` is ESRCH (dead) or EPERM (alive, but not signalable by us —
+# sandboxes do exactly this, and a live instance of it was found in
+# delivery.sh status the same day this was written). Treating every failure as
+# "gone" is how a wait-for-exit helper reports success for a running process,
+# which turns every test built on it into a green that proves nothing. That is
+# the defect this file's own callers were just fixed for; the helper must not
+# reintroduce it one level down.
+#
+# Mirrors _agmsg_pid_alive in scripts/lib/instance-id.sh, then cross-checks the
+# process table, which does not depend on signalling permission at all. Saying
+# "gone" now requires kill(2) and ps to agree.
+_pid_gone() {
+  local pid="$1" err stat
+  # `export LC_ALL=C` rather than a bare prefix: a prefix misses the builtin on
+  # bash 3.2, and the ESRCH match below is on English text.
+  err="$(export LC_ALL=C; kill -0 "$pid" 2>&1)" && return 1
+  case "$err" in
+    *[Nn]'o such process'*) ;;
+    *) return 1 ;;   # EPERM and anything unrecognised mean "assume alive"
+  esac
+  stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -z "$stat" ] && return 0
+  case "$stat" in Z*) return 0 ;; esac   # terminated, just not reaped yet
+  return 1
+}
+
+# Wait for a process to actually be gone. Writing a pidfile and dying are not
+# atomic, so asserting `! kill -0 $pid` the instant a pidfile disappears races
+# the TERM trap (#124).
+wait_for_pid_exit() {
+  local pid="$1" i
+  for i in $(seq 1 $_WAIT_TICKS); do
+    # Reap finished children first: an unreaped zombie still answers `kill -0`,
+    # so without this a process that HAS exited can keep looking alive for the
+    # whole timeout. `jobs` is what makes bash collect them.
+    jobs >/dev/null 2>&1 || true
+    _pid_gone "$pid" && return 0
+    sleep $_WAIT_INTERVAL
+  done
+  return 1
+}
+
+# Wait for <file> to contain exactly <expected>, for pidfile handoffs where the
+# file exists throughout but its contents flip to the successor.
+wait_for_file_is() {
+  local file="$1" expected="$2" i
+  for i in $(seq 1 $_WAIT_TICKS); do
+    if [ -f "$file" ] && [ "$(cat "$file" 2>/dev/null)" = "$expected" ]; then
+      return 0
+    fi
+    sleep $_WAIT_INTERVAL
+  done
+  return 1
+}
+
 # Pin a fake-owned session_id under the given run/ directory so the lock
 # liveness check (which runs `kill -0` on cc-instance.<pid>) considers
 # <sid> alive for the duration of the bats process.
