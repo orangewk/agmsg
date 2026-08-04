@@ -562,12 +562,20 @@ launch_linux_terminal() {
 }
 
 launch_windows_terminal() {
+  # wt is a native Windows executable, so a bare bash is resolved through the
+  # Windows PATH and may select WSL's bash.exe. Pin the Bash that is running
+  # agmsg and convert its MSYS/Cygwin path before crossing the native boundary.
+  local bash_path
+  bash_path="$(command -v bash)" || die "current bash executable not found"
+  if command -v cygpath >/dev/null 2>&1; then
+    bash_path="$(cygpath -w "$bash_path")" || die "failed to convert bash path for Windows Terminal"
+  fi
   if command -v wt.exe >/dev/null 2>&1; then
-    wt.exe new-tab bash -l "$BOOT"
+    wt.exe new-tab "$bash_path" -l "$BOOT"
     return 0
   fi
   if command -v wt >/dev/null 2>&1; then
-    wt new-tab bash -l "$BOOT"
+    wt new-tab "$bash_path" -l "$BOOT"
     return 0
   fi
   die "Windows Terminal (wt) not found; set AGMSG_TERMINAL or run inside tmux"

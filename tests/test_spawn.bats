@@ -743,6 +743,41 @@ YAML
   fi
 }
 
+@test "spawn: Windows Terminal receives the current Git Bash executable, not bare bash (#39)" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  unset AGMSG_TERMINAL
+
+  cat > "$STUB_BIN/uname" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' MINGW64_NT-10.0
+SH
+  cat > "$STUB_BIN/cygpath" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "-w" ] && [[ "$2" == */bash ]]; then
+  printf '%s\n' 'C:\Program Files\Git\usr\bin\bash.exe'
+else
+  if [ -x /usr/bin/cygpath ]; then
+    exec /usr/bin/cygpath "$@"
+  fi
+  printf '%s\n' "${!#}"
+fi
+SH
+  cat > "$STUB_BIN/wt.exe" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CAPTURE"
+SH
+  chmod +x "$STUB_BIN/uname" "$STUB_BIN/cygpath" "$STUB_BIN/wt.exe"
+
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+
+  [ "$(sed -n '1p' "$CAPTURE")" = "new-tab" ]
+  [ "$(sed -n '2p' "$CAPTURE")" = 'C:\Program Files\Git\usr\bin\bash.exe' ]
+  [ "$(sed -n '3p' "$CAPTURE")" = "-l" ]
+  local boot_path; boot_path="$(sed -n '4p' "$CAPTURE")"
+  [ -f "$boot_path" ]
+}
+
 @test "spawn: macOS terminal launch does not steal focus (Terminal and iTerm)" {
   # A no-op-Terminal spawn (no $TMUX, no AGMSG_TERMINAL override) exercises
   # launch_macos_terminal() itself, which every other test in this file
