@@ -621,6 +621,11 @@ EOF
   run bash "$SCRIPTS/join.sh" myteam alice opencode /tmp/proj
   [ "$status" -eq 0 ]
 }
+
+@test "join: accepts qwen" {
+  run bash "$SCRIPTS/join.sh" myteam alice qwen /tmp/proj
+  [ "$status" -eq 0 ]
+}
 # --- #140: team-name path traversal ---
 
 @test "join: rejects a team name with path traversal (../)" {

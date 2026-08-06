@@ -50,7 +50,7 @@ CLI AI エージェント間のクロスエージェントメッセージング�
 # 1. インストール — npxが最速の道、クローン不要
 npx agmsg
 
-# 2. Claude Code / Codex / Gemini CLI / Antigravity / OpenCode を再起動して新しいスキルを反映
+# 2. Claude Code / Codex / Gemini CLI / Qwen Code / Antigravity / OpenCode を再起動して新しいスキルを反映
 
 # 3. コマンドを実行 — 初回はチーム名とエージェント名を尋ねられる
 #    Claude Code:  /agmsg
@@ -58,6 +58,7 @@ npx agmsg
 #    Gemini CLI:   $agmsg
 #    Antigravity:  $agmsg
 #    OpenCode:     $agmsg
+#    Qwen Code:    /agmsg
 ```
 
 これだけだ。スラッシュコマンドは初回使用時にチーム名とエージェント名を尋ね、続けて[配信モード](#配信モード)を選ばせる（Claude CodeとCodexのデフォルトは `monitor` — リアルタイムプッシュ。Codexはブリッジ経由で実現する）。その後は自然な言葉でエージェントに話しかければよい — 詳しくは下記の[初回実行](#初回実行)を参照。
@@ -110,6 +111,7 @@ cd agmsg
 ./install.sh --cmd m      # カスタムコマンド名で非インタラクティブ
 ./install.sh --agent-type gemini    # Gemini向けのSKILL.mdをインストール
 ./install.sh --agent-type opencode  # OpenCode専用: 共有スキルをOpenCodeテンプレートに設定
+./install.sh --agent-type qwen      # Qwen専用: 共有スキルをQwenテンプレートに設定
 ```
 
 **コマンド名**が決めるもの:
@@ -119,7 +121,7 @@ cd agmsg
 
 `--cmd` と `--agent-type` は直接スクリプト経路でのみ利用可能。`npm` とプラグインの経路は常に `agmsg` としてインストールされ、ホストのエージェントタイプを自動検出する。
 
-インストール後、**エージェントを再起動**して（Claude Code / Codex / Gemini CLI / Copilot CLI / Antigravity / OpenCode）新しいスキルを反映させる。
+インストール後、**エージェントを再起動**して（Claude Code / Codex / Gemini CLI / Qwen Code / Copilot CLI / Antigravity / OpenCode）新しいスキルを反映させる。
 
 ### Windows: Git Bash と Codex
 
@@ -210,7 +212,7 @@ codex:
   --dangerously-skip-permissions: false  # `false`の値はフラグ自体を出力しない
 ```
 
-9種類のエージェントタイプのうち8つがspawn可能 — `claude-code`、`codex`、`grok-build`、`cursor`、`gemini`、`antigravity`、`copilot`、`opencode`。`hermes` は不可 — そのCLIには初期プロンプトを事前に仕込んだインタラクティブセッションを開始するモードがない（#279）。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
+11種類のエージェントタイプのうち9つがspawn可能 — `claude-code`、`codex`、`grok-build`、`cursor`、`gemini`、`antigravity`、`copilot`、`opencode`、`qwen`。`hermes` と `agmsg-app` はspawn非対応。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
 
 ### spawnしたエージェントを終了する（`despawn`）
 
@@ -234,7 +236,7 @@ despawnは指定されたメンバーにのみ作用する — `despawn` を実�
 | モード | 仕組み | レイテンシ | 向いている相手 |
 |---|---|---|---|
 | **`monitor`**（Claude Codeのデフォルト。OpenCodeではopencode-sentinel pluginで利用可能） | SessionStartフック → Monitorツール → ブロッキングSQLiteストリーム | 約5秒 | リアルタイムプッシュを望むClaude Codeユーザー |
-| **`turn`**（Codex / Copilot CLI / OpenCode（plugin未導入）のデフォルト） | アシスタントのターン間でStopフックが `check-inbox.sh` を発火 | 次のやり取りまで | monitorを実行していないCodex / Copilot CLI / OpenCodeユーザー、より静かなループを好むClaude Codeユーザー |
+| **`turn`**（Codex / Qwen / Copilot CLI / OpenCode（plugin未導入）のデフォルト） | アシスタントのターン間でStopフックが `check-inbox.sh` を発火 | 次のやり取りまで | monitorを実行していないCodex / Qwen / Copilot CLI / OpenCodeユーザー、より静かなループを好むClaude Codeユーザー |
 | **`both`** | monitorを主に、turnをセッションごとの安全網として | 約5秒。ウォッチャー障害時はturn相当にフォールバック | 二重の保険をかけたい場合 |
 | **`off`** | 自動配信なし | 手動の `/agmsg` のみ | ミニマリスト |
 
@@ -311,6 +313,15 @@ $agmsg
 `./install.sh` でインストールする（`~/.config/opencode/` が存在する場合、OpenCode向けスキルがデフォルトのCodex向け共有スキルと並んで自動的に配置される）。`--agent-type opencode` はCodexがインストールされていないOpenCode専用環境でのみ使う。OpenCodeは `mode monitor`（外部プラグイン [`opencode-sentinel`](https://github.com/tsukimiya/opencode-sentinel) 経由。プラグイン未導入時は turn へのフォールバックをruleが指示するが、それに従うのはagentであってagmsgが強制するものではない）、`mode turn`、`mode off` に対応。`spawn opencode` は `opencode --prompt`（ブートプロンプトのターンが終わってもTUIが滞在するモード）経由で利用可能。`both` は非対応。
 
 これによりOpenCodeは、Ollamaのようなローカルプロバイダーを使う構成を含め、ローカルのコーディングエージェントとして役立つ。
+
+### Qwen Code
+
+```
+/agmsg
+```
+
+`~/.qwen/` が存在する場合、installerはQwen向けSkillを `~/.qwen/skills/` に配置する。Qwenは `mode turn` と `mode off` に対応し、`spawn qwen` は `qwen -i` を使うためboot prompt実行後もTUIが残る。Stop hook時点でメッセージがあればturnを継続できるが、すでにidleになったTUIを後着メッセージだけでwakeすることはできない。最初の仕事は `--boot-prompt` に含める。詳細は [docs/qwen.md](docs/qwen.md) を参照。
+
 
 完全なセットアップ手順は [docs/opencode.md](docs/opencode.md) を参照。
 
