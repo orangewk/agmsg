@@ -50,7 +50,7 @@ In real use it looks like this — Claude Code asking Codex for a code review an
 # 1. Install — npx is the fastest path, no clone needed
 npx agmsg
 
-# 2. Restart Claude Code / Codex / Gemini CLI / Antigravity / OpenCode to pick up the new skill
+# 2. Restart Claude Code / Codex / Gemini CLI / Qwen Code / Antigravity / OpenCode to pick up the new skill
 
 # 3. Run the command — it will prompt for team and agent name on first use
 #    Claude Code:  /agmsg
@@ -58,6 +58,7 @@ npx agmsg
 #    Gemini CLI:   $agmsg
 #    Antigravity:  $agmsg
 #    OpenCode:     $agmsg
+#    Qwen Code:    /agmsg
 ```
 
 That's it. The slash command prompts you for a team name and an agent name on first use, then asks you to pick a [delivery mode](#delivery-modes) (default on Claude Code and Codex: `monitor` — real-time push; Codex delivers it through a bridge). After that, you talk to your agent naturally — see [First run](#first-run) below.
@@ -110,6 +111,7 @@ cd agmsg
 ./install.sh --cmd m      # Non-interactive with custom command name
 ./install.sh --agent-type gemini    # Install a Gemini-oriented SKILL.md
 ./install.sh --agent-type opencode  # OpenCode-only: sets shared skill to OpenCode template
+./install.sh --agent-type qwen      # Qwen-only: sets shared skill to Qwen template
 ```
 
 The **command name** determines:
@@ -119,7 +121,7 @@ The **command name** determines:
 
 `--cmd` and `--agent-type` are only available via the direct-script path; the `npm` and plugin paths always install as `agmsg` and auto-detect the host agent type.
 
-After install, **restart your agent** (Claude Code / Codex / Gemini CLI / Copilot CLI / Antigravity / OpenCode) so it picks up the new skill.
+After install, **restart your agent** (Claude Code / Codex / Gemini CLI / Qwen Code / Copilot CLI / Antigravity / OpenCode) so it picks up the new skill.
 
 ### Windows: Git Bash & Codex
 
@@ -211,7 +213,7 @@ codex:
   --dangerously-skip-permissions: false  # a `false` value suppresses the flag entirely
 ```
 
-Eight of the nine agent types are spawnable — `claude-code`, `codex`, `grok-build`, `cursor`, `gemini`, `antigravity`, `copilot`, `opencode`. `hermes` is not: its CLI has no mode that starts an interactive session pre-seeded with an initial prompt (#279). macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
+Nine of the eleven agent types are spawnable — `claude-code`, `codex`, `grok-build`, `cursor`, `gemini`, `antigravity`, `copilot`, `opencode`, `qwen`. `hermes` and `agmsg-app` are not spawnable. macOS is the primary target; Linux and Windows are best-effort (please open an issue/PR if your terminal isn't handled). Headless environments — no tmux **and** no usable terminal — error out, since the agent CLIs need an interactive terminal.
 
 ### Tear down a spawned agent (`despawn`)
 
@@ -248,7 +250,7 @@ How incoming messages reach your agent. Pick one at first join via the prompt, o
 | mode | mechanism | latency | who it's for |
 |---|---|---|---|
 | **`monitor`** (default on Claude Code; on OpenCode with the opencode-sentinel plugin) | SessionStart hook → Monitor tool → blocking SQLite stream | ~5s | Claude Code users wanting real-time push |
-| **`turn`** (default on Codex / Copilot CLI / OpenCode without the plugin) | Stop hook fires `check-inbox.sh` between assistant turns | until your next interaction | Codex / Copilot CLI / OpenCode users not running monitor; Claude Code users on a quieter loop |
+| **`turn`** (default on Codex / Qwen / Copilot CLI / OpenCode without the plugin) | Stop hook fires `check-inbox.sh` between assistant turns | until your next interaction | Codex / Qwen / Copilot CLI / OpenCode users not running monitor; Claude Code users on a quieter loop |
 | **`both`** | monitor primary, turn as per-session safety net | ~5s; falls back to turn-end on watcher failure | belt-and-suspenders |
 | **`off`** | no automatic delivery | manual `/agmsg` only | minimalists |
 
@@ -325,6 +327,15 @@ $agmsg
 Install with `./install.sh` (when `~/.config/opencode/` exists, the OpenCode-typed skill is placed automatically alongside the default Codex-typed shared skill). Use `--agent-type opencode` only for OpenCode-only environments where Codex is not installed. OpenCode supports `mode monitor` (via the external [`opencode-sentinel`](https://github.com/tsukimiya/opencode-sentinel) plugin; without it the rule instructs a fallback to turn mode, which the agent follows rather than agmsg enforcing it), `mode turn`, and `mode off`. `spawn opencode` is available via `opencode --prompt` (TUI mode, which stays resident after the boot prompt's turn). `both` is not supported.
 
 This makes OpenCode useful as a local coding agent, including configurations backed by local providers such as Ollama.
+
+### Qwen Code
+
+```
+/agmsg
+```
+
+When `~/.qwen/` exists, the installer places a Qwen-typed skill under `~/.qwen/skills/`. Qwen supports `mode turn` and `mode off`; `spawn qwen` uses `qwen -i` so the boot prompt runs and the TUI stays open. Turn delivery can continue work when a message is present at the Stop hook, but it does not wake a TUI that was already idle when a later message arrived. Put the first task in `--boot-prompt`. See [docs/qwen.md](docs/qwen.md).
+
 
 See [docs/opencode.md](docs/opencode.md) for full setup instructions.
 

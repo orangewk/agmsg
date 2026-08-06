@@ -64,7 +64,7 @@ agmsg_source_version() {
 CMD_NAME=""
 UPDATE_ONLY=false
 INTERACTIVE=true
-AGENT_TYPE=""  # claude-code, codex, gemini, antigravity — passed via --agent-type, or empty for auto/default
+AGENT_TYPE=""  # registered agent type passed via --agent-type, or empty for auto/default
 
 configure_codex_sandbox() {
   # --- Configure Codex sandbox (if Codex is installed) ---
@@ -180,7 +180,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --cmd <name>      Command & skill folder name (default: agmsg)"
       echo "                    Claude Code: /<cmd>, Codex/Gemini/Antigravity: \$<cmd>"
-      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor, grok-build"
+      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, qwen, hermes, cursor, grok-build"
       echo "                    Selects which template becomes SKILL.md (matches the"
       echo "                    <type> arg passed to join.sh / whoami.sh)"
       echo "  --update          Update skill scripts only (preserve DB and teams)"
@@ -250,6 +250,8 @@ if [ "$UPDATE_ONLY" = true ]; then
       AGENT_TYPE="antigravity"
     elif grep -q "whoami.sh.*gemini" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
       AGENT_TYPE="gemini"
+    elif grep -q "whoami.sh.*qwen" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+      AGENT_TYPE="qwen"
     elif grep -q "whoami.sh.*grok-build" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
       AGENT_TYPE="grok-build"
     else
@@ -261,7 +263,7 @@ if [ "$UPDATE_ONLY" = true ]; then
   # shared SKILL.md; their dedicated copies are dropped separately below.)
   TPL_TYPE="codex"
   case "$AGENT_TYPE" in
-    gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
+    gemini|antigravity|opencode|qwen|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
   esac
   sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
   # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/)
@@ -299,6 +301,13 @@ if [ "$UPDATE_ONLY" = true ]; then
     mkdir -p "$OPENCODE_SKILL_DIR"
     sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path opencode)" > "$OPENCODE_SKILL_DIR/SKILL.md"
   fi
+  # Refresh / install the Qwen Code skill.
+  QWEN_SKILL_DIR="$HOME/.qwen/skills/$SKILL_NAME"
+  if [ -d "$HOME/.qwen" ]; then
+    mkdir -p "$QWEN_SKILL_DIR"
+    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path qwen)" > "$QWEN_SKILL_DIR/SKILL.md"
+  fi
+
   # Refresh / install the Hermes Agent skill (same reasoning as Copilot above).
   HERMES_SKILL_DIR="$HOME/.hermes/skills/$SKILL_NAME"
   if [ -d "$HOME/.hermes" ]; then
@@ -368,7 +377,7 @@ mkdir -p "$SKILL_DIR"/{scripts,types,db,agents}
 # codex template by default; gemini/antigravity/opencode get their own.
 TPL_TYPE="codex"
 case "$AGENT_TYPE" in
-  gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
+  gemini|antigravity|opencode|qwen|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
 esac
 sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
 # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/) ship
@@ -447,6 +456,16 @@ if [ -d "$HOME/.config/opencode" ]; then
   echo "  + installed \$$CMD_NAME skill to ~/.config/opencode/skills/"
 fi
 
+# --- Install Qwen Code skill ---
+# Qwen loads personal skills from ~/.qwen/skills/<name>/SKILL.md. Keep this
+# type-specific copy separate from the Codex-typed shared skill.
+QWEN_SKILL_DIR="$HOME/.qwen/skills/$CMD_NAME"
+if [ -d "$HOME/.qwen" ]; then
+  mkdir -p "$QWEN_SKILL_DIR"
+  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path qwen)" > "$QWEN_SKILL_DIR/SKILL.md"
+  echo "  + installed /$CMD_NAME skill to ~/.qwen/skills/"
+fi
+
 # --- Install Hermes Agent skill ---
 # Hermes reads skills from ~/.hermes/skills/<name>/SKILL.md. Runtime scripts and
 # the shared SQLite store stay in ~/.agents/skills/<name>/ so Hermes shares the
@@ -483,11 +502,12 @@ echo ""
 echo "  ✓ Installed to ~/.agents/skills/$CMD_NAME/ (version $INSTALLED_VERSION)"
 echo ""
 echo "  Next steps:"
-echo "    1. Restart your agent (Claude Code / Codex / Gemini CLI / Antigravity / OpenCode) to pick up the new skill"
+echo "    1. Restart your agent (Claude Code / Codex / Gemini CLI / Qwen Code / Antigravity / OpenCode) to pick up the new skill"
 echo "    2. Run the command to join a team:"
 echo "       Claude Code:  /$CMD_NAME"
 echo "       Codex:        \$$CMD_NAME"
 echo "       Gemini CLI:   \$$CMD_NAME"
+echo "       Qwen Code:    /$CMD_NAME"
 echo "       Antigravity:  \$$CMD_NAME"
 echo "       Copilot CLI:  /$CMD_NAME"
 echo "       OpenCode:     \$$CMD_NAME"
