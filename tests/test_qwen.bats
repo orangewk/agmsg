@@ -88,6 +88,6 @@ JSON
   run cat "$boot"
   [[ "$output" == *"qwen -m qwen3-coder-plus -i"* ]]
   local skill_name; skill_name="$(basename "$TEST_SKILL_DIR")"
-  [[ "$output" == *"/$skill_name actas qwen-worker"* ]]
+  [[ "$output" == *"Use the $skill_name skill to act as qwen-worker"* ]]
   [[ "$output" == *"send QWEN-SPAWN-OK to coordinator"* ]]
 }

@@ -23,6 +23,13 @@ _AGMSG_BOOT_COMMAND_SH=1
 agmsg_actas_prompt() {
   local type="$1" agent="$2" cmd_name cmd_prefix
   cmd_name="$(basename "$SKILL_DIR")"
+  # Qwen reserves leading slash input for its built-in slash-command parser.
+  # A slash-prefixed agmsg prompt is consumed without reaching the model, so
+  # use natural language and let the Qwen agmsg skill perform actas.
+  if [ "$type" = "qwen" ]; then
+    printf 'Use the %s skill to act as %s in the pre-joined team. First complete the %s actas procedure, then continue.' "$cmd_name" "$agent" "$cmd_name"
+    return 0
+  fi
   cmd_prefix="$(agmsg_type_get "$type" cmd_prefix)"
   [ -n "$cmd_prefix" ] || cmd_prefix="/"
   printf '%s%s actas %s' "$cmd_prefix" "$cmd_name" "$agent"
