@@ -43,7 +43,7 @@ fake_session() {
 
 # --- actas-claim.sh ---
 
-@test "actas-claim: status=ok and claim recorded when role is free" {
+@test "actas-claim: status=ok returns the effective bare owner token and records the claim" {
   fake_register T alice
   fake_session "sid-me" >/dev/null
 
@@ -51,6 +51,7 @@ fake_session() {
   [ "$status" -eq 0 ]
   [[ "$output" =~ "status=ok" ]]
   [[ "$output" =~ "team=T" ]]
+  [[ "$output" =~ "owner=sid-me" ]]
   [ "$(actas_lock_owner T alice)" = "sid-me" ]
 }
 
