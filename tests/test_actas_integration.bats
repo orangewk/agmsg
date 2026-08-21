@@ -56,7 +56,6 @@ fake_session() {
 }
 
 @test "actas-claim: status=held when role is held by another live session" {
-  skip_on_windows "actas live-session liveness under Git Bash (#182)"
   fake_register T alice
   fake_session "sid-owner" >/dev/null     # this test process is the "live owner"
   echo "sid-owner" > "$(actas_lock_path T alice)"
@@ -67,6 +66,33 @@ fake_session() {
   [[ "$output" =~ "team=T" ]]
   [[ "$output" =~ "owner=sid-owner" ]]
   [ "$(actas_lock_owner T alice)" = "sid-owner" ]   # not stolen
+}
+
+@test "actas-claim: two live processes yield claimed then held" {
+  fake_register T alice
+  sleep 60 & local owner_pid=$!
+  sleep 60 & local contender_pid=$!
+  local owner_token="sid-shared.$owner_pid"
+
+  # Match session-start.sh's record: instance tokens and cc-instance filenames
+  # use the Git Bash PID. _agmsg_pid_alive() must translate it to WINPID before
+  # querying tasklist on Windows.
+  echo "$owner_token" > "$RUN_DIR/cc-instance.$owner_pid"
+
+  run env AGMSG_AGENT_PID="$owner_pid" bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code alice sid-shared
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "status=ok" ]]
+  [[ "$output" =~ "owner=$owner_token" ]]
+
+  run env AGMSG_AGENT_PID="$contender_pid" bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code alice sid-shared
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "status=held" ]]
+  [[ "$output" =~ "owner=$owner_token" ]]
+  [ "$(actas_lock_owner T alice)" = "$owner_token" ]
+
+  kill "$owner_pid" "$contender_pid" 2>/dev/null || true
+  wait "$owner_pid" 2>/dev/null || true
+  wait "$contender_pid" 2>/dev/null || true
 }
 
 @test "actas-claim: status=not_registered when name is unknown" {

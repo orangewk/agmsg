@@ -33,6 +33,12 @@
 [ -n "${_AGMSG_INSTANCE_ID_SH:-}" ] && return 0
 _AGMSG_INSTANCE_ID_SH=1
 
+# _agmsg_pid_alive receives the MSYS PID emitted by agmsg_agent_pid() and
+# encoded into cc-instance filenames. Load the shared conversion helper here,
+# too, because actas-lock.sh may source this library without resolve-project.sh.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
+
 # Cross-platform pid liveness check, and the ONLY one any shipped script should
 # use. A bare `kill -0 "$pid" 2>/dev/null` is not a liveness check: it answers
 # "can I signal this", and the two differ exactly where it matters.
@@ -138,19 +144,18 @@ _agmsg_pid_alive_local() {
   return 0
 }
 
-# Liveness for a pid that came from OUTSIDE these shells -- reached by walking
-# ancestors until the walk leaves the MSYS subsystem, so under Git Bash the
-# number is a Windows pid and kill(1) there cannot see it at all (#134).
-#
-# Which of the two applies is decided by where the pid was minted, not by whether
-# it arrived through a pidfile. For anything $! or $$ produced, and anything read
-# back from a pidfile one of these shells wrote, use _agmsg_pid_alive_local.
+# Liveness for a pid encoded into an agmsg instance token. Under Git Bash this
+# is an MSYS pid, while tasklist.exe queries the native Windows process table;
+# translate it through the WINPID column before tasklist lookup (#662).
 _agmsg_pid_alive() {
   local pid="$1"
   _agmsg_pid_valid "$pid" || return 1
   case "${MSYSTEM:-}" in
     MINGW*|MSYS*|CLANGARM*)
-      MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
+      local winpid
+      winpid="$(_compat_get_winpid "$pid")"
+      _agmsg_pid_valid "$winpid" 4294967295 || return 1
+      MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $winpid" 2>/dev/null | grep -q "$winpid"
       return $?
       ;;
   esac
