@@ -40,6 +40,13 @@ source "$SCRIPT_DIR/lib/role-session.sh"  # role->session record (#339)
 # Resolve the session's real project root (see #92) before any lookup, so an
 # actas issued from a subdir/worktree claims against the registered project
 # rather than missing it as not_registered.
+
+# Project resolution and instance-id normalization both need the enclosing
+# agent pid. Warm one result in this script process so their command
+# substitutions reuse it instead of each starting a native ancestry walk.
+# The helper deliberately bypasses its cache when AGMSG_AGENT_PID is set.
+_agmsg_agent_pid_cache_warm "$TYPE"
+
 PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 
 # Claim the lock under the per-process instance id (#93), the same token the

@@ -323,9 +323,19 @@ _agmsg_agent_pid_walk() {
   return 1
 }
 
-# Like agmsg_agent_pid, but includes the PID space in a tab-separated second
-# field. The numeric-only public agmsg_agent_pid API remains unchanged below.
-agmsg_agent_pid_record() {
+# A native ancestry lookup is expensive on Windows. Entry scripts that need the
+# same enclosing agent identity more than once can warm this per-shell cache
+# before entering command substitutions. Those substitutions inherit a copy of
+# the shell state, so they reuse both a found record and a confirmed miss; a
+# separately started script or a parallel resume has its own cache.
+#
+# AGMSG_AGENT_PID stays outside this cache: it is the public MSYS PID override
+# contract and must be read fresh for every call.
+_AGMSG_AGENT_PID_CACHE_TYPE=""
+_AGMSG_AGENT_PID_CACHE_RECORD=""
+_AGMSG_AGENT_PID_CACHE_STATUS=""
+
+_agmsg_agent_pid_record_uncached() {
   local type="$1" native_self
   if [ -n "${AGMSG_AGENT_PID+set}" ]; then
     case "$AGMSG_AGENT_PID" in
@@ -349,6 +359,37 @@ agmsg_agent_pid_record() {
     esac
   fi
   _agmsg_agent_pid_walk "$$" "$type" msys
+}
+
+_agmsg_agent_pid_cache_warm() {
+  local type="$1" record
+  # An explicit override is intentionally never memoized. It can be changed by
+  # a caller between invocations and preserves AGMSG_AGENT_PID's long-standing
+  # numeric/empty/non-numeric behavior exactly.
+  [ -z "${AGMSG_AGENT_PID+set}" ] || return 0
+  if [ "$_AGMSG_AGENT_PID_CACHE_TYPE" = "$type" ] && [ -n "$_AGMSG_AGENT_PID_CACHE_STATUS" ]; then
+    return 0
+  fi
+  _AGMSG_AGENT_PID_CACHE_TYPE="$type"
+  _AGMSG_AGENT_PID_CACHE_RECORD=""
+  _AGMSG_AGENT_PID_CACHE_STATUS="missing"
+  if record="$(_agmsg_agent_pid_record_uncached "$type")"; then
+    _AGMSG_AGENT_PID_CACHE_RECORD="$record"
+    _AGMSG_AGENT_PID_CACHE_STATUS="found"
+  fi
+}
+
+# Like agmsg_agent_pid, but includes the PID space in a tab-separated second
+# field. The numeric-only public agmsg_agent_pid API remains unchanged below.
+agmsg_agent_pid_record() {
+  local type="$1"
+  if [ -n "${AGMSG_AGENT_PID+set}" ]; then
+    _agmsg_agent_pid_record_uncached "$type"
+    return
+  fi
+  _agmsg_agent_pid_cache_warm "$type"
+  [ "$_AGMSG_AGENT_PID_CACHE_STATUS" = "found" ] || return 1
+  printf '%s' "$_AGMSG_AGENT_PID_CACHE_RECORD"
 }
 
 # Walk the process tree from $$ upward, echoing the PID of the nearest ancestor

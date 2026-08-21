@@ -104,8 +104,28 @@ fake_session() {
   [[ "$output" =~ "status=not_registered" ]]
 }
 
-# --- reset.sh releases the lock when session_id is passed ---
+@test "actas-claim: one native ancestry walk serves resolution and instance normalization (#672)" {
+  local fakebin="$TEST_SKILL_DIR/fake-bin" calls="$TEST_SKILL_DIR/native-cim-calls"
+  fake_register T alice
+  mkdir -p "$fakebin"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" MSYS_NT-10.0' > "$fakebin/uname"
+  chmod +x "$fakebin/uname"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "F S UID PID PPID C PRI NI ADDR SZ WCHAN TTY TIME CMD WINPID"' 'printf "%s\n" "0 S 1 1 1 0 0 0 0 0 0 ? 00:00:00 bash 5000"' > "$fakebin/ps"
+  chmod +x "$fakebin/ps"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "walk\n" >> "$AGMSG_TEST_CIM_CALLS"' 'printf "%s\t%s\n" 9000 "C:\Users\test\claude.exe --session test"' > "$fakebin/powershell.exe"
+  chmod +x "$fakebin/powershell.exe"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "claude.exe 9000"' > "$fakebin/tasklist"
+  chmod +x "$fakebin/tasklist"
+  unset AGMSG_AGENT_PID
 
+  run env "PATH=$fakebin:$PATH" MSYSTEM=MSYS "AGMSG_TEST_CIM_CALLS=$calls" bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p1 claude-code alice sid-me
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "status=ok" ]]
+  [[ "$output" =~ "owner=sid-me.9000" ]]
+  [ "$(wc -l < "$calls" | tr -d ' ')" = 1 ]
+}
+
+# --- reset.sh releases the lock when session_id is passed ---
 @test "reset: with session_id, releases the lock for the dropped role" {
   fake_register T alice
   actas_lock_claim T alice "sid-me"
