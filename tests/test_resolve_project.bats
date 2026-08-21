@@ -235,6 +235,28 @@ JSON
   [ "$output" = $'9000\tnative' ]
 }
 
+@test "agent-pid: warmed native record is reused by command substitutions" {
+  local calls="$TEST_SKILL_DIR/native-ancestry-calls" resolved instance
+  unset AGMSG_AGENT_PID
+  _agmsg_detect_platform() { _agmsg_platform=msys; }
+  _compat_get_winpid() { [ "$1" = "$$" ] && printf '%s' 5000; }
+  compat_get_native_ancestry() {
+    printf 'walk\n' >> "$calls"
+    printf '%s' $'9000\tC:/Users/test/.local/bin/claude.exe --session test'
+  }
+  agmsg_pid_is_agent() {
+    [ "$1" = 9000 ] && [ "$2" = claude-code ] && [ "$3" = native ]
+  }
+
+  _agmsg_agent_pid_cache_warm claude-code
+  resolved="$(agmsg_agent_pid claude-code)"
+  instance="$(agmsg_instance_id sid claude-code)"
+
+  [ "$resolved" = 9000 ]
+  [ "$instance" = sid.9000 ]
+  [ "$(wc -l < "$calls" | tr -d ' ')" = 1 ]
+}
+
 @test "project-marker: new native marker records sidecar and reads it" {
   agmsg_write_project_marker 4242 "$ROOT" native
   [ "$(cat "$(agmsg_project_marker_pid_space_path 4242)")" = native ]
