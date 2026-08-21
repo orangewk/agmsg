@@ -77,6 +77,24 @@ compat_get_native_ppid() {
     "(Get-CimInstance Win32_Process -Filter \"ProcessId=$pid\").ParentProcessId" 2>/dev/null \
     | tr -d '\r'
 }
+
+# List up to <max_hops> native parent records in one PowerShell host. Git Bash
+# cannot continue across the native parent boundary with ps(1), but spawning a
+# fresh PowerShell process for every hop turns a harmless failed lookup into a
+# multi-second SessionStart delay. Each output line is "<pid><TAB><cmdline>".
+compat_get_native_ancestry() {
+  local pid="$1" max_hops="${2:-20}"
+  [ -n "$pid" ] || return 1
+  case "$pid" in *[!0-9]*) return 1 ;; esac
+  case "$max_hops" in *[!0-9]*|'') return 1 ;; esac
+  _agmsg_detect_platform
+  [ "$_agmsg_platform" = "msys" ] || return 1
+  [ -z "${_AGMSG_COMPAT_NO_CIM:-}" ] || return 1
+  powershell.exe -NoProfile -Command \
+    "\$next = [uint32]$pid; \$maxHops = [int]$max_hops; \$current = Get-CimInstance Win32_Process -Filter \"ProcessId=\$next\"; if (\$null -eq \$current) { exit 0 }; \$next = [uint32]\$current.ParentProcessId; for (\$hop = 0; \$hop -lt \$maxHops -and \$next -gt 1; \$hop++) { \$current = Get-CimInstance Win32_Process -Filter \"ProcessId=\$next\"; if (\$null -eq \$current) { break }; [Console]::Out.WriteLine(([string]\$current.ProcessId + [char]9 + [string]\$current.CommandLine)); \$next = [uint32]\$current.ParentProcessId }" 2>/dev/null \
+    | tr -d '\r' | tr '\\' '/'
+}
+
 # Get the full command line of a process ALREADY KNOWN to be a native Windows
 # pid (not an MSYS pid) — e.g. Node's own `process.pid` when Node was launched
 # directly as a Windows binary from a bash script (`nohup node ... &` backgrounds

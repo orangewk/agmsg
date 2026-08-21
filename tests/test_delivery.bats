@@ -1939,6 +1939,29 @@ EOF
   grep -q -- "--inline-inbox" "$log"
 }
 
+@test "session-start.sh for codex reads the native agent app-server cmdline (#672)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice thread-native "$TEST_PROJECT" codex
+  cat >> "$TEST_SKILL_DIR/scripts/lib/resolve-project.sh" <<'EOF'
+agmsg_agent_pid_record() { printf '%s' $'4242\tnative'; }
+EOF
+  cat >> "$TEST_SKILL_DIR/scripts/lib/compat.sh" <<'EOF'
+compat_get_native_cmdline() { printf '%s' 'codex --remote unix://native-agent.sock'; }
+compat_get_cmdline() { return 1; }
+EOF
+
+  run env -u AGMSG_CODEX_BRIDGE_APP_SERVER \
+    AGMSG_CODEX_BRIDGE_LAUNCHER=1 CODEX_THREAD_ID=thread-native \
+    bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+
+  local hash request
+  hash=$(SKILL_DIR="$TEST_SKILL_DIR" bash -c \
+    'source "$1/lib/hash.sh"; printf "%s" "$2" | agmsg_sha1' _ "$SCRIPTS" "$TEST_PROJECT")
+  request="$TEST_SKILL_DIR/run/codex-bridge-request.$hash"
+  [ "$(cat "$request")" = $'codex\tthread-native\tunix://native-agent.sock' ]
+}
+
 @test "session-start.sh for codex stays quiet without monitor launcher env" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"

@@ -259,13 +259,16 @@ _agmsg_agent_binaries() {
 agmsg_pid_is_agent() {
   local pid="$1" type="$2" pid_space="${3:-msys}"
   [ -n "$pid" ] || return 1
-  agmsg_pid_alive_in_space "$pid" "$pid_space" || return 1
   local binaries comm cmdline first base bin
   binaries=$(_agmsg_agent_binaries "$type")
   case "$pid_space" in
     native)
       comm=""
-      cmdline=$(compat_get_native_cmdline "$pid" 2>/dev/null || true)
+      if [ "$#" -ge 4 ]; then
+        cmdline="$4"
+      else
+        cmdline=$(compat_get_native_cmdline "$pid" 2>/dev/null || true)
+      fi
       ;;
     *)
       comm=$(compat_get_comm "$pid" 2>/dev/null || true)
@@ -280,12 +283,12 @@ agmsg_pid_is_agent() {
   base=$(basename -- "${first:-}" 2>/dev/null || true)
   case "$base" in *.exe) base=${base%.exe} ;; *.EXE) base=${base%.EXE} ;; esac
   for bin in $binaries; do
-    case "$comm" in "$bin"|"$bin"-*) return 0 ;; esac
-    [ "$base" = "$bin" ] && return 0
+    case "$comm" in "$bin"|"$bin"-*) agmsg_pid_alive_in_space "$pid" "$pid_space" && return 0 ;; esac
+    [ "$base" = "$bin" ] && agmsg_pid_alive_in_space "$pid" "$pid_space" && return 0
   done
   if [ "$type" = "claude-code" ]; then
-    case "$comm" in [0-9]*.[0-9]*.[0-9]*) return 0 ;; esac
-    case "$base" in [0-9]*.[0-9]*.[0-9]*) return 0 ;; esac
+    case "$comm" in [0-9]*.[0-9]*.[0-9]*) agmsg_pid_alive_in_space "$pid" "$pid_space" && return 0 ;; esac
+    case "$base" in [0-9]*.[0-9]*.[0-9]*) agmsg_pid_alive_in_space "$pid" "$pid_space" && return 0 ;; esac
   fi
   return 1
 }
@@ -294,12 +297,22 @@ agmsg_pid_is_agent() {
 # agent as "<pid><TAB><pid-space>". The caller starts at this hook shell and
 # checks its parent first, preserving the prior agmsg_agent_pid contract.
 _agmsg_agent_pid_walk() {
-  local start="$1" type="$2" pid_space="$3" pid="$1" hops=0
+  local start="$1" type="$2" pid_space="$3" pid="$1" hops=0 native_records candidate_pid candidate_cmdline
+  case "$pid_space" in
+    native)
+      native_records=$(compat_get_native_ancestry "$pid" 20 2>/dev/null || true)
+      while IFS=$'\t' read -r candidate_pid candidate_cmdline; do
+        case "$candidate_pid" in ''|*[!0-9]*) continue ;; esac
+        if agmsg_pid_is_agent "$candidate_pid" "$type" native "$candidate_cmdline"; then
+          printf '%s\t%s' "$candidate_pid" native
+          return 0
+        fi
+      done <<< "$native_records"
+      return 1
+      ;;
+  esac
   while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do
-    case "$pid_space" in
-      native) pid=$(compat_get_native_ppid "$pid" 2>/dev/null || true) ;;
-      *)      pid=$(compat_get_ppid "$pid" 2>/dev/null || true) ;;
-    esac
+    pid=$(compat_get_ppid "$pid" 2>/dev/null || true)
     [ -n "$pid" ] && [ "$pid" != 0 ] || return 1
     if agmsg_pid_is_agent "$pid" "$type" "$pid_space"; then
       printf '%s\t%s' "$pid" "$pid_space"

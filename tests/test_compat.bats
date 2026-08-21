@@ -47,6 +47,27 @@ teardown() {
   [[ "$parent" =~ ^[1-9][0-9]*$ ]]
 }
 
+@test "compat_get_native_ancestry queries all ancestor records in one PowerShell process" {
+  local fakebin calls ancestry parent_pid parent_cmd
+  fakebin="$TEST_SKILL_DIR/fake-bin"
+  calls="$TEST_SKILL_DIR/native-cim-calls"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/powershell.exe" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AGMSG_TEST_CIM_CALLS"
+printf '%s\n' $'9000\tC:\\Users\\test\\claude.exe --session test'
+EOF
+  chmod +x "$fakebin/powershell.exe"
+
+  export PATH="$fakebin:$PATH"
+  export AGMSG_TEST_CIM_CALLS="$calls"
+  ancestry="$(compat_get_native_ancestry 5000 20)"
+  IFS=$'\t' read -r parent_pid parent_cmd <<< "$ancestry"
+  [ "$parent_pid" = 9000 ]
+  [[ "$parent_cmd" == *claude.exe* ]]
+  [ "$(wc -l < "$calls" | tr -d ' ')" = 1 ]
+}
+
 # ── /proc path (normal — regression guard) ───────────────────────────────
 
 @test "compat_get_cmdline returns full argv via /proc" {

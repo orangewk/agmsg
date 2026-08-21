@@ -199,10 +199,10 @@ JSON
   # whose native parent is Claude, while the MSYS ppids would terminate at 1.
   _agmsg_detect_platform() { _agmsg_platform=msys; }
   _compat_get_winpid() { [ "$1" = "$$" ] && printf '%s' 5000; }
-  compat_get_native_ppid() {
+  compat_get_native_ancestry() {
+    [ "$1" = 5000 ] && [ "$2" = 20 ] || return 1
     case "$1" in
-      5000) printf '%s' 9000 ;;
-      9000) printf '%s' 1 ;;
+      5000) printf '%s' $'9000\tC:/Users/test/.local/bin/claude.exe --session test' ;;
     esac
   }
   agmsg_pid_is_agent() {
@@ -216,6 +216,23 @@ JSON
   run agmsg_agent_pid claude-code
   [ "$status" -eq 0 ]
   [ "$output" = 9000 ]
+}
+
+@test "agent-pid: native walk consumes batched ancestor records without per-hop lookups" {
+  _agmsg_detect_platform() { _agmsg_platform=msys; }
+  _compat_get_winpid() { [ "$1" = "$$" ] && printf '%s' 5000; }
+  compat_get_native_ancestry() {
+    [ "$1" = 5000 ] && [ "$2" = 20 ] || return 1
+    printf '%s\n' $'7000\tC:/Windows/System32/cmd.exe /c hook'
+    printf '%s\n' $'9000\tC:/Users/test/.local/bin/claude.exe --session test'
+  }
+  compat_get_native_ppid() { return 99; }
+  compat_get_native_cmdline() { return 99; }
+  agmsg_pid_alive_in_space() { [ "$1" = 9000 ] && [ "$2" = native ]; }
+
+  run agmsg_agent_pid_record claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = $'9000\tnative' ]
 }
 
 @test "project-marker: new native marker records sidecar and reads it" {

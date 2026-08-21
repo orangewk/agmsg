@@ -3,7 +3,7 @@
 #
 # Sourced by session-start.sh in its global context (so it sees TYPE, PROJECT,
 # RUN_DIR, SKILL_DIR, SCRIPT_DIR, PAIRS and the helpers agmsg_sha1,
-# agmsg_sqlite_mem, agmsg_resolve_node, agmsg_canonical_path, agmsg_agent_pid).
+# agmsg_sqlite_mem, agmsg_resolve_node, agmsg_canonical_path, agmsg_agent_pid_record).
 # Defines agmsg_session_start, overriding session-start.sh's default no-op.
 #
 # Codex has no Monitor tool. When launched through codex-monitor.sh, the TUI is
@@ -122,9 +122,15 @@ agmsg_session_start() {
   [ -n "$PAIRS" ] || exit 0
   app_server="${AGMSG_CODEX_BRIDGE_APP_SERVER:-}"
   if [ -z "$app_server" ]; then
-    agent_pid=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
+    local agent_record agent_pid agent_space agent_cmd
+    agent_record=$(agmsg_agent_pid_record "$TYPE" 2>/dev/null || true)
+    agent_pid=${agent_record%%$'\t'*}
+    agent_space=${agent_record#*$'\t'}
     if [ -n "$agent_pid" ]; then
-      agent_cmd=$(compat_get_cmdline "$agent_pid" 2>/dev/null || true)
+      case "$agent_space" in
+        native) agent_cmd=$(compat_get_native_cmdline "$agent_pid" 2>/dev/null || true) ;;
+        *)      agent_cmd=$(compat_get_cmdline "$agent_pid" 2>/dev/null || true) ;;
+      esac
       app_server=$(printf '%s\n' "$agent_cmd" \
         | sed -n 's/.*\(unix:\/\/[^[:space:]]*\).*/\1/p' \
         | head -1)
