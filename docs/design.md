@@ -109,6 +109,24 @@ three signals, none needing a stable `session_id` (Codex doesn't expose one):
    markers are GC'd at SessionStart/SessionEnd. **Claude Code monitor/both
    only** — Codex rejects monitor mode (no Monitor tool), so it never installs
    `session-start.sh` and writes no marker; Codex relies on signals 2–3.
+
+   **Windows PID-space sidecars.** Git Bash process IDs and native Windows
+   process IDs are distinct namespaces. On MSYS, the resolver converts the hook
+   shell to its Windows PID, then walks native `Win32_Process.ParentProcessId`
+   records to find Claude. Every newly written PID-keyed runtime record carries
+   a sidecar before its primary file:
+
+   - `proj.<pid>.project` → `proj.<pid>.pidspace`
+   - `cc-instance.<pid>` → `cc-instance.<pid>.pidspace`
+
+   The sidecar contains exactly `native` for a Windows PID or `msys` for an
+   MSYS PID; it selects the corresponding liveness and command-line lookup.
+   **A missing, empty, malformed, or unknown sidecar means `msys`.** This is a
+   permanent backwards-compatibility rule for records from before the sidecar
+   contract. A sidecar without its primary record is ignored, and writers put
+   the sidecar first so a new primary record is never observed without its PID
+   namespace.
+
 2. **Ancestor walk.** Failing a marker, the nearest ancestor of pwd that is a
    registered project for the type wins. Git-independent — covers nested
    subdirs and worktrees that live *under* the registered project, on cc and

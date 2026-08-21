@@ -125,6 +125,24 @@ teardown() { teardown_test_env; }
   ! agmsg_instance_alive ""
 }
 
+@test "instance_alive: native sidecar uses native liveness" {
+  agmsg_write_cc_instance 4242 "native-session.4242" native
+  [ "$(cat "$(agmsg_cc_instance_pid_space_path 4242)")" = native ]
+  _agmsg_pid_alive_native() { [ "$1" = 4242 ]; }
+  _agmsg_pid_alive() { return 1; }
+
+  agmsg_instance_alive "native-session.4242"
+}
+
+@test "instance_alive: missing pid-space sidecar remains MSYS-compatible" {
+  printf '%s\n' "legacy-session.4243" > "$(agmsg_cc_instance_path 4243)"
+  [ "$(agmsg_cc_instance_pid_space 4243)" = msys ]
+  _agmsg_pid_alive_native() { return 1; }
+  _agmsg_pid_alive() { [ "$1" = 4243 ]; }
+
+  agmsg_instance_alive "legacy-session.4243"
+}
+
 # --- _agmsg_pid_alive: EPERM vs ESRCH (Claude Code sandbox) ---
 #
 # Under the sandbox `kill -0` on a live pid returns EPERM, not ESRCH. Only ESRCH
