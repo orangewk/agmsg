@@ -48,6 +48,31 @@ A stale lock is reclaimed when its owner session_id no longer maps to any live c
 
 PID recycling could in theory keep a long-dead session looking alive forever, starving peers from claiming or reaching its name. This is tracked in [#67](https://github.com/fujibee/agmsg/issues/67) and not addressed in v1.
 
+## Read-only ownership queries
+
+Code outside agmsg that must attribute a hook invocation to an `actas` owner
+must use these scripts rather than read `run/` files directly. Both commands
+are read-only: they never claim, release, or garbage-collect a lock.
+
+```sh
+# Resolve this hook's session to a per-process owner token.
+scripts/current-instance.sh <type> <session_id>
+
+# Verify that the token currently owns every matching (team, name) lock.
+scripts/actas-state.sh <project> <type> <name> <owner>
+```
+
+`current-instance.sh` emits `status=ok owner=<session_id>.<agent_pid>` only
+when it can resolve a composite owner token. It emits `status=unknown` and
+exits `1` instead of treating a bare session id as proof of ownership.
+
+`actas-state.sh` emits `status=mine ... owner=<token>` with exit `0` only when
+that live composite token owns every team where the role is registered. Its
+other states are `status=held team=<team> owner=<token>`,
+`status=free team=<team>`, `status=not_registered` (exit `2`), and
+`status=unknown`; the non-`mine` states exit `1` except `not_registered`.
+Consumers should fail open when either query cannot prove `mine`.
+
 ## Subscription model
 
 agmsg follows a **one CC session = one active role** model. Each watcher subscribes to a *static* set of identities decided at launch:
