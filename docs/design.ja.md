@@ -98,6 +98,14 @@ Agent responds → Stop hook fires → check-inbox.sh runs
 スラッシュコマンドはプロジェクトキーとして `"$(pwd)"` を渡す。ユーザーがセッションの実体が存在するプロジェクトのサブディレクトリや git worktree に `cd` すると、その pwd は登録済みプロジェクトと一致しなくなり、ルックアップが外れてサブディレクトリ用の幽霊レコードが作られてしまう。`lib/resolve-project.sh` は、安定した `session_id` を必要としない（Codex はそれを公開していない）3 つのシグナルを使って本当のルートを復元する。
 
 1. **プロセス単位のマーカー。** SessionStart 時に、`proj.<agent_pid>.project` が正式なプロジェクト（フックに組み込まれた `$2`）を、包含するエージェントプロセスの PID をキーとして記録する。スラッシュコマンドはその同じプロセスの子として実行されるため、ppid チェーンを遡ってエージェント PID にたどり着き、マーカーを読み戻す。信頼するかどうかは、その PID がまだ生きているエージェントプロセスであること（リサイクルガード）に依存し、古いマーカーは SessionStart/SessionEnd で GC される。**Claude Code の monitor/both のみ** — Codex は monitor モードを拒否する（Monitor ツールがない）ため `session-start.sh` をインストールせず、マーカーも書き込まない。Codex はシグナル 2〜3 に依存する。
+
+   **Windows の PID 空間 sidecar。** Git Bash の PID と native Windows の PID は別の名前空間である。MSYS 上では resolver が hook shell を Windows PID に変換し、native の `Win32_Process.ParentProcessId` を辿って Claude を見つける。新規の PID キー付き runtime record には、primary file より先に sidecar を書く:
+
+   - `proj.<pid>.project` → `proj.<pid>.pidspace`
+   - `cc-instance.<pid>` → `cc-instance.<pid>.pidspace`
+
+   sidecar は Windows PID なら正確に `native`、MSYS PID なら `msys` を格納し、対応する生存確認と command-line lookup を選ぶ。**sidecar が無い、空、不正、将来の未知値である場合は `msys` と解釈する。** これは sidecar 導入前の record を守る恒久的な後方互換ルールである。primary record の無い sidecar は無視し、writer は sidecar を先に書くため、新しい primary record が PID 名前空間情報なしに読まれることはない。
+
 2. **祖先ウォーク。** マーカーが見つからない場合、そのタイプについて登録済みプロジェクトである pwd の最も近い祖先が採用される。git に依存しないため、登録済みプロジェクトの*配下*にあるネストしたサブディレクトリや worktree を、cc と Codex の両方でカバーできる。
 3. **git 共通ディレクトリ。** それも失敗した場合、pwd の git リポジトリの登録済みメインチェックアウト（`git rev-parse --git-common-dir` 経由）を使う。これにより、祖先ウォークでは到達できない*兄弟*の worktree を復元できる。レジストリと突き合わせて検証されるため、登録がアンブレラの親ディレクトリ上にある場合は採用を見送る。
 

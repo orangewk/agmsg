@@ -57,6 +57,26 @@ _compat_cim_cmdline() {
     | tr -d '\r' | tr '\\' '/'
 }
 
+
+# Query Windows CIM for the parent PID of a process already identified in the
+# native Windows PID space. Git Bash's `ps` can only walk the MSYS process
+# table, whose native parent appears as PID 1; this is the one cross-boundary
+# step used by resolve-project.sh to reach the enclosing Claude process.
+#
+# Keep this per-PID lookup deliberately narrow. It is on a SessionStart / slash
+# command path, not a process monitor: enumerating Win32_Process would make a
+# costly system-wide WMI query for every invocation.
+compat_get_native_ppid() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  case "$pid" in *[!0-9]*) return 1 ;; esac
+  _agmsg_detect_platform
+  [ "$_agmsg_platform" = "msys" ] || return 1
+  [ -z "${_AGMSG_COMPAT_NO_CIM:-}" ] || return 1
+  powershell.exe -NoProfile -Command \
+    "(Get-CimInstance Win32_Process -Filter \"ProcessId=$pid\").ParentProcessId" 2>/dev/null \
+    | tr -d '\r'
+}
 # Get the full command line of a process ALREADY KNOWN to be a native Windows
 # pid (not an MSYS pid) — e.g. Node's own `process.pid` when Node was launched
 # directly as a Windows binary from a bash script (`nohup node ... &` backgrounds

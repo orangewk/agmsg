@@ -38,6 +38,15 @@ teardown() {
   teardown_test_env
 }
 
+@test "compat_get_native_ppid returns the native parent of an MSYS process" {
+  local native_pid parent
+  native_pid="$(_compat_get_winpid "$_STUB_PID")"
+  [[ "$native_pid" =~ ^[1-9][0-9]*$ ]]
+
+  parent="$(compat_get_native_ppid "$native_pid")"
+  [[ "$parent" =~ ^[1-9][0-9]*$ ]]
+}
+
 # ── /proc path (normal — regression guard) ───────────────────────────────
 
 @test "compat_get_cmdline returns full argv via /proc" {

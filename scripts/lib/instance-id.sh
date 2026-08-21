@@ -33,9 +33,9 @@
 [ -n "${_AGMSG_INSTANCE_ID_SH:-}" ] && return 0
 _AGMSG_INSTANCE_ID_SH=1
 
-# _agmsg_pid_alive receives the MSYS PID emitted by agmsg_agent_pid() and
-# encoded into cc-instance filenames. Load the shared conversion helper here,
-# too, because actas-lock.sh may source this library without resolve-project.sh.
+# Legacy records store MSYS PIDs; newer native-PID records carry an explicit
+# pid-space sidecar. Load the shared conversion helper here, too, because
+# actas-lock.sh may source this library without resolve-project.sh.
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
 
@@ -160,6 +160,67 @@ _agmsg_pid_alive() {
       ;;
   esac
   _agmsg_pid_alive_local "$pid"
+}
+
+# Liveness for a PID that is already in the native Windows process table. This
+# must not pass through _compat_get_winpid: that converter only understands an
+# MSYS pid, and applying it to a native pid would call the running Claude
+# process dead. Native records are only written on MSYS/Windows hosts.
+_agmsg_pid_alive_native() {
+  local pid="$1"
+  _agmsg_pid_valid "$pid" 4294967295 || return 1
+  case "${MSYSTEM:-}" in
+    MINGW*|MSYS*|CLANGARM*)
+      MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
+      return $?
+      ;;
+  esac
+  return 1
+}
+
+# A missing, malformed, or future pid-space marker deliberately means MSYS.
+# That is the compatibility contract for records created before sidecars
+# existed; only the exact string "native" opts into native Windows liveness.
+agmsg_pid_space_normalize() {
+  case "${1:-}" in native) printf '%s' native ;; *) printf '%s' msys ;; esac
+}
+
+# Dispatch process liveness using the space recorded alongside the pid.
+agmsg_pid_alive_in_space() {
+  local pid="$1" space="${2:-msys}"
+  case "$space" in
+    native) _agmsg_pid_alive_native "$pid" ;;
+    *)      _agmsg_pid_alive "$pid" ;;
+  esac
+}
+
+# cc-instance.<pid> stores the session instance associated with an enclosing
+# Claude process. The `.pidspace` sidecar is written before the state file;
+# absent sidecars are legacy MSYS records.
+agmsg_cc_instance_path() { printf '%s/run/cc-instance.%s' "$SKILL_DIR" "$1"; }
+agmsg_cc_instance_pid_space_path() { printf '%s.pidspace' "$(agmsg_cc_instance_path "$1")"; }
+
+agmsg_cc_instance_pid_space() {
+  local value="" f
+  f="$(agmsg_cc_instance_pid_space_path "$1")"
+  [ -f "$f" ] && value="$(head -1 "$f" 2>/dev/null || true)"
+  agmsg_pid_space_normalize "$value"
+}
+
+agmsg_cc_instance_pid_alive() {
+  local pid="$1" space
+  space="$(agmsg_cc_instance_pid_space "$pid")"
+  agmsg_pid_alive_in_space "$pid" "$space"
+}
+
+agmsg_write_cc_instance() {
+  local pid="$1" instance_id="$2" space
+  space="$(agmsg_pid_space_normalize "${3:-msys}")"
+  mkdir -p "$SKILL_DIR/run" 2>/dev/null || true
+  # Write the space first: a state file is never observed as native without its
+  # native liveness rule. A stray sidecar without state is harmless.
+  printf '%s\n' "$space" > "$(agmsg_cc_instance_pid_space_path "$pid")" 2>/dev/null || return 1
+  printf '%s\n' "$instance_id" > "$(agmsg_cc_instance_path "$pid")" 2>/dev/null
 }
 
 # Compose from an explicit pid. Bare sid when pid is empty/non-numeric.
@@ -394,9 +455,11 @@ EOF
 }
 
 # True iff <token> identifies a still-live instance.
-#   composite "<sid>.<pid>" → the embedded pid is alive (kill -0), AND, when a
-#                            cc-instance.<pid> record exists for that pid, its
-#                            content still names this exact token. A shared pid
+#   composite "<sid>.<pid>" → the embedded pid is alive in the pid space
+#                            recorded by cc-instance.<pid>.pidspace (missing →
+#                            MSYS), AND, when a cc-instance.<pid> record exists
+#                            for that pid, its content still names this exact
+#                            token. A shared pid
 #                            (the Claude Code 2.1.x daemon, #349) can outlive
 #                            the specific session that derived this token —
 #                            session-start.sh's dedup overwrites cc-instance.
@@ -417,9 +480,9 @@ agmsg_instance_alive() {
   [ -n "$token" ] || return 1
   if agmsg_instance_is_composite "$token"; then
     local pid="${token##*.}"
-    _agmsg_pid_alive "$pid" || return 1
+    agmsg_cc_instance_pid_alive "$pid" || return 1
     local f s
-    f="$SKILL_DIR/run/cc-instance.$pid"
+    f="$(agmsg_cc_instance_path "$pid")"
     [ -f "$f" ] || return 0
     s="$(cat "$f" 2>/dev/null || true)"
     [ "$s" = "$token" ] && return 0
@@ -432,7 +495,7 @@ agmsg_instance_alive() {
     [ -f "$f" ] || continue
     p=${f##*.}
     case "$p" in ''|*[!0-9]*) continue ;; esac
-    _agmsg_pid_alive "$p" || continue
+    agmsg_cc_instance_pid_alive "$p" || continue
     s="$(cat "$f" 2>/dev/null || true)"
     [ "$s" = "$token" ] && return 0
     # upgrade compat: cc-instance stores "<sid>.<pid>" but the lock holds "<sid>"

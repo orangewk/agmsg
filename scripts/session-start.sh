@@ -126,7 +126,11 @@ mkdir -p "$RUN_DIR" 2>/dev/null || true
 # which is more robust to wrapper/launch shapes than matching only "claude".
 # Empty when no agent ancestor is found (detached / sandboxed) — in that case
 # the instance id degrades to the bare session_id and the dedup step is skipped.
-CC_PID=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
+CC_PID_RECORD=$(agmsg_agent_pid_record "$TYPE" 2>/dev/null || true)
+CC_PID=${CC_PID_RECORD%%$'\t'*}
+CC_PID_SPACE=${CC_PID_RECORD#*$'\t'}
+[ "$CC_PID_SPACE" = "$CC_PID_RECORD" ] && CC_PID_SPACE="msys"
+CC_PID_SPACE=$(agmsg_pid_space_normalize "$CC_PID_SPACE")
 
 # Per-process instance id (see instance-id.sh): "<session_id>.<cc_pid>", or the
 # bare session_id when cc_pid is unresolved. This — not the bare session_id — is
@@ -149,7 +153,7 @@ for f in "$RUN_DIR"/cc-instance.*; do
   [ -f "$f" ] || continue
   pid=${f##*.}
   case "$pid" in ''|*[!0-9]*) continue ;; esac
-  if _agmsg_pid_alive "$pid"; then
+  if agmsg_cc_instance_pid_alive "$pid"; then
     s=$(cat "$f" 2>/dev/null || true)
     [ -n "$s" ] && live_sids="$live_sids|$s"
   fi
@@ -161,7 +165,7 @@ for f in "$RUN_DIR"/cc-instance.*; do
   [ -f "$f" ] || continue
   pid=${f##*.}
   case "$pid" in ''|*[!0-9]*) continue ;; esac
-  _agmsg_pid_alive "$pid" && continue
+  agmsg_cc_instance_pid_alive "$pid" && continue
   dead_sid=$(cat "$f" 2>/dev/null || true)
   if [ -n "$dead_sid" ] \
       && ! printf '%s\n' "$live_sids" | tr '|' '\n' | grep -Fxq "$dead_sid"; then
@@ -215,8 +219,7 @@ agmsg_gc_run_all 2>/dev/null || true
 # actas/join/whoami can recover it without a stable session_id — the key that
 # makes this work for Codex too. Drop markers whose agent process has died.
 agmsg_marker_gc_stale 2>/dev/null || true
-AGENT_PID=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
-[ -n "$AGENT_PID" ] && agmsg_write_project_marker "$AGENT_PID" "$PROJECT" 2>/dev/null || true
+[ -n "$CC_PID" ] && agmsg_write_project_marker "$CC_PID" "$PROJECT" "$CC_PID_SPACE" 2>/dev/null || true
 
 # Garbage-collect stream watermarks (#107) and readiness sentinels (#108) whose
 # owner session_id is no longer alive — left behind when a watcher dies without
@@ -254,7 +257,7 @@ if [ -n "$CC_PID" ]; then
       fi
     fi
   fi
-  printf '%s\n' "$INSTANCE_ID" > "$STATE"
+  agmsg_write_cc_instance "$CC_PID" "$INSTANCE_ID" "$CC_PID_SPACE" 2>/dev/null || true
 fi
 
 # --- Skip directive when a watcher is already alive for this instance. ---

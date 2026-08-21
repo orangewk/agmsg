@@ -257,18 +257,28 @@ _agmsg_agent_binaries() {
 # at the real per-session process instead of continuing past it to the
 # (excluded) daemon.
 agmsg_pid_is_agent() {
-  local pid="$1" type="$2"
+  local pid="$1" type="$2" pid_space="${3:-msys}"
   [ -n "$pid" ] || return 1
-  _agmsg_pid_alive "$pid" || return 1
+  agmsg_pid_alive_in_space "$pid" "$pid_space" || return 1
   local binaries comm cmdline first base bin
   binaries=$(_agmsg_agent_binaries "$type")
-  comm=$(compat_get_comm "$pid" 2>/dev/null || true)
-  cmdline=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+  case "$pid_space" in
+    native)
+      comm=""
+      cmdline=$(compat_get_native_cmdline "$pid" 2>/dev/null || true)
+      ;;
+    *)
+      comm=$(compat_get_comm "$pid" 2>/dev/null || true)
+      cmdline=$(compat_get_cmdline "$pid" 2>/dev/null || true)
+      ;;
+  esac
   case "$cmdline" in
     *"daemon run"*) return 1 ;;
   esac
-  first=$(printf '%s' "$cmdline" | awk '{print $1}' || true)
+  first=$(printf '%s' "$cmdline" | sed -n 's/^"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$first" ] || first=$(printf '%s' "$cmdline" | awk '{print $1}' || true)
   base=$(basename -- "${first:-}" 2>/dev/null || true)
+  case "$base" in *.exe) base=${base%.exe} ;; *.EXE) base=${base%.EXE} ;; esac
   for bin in $binaries; do
     case "$comm" in "$bin"|"$bin"-*) return 0 ;; esac
     [ "$base" = "$bin" ] && return 0
@@ -278,6 +288,54 @@ agmsg_pid_is_agent() {
     case "$base" in [0-9]*.[0-9]*.[0-9]*) return 0 ;; esac
   fi
   return 1
+}
+
+# Walk one PID space from <start> toward init and write the nearest matching
+# agent as "<pid><TAB><pid-space>". The caller starts at this hook shell and
+# checks its parent first, preserving the prior agmsg_agent_pid contract.
+_agmsg_agent_pid_walk() {
+  local start="$1" type="$2" pid_space="$3" pid="$1" hops=0
+  while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do
+    case "$pid_space" in
+      native) pid=$(compat_get_native_ppid "$pid" 2>/dev/null || true) ;;
+      *)      pid=$(compat_get_ppid "$pid" 2>/dev/null || true) ;;
+    esac
+    [ -n "$pid" ] && [ "$pid" != 0 ] || return 1
+    if agmsg_pid_is_agent "$pid" "$type" "$pid_space"; then
+      printf '%s\t%s' "$pid" "$pid_space"
+      return 0
+    fi
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
+# Like agmsg_agent_pid, but includes the PID space in a tab-separated second
+# field. The numeric-only public agmsg_agent_pid API remains unchanged below.
+agmsg_agent_pid_record() {
+  local type="$1" native_self
+  if [ -n "${AGMSG_AGENT_PID+set}" ]; then
+    case "$AGMSG_AGENT_PID" in
+      '')       return 1 ;;
+      *[!0-9]*)
+        printf 'agmsg: ignoring non-numeric AGMSG_AGENT_PID=%s; using bare session_id\n' "$AGMSG_AGENT_PID" >&2
+        return 1
+        ;;
+      # AGMSG_AGENT_PID has always meant the shell/MSYS PID supplied by the
+      # caller; keep that override contract unchanged.
+      *) printf '%s\tmsys' "$AGMSG_AGENT_PID"; return 0 ;;
+    esac
+  fi
+
+  _agmsg_detect_platform
+  if [ "$_agmsg_platform" = "msys" ]; then
+    native_self=$(_compat_get_winpid "$$" 2>/dev/null || true)
+    case "$native_self" in
+      ''|*[!0-9]*) ;;
+      *) _agmsg_agent_pid_walk "$native_self" "$type" native && return 0 ;;
+    esac
+  fi
+  _agmsg_agent_pid_walk "$$" "$type" msys
 }
 
 # Walk the process tree from $$ upward, echoing the PID of the nearest ancestor
@@ -291,48 +349,45 @@ agmsg_pid_is_agent() {
 # suite regardless of the ambient process tree, and is a usable escape hatch
 # when the ps-walk heuristic misfires for an unusual launch topology.
 agmsg_agent_pid() {
-  local type="$1"
-  if [ -n "${AGMSG_AGENT_PID+set}" ]; then
-    case "$AGMSG_AGENT_PID" in
-      '')       return 1 ;;  # explicit empty → force the bare-sid fallback
-      *[!0-9]*)              # non-numeric → ignore, warn, fall back to bare
-        printf 'agmsg: ignoring non-numeric AGMSG_AGENT_PID=%s; using bare session_id\n' "$AGMSG_AGENT_PID" >&2
-        return 1 ;;
-      *) printf '%s' "$AGMSG_AGENT_PID"; return 0 ;;
-    esac
-  fi
-  local pid="$$" hops=0
-  while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do
-    pid=$(compat_get_ppid "$pid" 2>/dev/null || true)
-    [ -z "$pid" ] && return 1
-    [ "$pid" = "0" ] && return 1
-    if agmsg_pid_is_agent "$pid" "$type"; then
-      printf '%s' "$pid"
-      return 0
-    fi
-    hops=$((hops + 1))
-  done
-  return 1
+  local type="$1" record pid
+  record=$(agmsg_agent_pid_record "$type") || return 1
+  pid=${record%%$'\t'*}
+  [ -n "$pid" ] || return 1
+  printf '%s' "$pid"
 }
 
 agmsg_project_marker_path() { printf '%s/proj.%s.project' "$(_agmsg_run_dir)" "$1"; }
+agmsg_project_marker_pid_space_path() { printf '%s/proj.%s.pidspace' "$(_agmsg_run_dir)" "$1"; }
 
-# Persist <project> as the real root for agent <pid>. Best-effort.
+agmsg_project_marker_pid_space() {
+  local value="" f
+  f="$(agmsg_project_marker_pid_space_path "$1")"
+  [ -f "$f" ] && value="$(head -1 "$f" 2>/dev/null || true)"
+  agmsg_pid_space_normalize "$value"
+}
+
+# Persist <project> as the real root for agent <pid>. New markers always get a
+# pid-space sidecar; a missing sidecar belongs to a pre-sidecar MSYS record.
 agmsg_write_project_marker() {
-  local pid="$1" project="$2" dir
+  local pid="$1" project="$2" space dir
   [ -n "$pid" ] && [ -n "$project" ] || return 1
+  space="$(agmsg_pid_space_normalize "${3:-msys}")"
   dir="$(_agmsg_run_dir)"
   mkdir -p "$dir" 2>/dev/null || true
+  # Write the sidecar first so a newly written marker is never interpreted in
+  # the wrong PID space. A sidecar without a project marker is inert.
+  printf '%s\n' "$space" > "$(agmsg_project_marker_pid_space_path "$pid")" 2>/dev/null || return 1
   printf '%s\n' "$project" > "$(agmsg_project_marker_path "$pid")" 2>/dev/null || return 1
 }
 
 # Read the marker for <pid>, but only trust it when <pid> is still a live agent
-# process of <type>. Empty (return 1) otherwise.
+# process of <type> in the sidecar's PID space. Empty (return 1) otherwise.
 agmsg_read_project_marker() {
-  local pid="$1" type="$2" f
+  local pid="$1" type="$2" f space
   f="$(agmsg_project_marker_path "$pid")"
   [ -f "$f" ] || return 1
-  agmsg_pid_is_agent "$pid" "$type" || return 1
+  space="$(agmsg_project_marker_pid_space "$pid")"
+  agmsg_pid_is_agent "$pid" "$type" "$space" || return 1
   head -1 "$f" 2>/dev/null
 }
 
@@ -345,11 +400,22 @@ agmsg_marker_gc_stale() {
   # Skip if _agmsg_pid_alive (EPERM-aware; instance-id.sh) isn't loaded, so a
   # "command not found" can't fall through to `|| rm -f` and delete a live marker.
   declare -F _agmsg_pid_alive >/dev/null 2>&1 || return 0
-  local f pid
+  local f pid space
   for f in "$dir"/proj.*.project; do
     [ -f "$f" ] || continue
     pid=${f##*/proj.}; pid=${pid%.project}
-    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    case "$pid" in
+      ''|*[!0-9]*) continue ;;
+      *)
+        space="$(agmsg_project_marker_pid_space "$pid")"
+        if [ "$space" = native ] && ! agmsg_pid_alive_in_space "$pid" "$space"; then
+          # Clearing is non-destructive and stops PID reuse from trusting it.
+          : > "$f"
+          : > "$(agmsg_project_marker_pid_space_path "$pid")"
+        fi
+        [ "$space" = native ] && continue
+        ;;
+    esac
     _agmsg_pid_alive "$pid" || rm -f "$f"
   done
 }

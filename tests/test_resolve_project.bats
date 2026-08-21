@@ -192,6 +192,70 @@ JSON
   rm -rf "$markroot"
 }
 
+# --- PID-space sidecar / native Windows ancestry (#672) ---
+
+@test "agent-pid: MSYS hook crosses to a native Claude parent" {
+  # Model the observed boundary: this Git Bash hook has a native Windows PID,
+  # whose native parent is Claude, while the MSYS ppids would terminate at 1.
+  _agmsg_detect_platform() { _agmsg_platform=msys; }
+  _compat_get_winpid() { [ "$1" = "$$" ] && printf '%s' 5000; }
+  compat_get_native_ppid() {
+    case "$1" in
+      5000) printf '%s' 9000 ;;
+      9000) printf '%s' 1 ;;
+    esac
+  }
+  agmsg_pid_is_agent() {
+    [ "$1" = 9000 ] && [ "$2" = claude-code ] && [ "$3" = native ]
+  }
+
+  run agmsg_agent_pid_record claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = $'9000\tnative' ]
+
+  run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = 9000 ]
+}
+
+@test "project-marker: new native marker records sidecar and reads it" {
+  agmsg_write_project_marker 4242 "$ROOT" native
+  [ "$(cat "$(agmsg_project_marker_pid_space_path 4242)")" = native ]
+  agmsg_pid_is_agent() { [ "$1" = 4242 ] && [ "$3" = native ]; }
+
+  result="$(agmsg_read_project_marker 4242 claude-code)"
+  [ "$result" = "$ROOT" ]
+}
+
+@test "project-marker: missing sidecar is treated as legacy MSYS" {
+  printf '%s\n' "$ROOT" > "$(agmsg_project_marker_path 4243)"
+  [ "$(agmsg_project_marker_pid_space 4243)" = msys ]
+  agmsg_pid_is_agent() { [ "$1" = 4243 ] && [ "$3" = msys ]; }
+
+  result="$(agmsg_read_project_marker 4243 claude-code)"
+  [ "$result" = "$ROOT" ]
+}
+
+@test "marker-gc: native sidecar dispatch keeps a live marker" {
+  agmsg_write_project_marker 4244 "$ROOT" native
+  agmsg_pid_alive_in_space() { [ "$1" = 4244 ] && [ "$2" = native ]; }
+
+  agmsg_marker_gc_stale
+
+  [ "$(cat "$(agmsg_project_marker_path 4244)")" = "$ROOT" ]
+  [ "$(cat "$(agmsg_project_marker_pid_space_path 4244)")" = native ]
+}
+
+@test "marker-gc: stale native record is cleared without deletion" {
+  agmsg_write_project_marker 4245 "$ROOT" native
+  agmsg_pid_alive_in_space() { return 1; }
+
+  agmsg_marker_gc_stale
+
+  [ ! -s "$(agmsg_project_marker_path 4245)" ]
+  [ ! -s "$(agmsg_project_marker_pid_space_path 4245)" ]
+}
+
 # --- marker GC ---
 
 @test "marker-gc: removes markers for dead pids, keeps live ones" {
