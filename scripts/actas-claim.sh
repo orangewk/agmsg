@@ -14,7 +14,7 @@ set -euo pipefail
 #   3. TaskStop the existing Monitor and invoke the new one with <name>
 #
 # Output (stdout, key=value lines):
-#   status=ok team=<team> [team=<team2> ...]              everything claimed
+#   status=ok team=<team> [team=<team2> ...] owner=<token> everything claimed
 #   status=held team=<team> owner=<owner_sid>             refused — another live session owns it
 #   status=not_registered                                  name is not joined to any team in this project/type
 #
@@ -104,5 +104,5 @@ while IFS= read -r team; do
   [ -z "$team" ] && continue
   printf ' team=%s' "$team"
 done <<< "$TEAMS"
-printf '\n'
+printf ' owner=%s\n' "$SESSION_ID"
 exit 0
