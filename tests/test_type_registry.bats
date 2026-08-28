@@ -29,11 +29,11 @@ write_node_launcher_fixtures() {
   printf '// stub node launcher fixture\n' > "$nd/nodetype-launcher.mjs"
 }
 
-@test "type-registry: known_types lists the ten built-ins" {
+@test "type-registry: known_types lists the eleven built-ins" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "agmsg-app,antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode" ]
+  [ "$output" = "agmsg-app,antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode,qwen" ]
 }
 
 @test "type-registry: is_known_type accepts a built-in and rejects a bogus type" {
@@ -64,7 +64,7 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
-@test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
+@test "type-registry: spawnable set is exactly nine of the eleven built-ins (#277, #279, #41)" {
   # hermes deliberately stays out (#279): no known CLI mode starts it
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
   # the desktop app itself (spawnable=no), not a spawnable agent type.
@@ -75,7 +75,7 @@ write_node_launcher_fixtures() {
        [ \"\$(agmsg_type_get \"\$t\" spawnable)\" = yes ] && echo \"\$t\"
      done <<< \"\$(agmsg_known_types | sort -u)\" | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,opencode" ]
+  [ "$output" = "antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,opencode,qwen" ]
 }
 
 @test "type-registry: detection manifests carry the expected env / proc keys" {
@@ -86,6 +86,7 @@ write_node_launcher_fixtures() {
   [ "$(g antigravity detect)" = "explicit" ]
   [ "$(g copilot detect)" = "explicit" ]
   [ "$(g opencode detect_proc)" = "opencode opencode-*" ]
+  [ "$(g qwen detect)" = "explicit" ]
 }
 
 @test "type-registry: whoami detects codex end-to-end from CODEX_THREAD_ID" {

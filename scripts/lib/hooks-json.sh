@@ -104,6 +104,7 @@ add_event_entry_file() {
   local event="$2"
   local cmd="$3"
   local windows_wrap="${4:-}"
+  local hook_shell="${5:-}"
   local sql_path
   sql_path=$(sql_readfile_path "$path")
 
@@ -121,6 +122,11 @@ add_event_entry_file() {
     cw=$(windows_wrap "$cmd")
     cw_lit=$(printf '%s' "$cw" | sed "s/'/''/g")
     hook_obj="$hook_obj,'commandWindows','$cw_lit'"
+  fi
+  if [ -n "$hook_shell" ]; then
+    local shell_lit
+    shell_lit=$(printf '%s' "$hook_shell" | sed "s/'/''/g")
+    hook_obj="$hook_obj,'shell','$shell_lit'"
   fi
   hook_obj="$hook_obj)"
   local entry_sql="json_object('matcher','','hooks',json_array($hook_obj))"
